@@ -6,6 +6,68 @@ import (
 	"github.com/bobyeoh/docx2pdf-go/internal/docx"
 )
 
+func TestIsHeadingStyle(t *testing.T) {
+	cases := []struct {
+		id   string
+		want bool
+	}{
+		{"", false},
+		{"Heading1", true},
+		{"Heading9", true},
+		{"Heading", true},
+		{"heading2", true},  // case-insensitive
+		{"Heading 3", true}, // tolerate space-separated variant
+		{"Title", true},
+		{"title", true},
+		{"Subtitle", false},
+		{"Heading10", false}, // two-digit not recognized; rare in practice
+		{"HeadingCustom", false},
+		{"Normal", false},
+		{"BodyText", false},
+	}
+	for _, c := range cases {
+		got := isHeadingStyle(c.id)
+		if got != c.want {
+			t.Errorf("isHeadingStyle(%q) = %v, want %v", c.id, got, c.want)
+		}
+	}
+}
+
+func TestHeadingTitle(t *testing.T) {
+	p := docx.Paragraph{
+		StyleID: "Heading1",
+		Runs: []docx.Run{
+			{Text: "  Chapter "},
+			{Text: "One  "},
+		},
+	}
+	if got := headingTitle(p); got != "Chapter One" {
+		t.Errorf("headingTitle = %q, want %q", got, "Chapter One")
+	}
+	// Non-heading paragraph returns empty.
+	p2 := docx.Paragraph{StyleID: "Normal", Runs: []docx.Run{{Text: "body"}}}
+	if got := headingTitle(p2); got != "" {
+		t.Errorf("non-heading returned %q", got)
+	}
+	// Heading with field markers in runs — markers must not leak into title.
+	p3 := docx.Paragraph{
+		StyleID: "Heading2",
+		Runs: []docx.Run{
+			{Text: "Section "},
+			{FieldBegin: true},
+			{InstrText: "SEQ Section"},
+			{FieldSep: true},
+			{Text: "3"},
+			{FieldEnd: true},
+		},
+	}
+	// The "3" cached field result is plain text inside FieldSep..FieldEnd,
+	// so it survives. Field marker runs themselves are dropped.
+	if got := headingTitle(p3); got != "Section 3" {
+		t.Errorf("heading with field = %q, want %q", got, "Section 3")
+	}
+}
+
 func TestRoman(t *testing.T) {
 	cases := []struct {
 		n    int

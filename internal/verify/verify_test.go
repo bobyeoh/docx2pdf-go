@@ -251,6 +251,7 @@ func allCases() []verifyCase {
 		caseAlternateContentChoice(),
 		caseAlternateContentFallback(),
 		caseComments(),
+		caseHeadingOutline(),
 		// — batch Q: context cancel ---
 		// (tested separately via TestContextCancel, not the harness)
 	}
@@ -4150,6 +4151,58 @@ func caseComments() verifyCase {
 			}
 			if !(b < c) {
 				fail("comment appears before body text (idx %d > %d)", c, b)
+			}
+		},
+	}
+}
+
+// caseHeadingOutline: paragraphs styled as Heading1/Heading2/Title
+// contribute entries to the PDF outline. We verify by checking the PDF
+// for the /Outlines object plus our heading titles appearing in the
+// /Title entries inside.
+func caseHeadingOutline() verifyCase {
+	return verifyCase{
+		name:        "126_heading_outline",
+		description: "Heading1/2/Title paragraphs produce PDF outline (sidebar bookmarks)",
+		build: func(t *testing.T, dir string) string {
+			return newDocx().Body(`
+    <w:p>
+      <w:pPr><w:pStyle w:val="Title"/></w:pPr>
+      <w:r><w:t>BOOK-TITLE</w:t></w:r>
+    </w:p>
+    <w:p>
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>OUTLINE-CHAPTER-ONE</w:t></w:r>
+    </w:p>
+    <w:p><w:r><w:t>body text</w:t></w:r></w:p>
+    <w:p>
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>OUTLINE-CHAPTER-TWO</w:t></w:r>
+    </w:p>`).Write(t, dir)
+		},
+		expectText:  []string{"BOOK-TITLE", "OUTLINE-CHAPTER-ONE", "body text", "OUTLINE-CHAPTER-TWO"},
+		expectPages: 1,
+		custom: func(t *testing.T, pdf string, fail func(format string, args ...any)) {
+			data, err := os.ReadFile(pdf)
+			if err != nil {
+				fail("read pdf: %v", err)
+				return
+			}
+			// PDF outline strings are emitted as PDF "text strings", which
+			// gopdf encodes UTF-16BE — they won't appear as raw ASCII in
+			// the byte stream. Two structural signals are enough:
+			//
+			//   1. /Outlines is present (anchors the outline tree).
+			//   2. We have at least 3 /Title entries in the file
+			//      (Title + Heading1 #1 + Heading1 #2 = our three
+			//      heading paragraphs).
+			if !bytes.Contains(data, []byte("/Outlines")) {
+				fail("no /Outlines reference in PDF — outline tree not emitted")
+				return
+			}
+			n := bytes.Count(data, []byte("/Title"))
+			if n < 3 {
+				fail("found %d /Title entries in PDF, want ≥ 3 (one per heading)", n)
 			}
 		},
 	}

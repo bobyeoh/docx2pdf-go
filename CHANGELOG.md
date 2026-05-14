@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added (later round)
+- **PDF outline / sidebar bookmarks** are emitted from `Heading1`..`Heading9`
+  and `Title` styled paragraphs. PDF readers (Preview, Adobe, ...) show a
+  clickable chapter navigator. Field markers and bookmark anchors inside
+  heading text are filtered so the title reads cleanly. Regression
+  case #126 plus unit tests for `isHeadingStyle` / `headingTitle`.
 - **Comments are surfaced.** `word/comments.xml` is now parsed and
   appended at document end as a "Comments" trailer alongside the
   existing Endnotes section. Reviewer markup that would have been

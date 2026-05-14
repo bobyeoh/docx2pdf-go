@@ -22,6 +22,17 @@ func (r *renderer) drawParagraph(p docx.Paragraph) error {
 		r.pdf.AddPage()
 		r.cursorY = r.marT
 	}
+	// PDF outline: paragraphs styled as Heading1..9 or Title contribute
+	// a bookmark in the reader's sidebar so the resulting PDF has a
+	// clickable navigable structure. The text of the first paragraph at
+	// each heading level becomes the bookmark title. We add the outline
+	// here (before content draws) so it points at the correct page —
+	// note that any preceding spacing-before or KeepNext ensureRoom may
+	// still shift the page; close enough for "click to jump near
+	// chapter".
+	if title := headingTitle(p); title != "" {
+		r.pdf.AddOutline(title)
+	}
 	// RTL paragraph state: drives rune-reversal inside RTL word atoms and
 	// line-internal atom reversal at flush time. Set before runsToAtoms so
 	// atom construction sees it.
@@ -269,4 +280,49 @@ func roman(n int, upper bool) string {
 		out = strings.ToUpper(out)
 	}
 	return out
+}
+
+// headingTitle returns a PDF-outline title when p is styled as a heading.
+// Recognized styles: Heading1..Heading9 and Title (Word's defaults). We
+// match case-insensitively and tolerate the variant "Heading 1" style ID
+// some templates use. Returns "" for non-heading paragraphs.
+//
+// The title is the concatenated visible text of the paragraph's runs,
+// trimmed of surrounding whitespace.
+func headingTitle(p docx.Paragraph) string {
+	if !isHeadingStyle(p.StyleID) {
+		return ""
+	}
+	var b strings.Builder
+	for _, run := range p.Runs {
+		if run.Props.Vanish || run.Bookmark != "" || run.FieldBegin || run.FieldSep || run.FieldEnd || run.InstrText != "" {
+			continue
+		}
+		b.WriteString(run.Text)
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func isHeadingStyle(id string) bool {
+	if id == "" {
+		return false
+	}
+	low := strings.ToLower(strings.ReplaceAll(id, " ", ""))
+	if low == "title" {
+		return true
+	}
+	if !strings.HasPrefix(low, "heading") {
+		return false
+	}
+	// "heading", "heading1" … "heading9" all qualify; "headingnoborder"
+	// (custom names) shouldn't, so require either bare "heading" or one
+	// trailing decimal digit.
+	rest := low[len("heading"):]
+	if rest == "" {
+		return true
+	}
+	if len(rest) == 1 && rest[0] >= '1' && rest[0] <= '9' {
+		return true
+	}
+	return false
 }
