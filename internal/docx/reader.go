@@ -1497,6 +1497,22 @@ func parseDocument(f *zip.File, pctx *parseDocContext) error {
 					pctx.finalizeSection()
 				}
 			}
+		case "oMathPara":
+			// Display math: a body-level equation. Best-effort — extract
+			// the visible text and emit it as a centered, italic paragraph.
+			// Loses the structural typesetting but keeps the content.
+			txt, err := extractMathText(dec, se)
+			if err != nil {
+				return err
+			}
+			if txt != "" {
+				p := Paragraph{
+					Alignment: AlignCenter,
+					Runs:      []Run{mathRun(txt, doc.Defaults)},
+				}
+				pctx.curSection.Blocks = append(pctx.curSection.Blocks, p)
+				doc.Body = append(doc.Body, p)
+			}
 		case "sectPr":
 			// Top-level sectPr: properties of the final section.
 			if err := decodeSectPr(dec, se, pctx); err != nil {
@@ -1623,6 +1639,16 @@ func decodeParagraph(dec *xml.Decoder, start xml.StartElement, pctx *parseDocCon
 				if err := decodeInlineSdt(dec, t, &p, paraRPr, pctx, false); err != nil {
 					return p, err
 				}
+			case "oMath":
+				// Inline math equation. Best-effort: pull the visible text
+				// out of the subtree and emit it as one italic run.
+				txt, err := extractMathText(dec, t)
+				if err != nil {
+					return p, err
+				}
+				if txt != "" {
+					p.Runs = append(p.Runs, mathRun(txt, paraRPr))
+				}
 			case "commentRangeStart", "commentRangeEnd", "commentReference":
 				// Comments are out-of-flow; we skip the inline markers.
 				_ = dec.Skip()
@@ -1700,6 +1726,15 @@ func decodeWrapper(dec *xml.Decoder, start xml.StartElement, p *Paragraph, paraR
 				if err := decodeInlineSdt(dec, t, p, paraRPr, pctx, drop); err != nil {
 					return err
 				}
+			case "oMath":
+				txt, err := extractMathText(dec, t)
+				if err != nil {
+					return err
+				}
+				if drop || txt == "" {
+					continue
+				}
+				p.Runs = append(p.Runs, mathRun(txt, paraRPr))
 			case "bookmarkStart":
 				id := attr(t, "id")
 				name := attr(t, "name")

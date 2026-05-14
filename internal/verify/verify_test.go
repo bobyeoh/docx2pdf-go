@@ -243,6 +243,8 @@ func allCases() []verifyCase {
 		caseInlineSdt(),
 		caseBlockSdt(),
 		caseSdtInTableCell(),
+		caseInlineMath(),
+		caseDisplayMath(),
 		// — batch Q: context cancel ---
 		// (tested separately via TestContextCancel, not the harness)
 	}
@@ -3781,6 +3783,69 @@ func caseSdtInTableCell() verifyCase {
 		},
 		expectText:  []string{"CELL-SDT-TEXT"},
 		expectPages: 1,
+	}
+}
+
+// caseInlineMath: m:oMath inside a paragraph. Best-effort: contained
+// chardata survives as an italic run. Structural formatting (fractions,
+// subscripts) is intentionally lost.
+func caseInlineMath() verifyCase {
+	return verifyCase{
+		name:        "118_inline_math",
+		description: "Inline m:oMath equation extracts visible text",
+		build: func(t *testing.T, dir string) string {
+			return newDocx().Body(`
+    <w:p>
+      <w:r><w:t xml:space="preserve">The polynomial </w:t></w:r>
+      <m:oMath xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math">
+        <m:r><m:t>P(x)=ax</m:t></m:r>
+        <m:sSup>
+          <m:e><m:r><m:t>x</m:t></m:r></m:e>
+          <m:sup><m:r><m:t>2</m:t></m:r></m:sup>
+        </m:sSup>
+        <m:r><m:t>+bx+c</m:t></m:r>
+      </m:oMath>
+      <w:r><w:t xml:space="preserve"> is quadratic.</w:t></w:r>
+    </w:p>`).Write(t, dir)
+		},
+		expectText:  []string{"polynomial", "P(x)", "quadratic"},
+		expectPages: 1,
+	}
+}
+
+// caseDisplayMath: m:oMathPara as a body-level equation. Renders as its
+// own paragraph (centered + italic) inserted between surrounding body
+// paragraphs.
+func caseDisplayMath() verifyCase {
+	return verifyCase{
+		name:        "119_display_math",
+		description: "Body-level m:oMathPara becomes its own paragraph in flow",
+		build: func(t *testing.T, dir string) string {
+			return newDocx().RawBody(docHeader+`
+    <w:p><w:r><w:t>before</w:t></w:r></w:p>
+    <m:oMathPara xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math">
+      <m:oMath>
+        <m:r><m:t>EQUATION-TEXT</m:t></m:r>
+      </m:oMath>
+    </m:oMathPara>
+    <w:p><w:r><w:t>after</w:t></w:r></w:p>`+docFooter).Write(t, dir)
+		},
+		expectText:  []string{"before", "EQUATION-TEXT", "after"},
+		expectPages: 1,
+		custom: func(t *testing.T, pdf string, fail func(format string, args ...any)) {
+			// Order check: before → equation → after in the extracted text.
+			txt := pdftotext(t, pdf)
+			b := strings.Index(txt, "before")
+			e := strings.Index(txt, "EQUATION-TEXT")
+			a := strings.Index(txt, "after")
+			if b < 0 || e < 0 || a < 0 {
+				fail("missing markers in:\n%s", txt)
+				return
+			}
+			if !(b < e && e < a) {
+				fail("expected before<equation<after, got %d %d %d", b, e, a)
+			}
+		},
 	}
 }
 

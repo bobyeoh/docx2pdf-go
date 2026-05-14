@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added (later round)
+- **`m:oMath` / `m:oMathPara` math equations** extract their visible text
+  and emit it as an italic run (inline) or italic centered paragraph
+  (display). Structural typesetting (fractions, sub/superscripts, integral
+  signs) is lost, but the content survives instead of being silently
+  dropped — the right trade-off until a real math renderer is on the
+  table. Regression cases #118 (inline) and #119 (display).
 - **`w:sdt` (content controls / structured document tags) are transparent.**
   Both inline (within a paragraph) and block-level SDTs (in body, table
   cells, headers/footers, notes) are recognized: `w:sdtPr` / `w:sdtEndPr`
