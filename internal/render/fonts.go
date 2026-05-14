@@ -15,31 +15,61 @@ const (
 )
 
 func (r *renderer) registerFonts() error {
-	if err := r.pdf.AddTTFFont(defaultFamily, r.opts.FontRegular); err != nil {
+	// FontRegular is required — its load error is fatal.
+	if err := r.loadFont(defaultFamily, r.opts.FontRegular); err != nil {
 		return fmt.Errorf("load font %s: %w", r.opts.FontRegular, err)
 	}
 	r.fonts[defaultFamily] = true
-	if r.opts.FontBold != "" {
-		if err := r.pdf.AddTTFFont(boldFamily, r.opts.FontBold); err == nil {
-			r.fonts[boldFamily] = true
-		}
-	}
-	if r.opts.FontItalic != "" {
-		if err := r.pdf.AddTTFFont(italicFamily, r.opts.FontItalic); err == nil {
-			r.fonts[italicFamily] = true
-		}
-	}
-	if r.opts.FontHeading != "" {
-		if err := r.pdf.AddTTFFont(headingFamily, r.opts.FontHeading); err == nil {
-			r.fonts[headingFamily] = true
-		}
-	}
-	if r.opts.FontFallback != "" {
-		if err := r.pdf.AddTTFFont(fallbackFamily, r.opts.FontFallback); err == nil {
-			r.fonts[fallbackFamily] = true
-		}
-	}
+	// Optional faces: failures are reported via Logger / Verbose but
+	// don't abort the render. The renderer just falls back to the
+	// regular face for the missing variant.
+	r.tryLoadOptionalFont(boldFamily, r.opts.FontBold)
+	r.tryLoadOptionalFont(italicFamily, r.opts.FontItalic)
+	r.tryLoadOptionalFont(headingFamily, r.opts.FontHeading)
+	r.tryLoadOptionalFont(fallbackFamily, r.opts.FontFallback)
 	return nil
+}
+
+// loadFont handles both plain TTF files and TrueType Collections.
+// gopdf's AddTTFFont parses the first 4 bytes as an sfnt version and
+// rejects "ttcf"-tagged collections; we detect that header and extract
+// face 0 from the collection before handing it to AddTTFFontData.
+// Errors from gopdf are returned wrapped with the path so callers can
+// see exactly which face failed.
+func (r *renderer) loadFont(family, path string) error {
+	if path == "" {
+		return fmt.Errorf("empty path")
+	}
+	if looksLikeTTC(path) {
+		data, err := extractTTCFace0(path)
+		if err != nil {
+			return fmt.Errorf("extract ttc face 0: %w", err)
+		}
+		return r.pdf.AddTTFFontData(family, data)
+	}
+	return r.pdf.AddTTFFont(family, path)
+}
+
+// tryLoadOptionalFont attempts to load an optional face (bold/italic/
+// heading/fallback). Empty path → no-op. Real load failures are logged
+// via the renderer's logger so users see why their CJK fallback or
+// bold variant isn't taking effect, but do NOT abort the render.
+func (r *renderer) tryLoadOptionalFont(family, path string) {
+	if path == "" {
+		return
+	}
+	if err := r.loadFont(family, path); err != nil {
+		// Mirror RenderWriter's logger selection logic.
+		log := r.opts.Logger
+		if log == nil && r.opts.Verbose {
+			log = func(s string) { fmt.Println(s) }
+		}
+		if log != nil {
+			log(fmt.Sprintf("font: skip %s (%s): %v", family, path, err))
+		}
+		return
+	}
+	r.fonts[family] = true
 }
 
 // isMajorThemeRole reports whether the role names a major (i.e. heading)

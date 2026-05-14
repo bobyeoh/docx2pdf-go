@@ -51,9 +51,9 @@ type Options struct {
 	ctx context.Context
 
 	// FontRegular is the path to the TTF used for normal text. When
-	// empty, a list of common system-font locations (Arial / Helvetica
-	// on macOS, DejaVu / Liberation / Noto on Linux) is searched and
-	// the first one that exists wins. The error from RenderWriter
+	// empty, resolution order is: $DOCX2PDF_FONT env var, then a list
+	// of common system-font locations (Arial / Helvetica on macOS,
+	// DejaVu / Liberation / Noto on Linux). The error from RenderWriter
 	// lists the paths tried when nothing is found.
 	FontRegular string
 	FontBold    string // optional; falls back to FontRegular
@@ -65,7 +65,9 @@ type Options struct {
 	// Cambria.ttf to get the visual distinction Office shows by default.
 	FontHeading string
 	// FontFallback is a TTF used for runes the regular font cannot render
-	// (typically CJK). Recommended: Noto Sans CJK or similar.
+	// (typically CJK). Recommended: Noto Sans CJK or similar. When empty,
+	// $DOCX2PDF_FONT_CJK is consulted; missing it just means CJK glyphs
+	// share the regular face (and likely render as boxes).
 	FontFallback string
 	// DefaultFontSize is the size in points used when the document does
 	// not specify one. Word's default is 11pt.
@@ -113,16 +115,29 @@ func Render(doc *docx.Document, outPath string, opts Options) error {
 // RenderWriter is the streaming variant — writes the produced PDF to w.
 func RenderWriter(doc *docx.Document, w io.Writer, opts Options) error {
 	if opts.FontRegular == "" {
-		// No font specified — try a list of common system locations.
-		// Lets the library "just work" on a default install where the
-		// caller hasn't bothered to vend a TTF.
-		opts.FontRegular = findSystemFont()
+		// Resolution order when no explicit font was passed:
+		//   1. DOCX2PDF_FONT env var (set by our Docker image, also a
+		//      convenient knob for containerized deployments).
+		//   2. findSystemFont(): a list of common /usr/share/fonts/
+		//      and macOS / Windows paths.
+		// If neither yields a real file, surface a clear error listing
+		// the candidates we tried so the caller knows what to provide.
+		opts.FontRegular = resolveFontFromEnv(envFontRegular)
+		if opts.FontRegular == "" {
+			opts.FontRegular = findSystemFont()
+		}
 		if opts.FontRegular == "" {
 			return fmt.Errorf(
 				"render: FontRegular not specified and no system font found; "+
-					"set Options.FontRegular to a TTF/TTC path. Tried: %s",
-				formatFontCandidates())
+					"set Options.FontRegular (or $%s) to a TTF/TTC path. Tried: %s",
+				envFontRegular, formatFontCandidates())
 		}
+	}
+	// Symmetric env-var fallback for the CJK fallback font. Optional —
+	// missing it just means CJK glyphs use the regular face (and likely
+	// render as boxes for runes the regular face doesn't cover).
+	if opts.FontFallback == "" {
+		opts.FontFallback = resolveFontFromEnv(envFontFallback)
 	}
 	if opts.DefaultFontSize == 0 {
 		opts.DefaultFontSize = 11

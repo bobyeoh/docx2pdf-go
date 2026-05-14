@@ -40,7 +40,8 @@ external runtimes.
 
 - **Deploys as a 12 MB static binary.** `CGO_ENABLED=0`, single file, runs
   anywhere Go runs.
-- **Ships as a ~90 MB Docker image** with Noto + Noto CJK fonts baked in.
+- **Ships as a ~70 MB Docker image** with Noto Sans + WenQuanYi Zen Hei
+  fonts baked in (Latin + CJK fallback, no Word installation needed).
 - **`go get`-able library**, with a stable public surface and a streaming
   `io.Reader` → `io.Writer` API (perfect for HTTP handlers).
 - **CLI** for batch processing — point it at a directory, get a mirrored
@@ -112,15 +113,28 @@ docx2pdf -in indir/ -out outdir/ -font Regular.ttf \
 ### Docker
 
 ```bash
+# Simplest — fonts auto-detected from $DOCX2PDF_FONT and
+# $DOCX2PDF_FONT_CJK baked into the image.
 docker run --rm -v "$PWD":/work bobyeoh/docx2pdf-go \
-    -in /work/in.docx -out /work/out.pdf \
-    -font /usr/share/fonts/noto/NotoSans-Regular.ttf \
-    -font-fallback /usr/share/fonts/noto/NotoSansCJK-Regular.ttc \
-    -page-numbers
+    -in /work/in.docx -out /work/out.pdf -page-numbers
 ```
 
-The image already includes Noto Sans + Noto CJK at the paths above
-(`$DOCX2PDF_FONT` and `$DOCX2PDF_FONT_CJK` env vars point at them too).
+The image (~70 MB) ships **Noto Sans** for Latin text and **WenQuanYi
+Zen Hei** for CJK fallback. Noto Sans CJK is *not* bundled because it
+uses CFF/PostScript outlines (`.ttc` with `OTTO` faces) which gopdf's
+TrueType-only parser can't render; WQY Zen Hei is a TrueType TTC that
+the runtime extracts face 0 from automatically.
+
+The env vars `DOCX2PDF_FONT` and `DOCX2PDF_FONT_CJK` are honored by the
+binary when no `-font` / `-font-fallback` flag is given, so the
+Dockerfile's `ENV` directives make the container work out of the box.
+Override by mounting your own TTF and pointing the env var at it:
+
+```bash
+docker run --rm -v "$PWD":/work \
+    -e DOCX2PDF_FONT_CJK=/work/SimSun.ttf \
+    bobyeoh/docx2pdf-go -in /work/in.docx -out /work/out.pdf
+```
 
 ---
 

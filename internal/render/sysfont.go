@@ -5,6 +5,14 @@ import (
 	"strings"
 )
 
+// Env-var names honored when Options.FontRegular / FontFallback are
+// empty. Set by the Docker image so containerized callers get sensible
+// defaults without having to pass -font flags.
+const (
+	envFontRegular  = "DOCX2PDF_FONT"
+	envFontFallback = "DOCX2PDF_FONT_CJK"
+)
+
 // systemFontCandidates returns paths to TTF/TTC fonts that commonly exist
 // on the major platforms. Used as the fallback when a caller doesn't
 // supply Options.FontRegular. The list is intentionally biased toward
@@ -50,6 +58,21 @@ func findSystemFont() string {
 		}
 	}
 	return ""
+}
+
+// resolveFontFromEnv reads the named environment variable; returns the
+// path only when the file actually exists. A stale env var pointing at
+// a missing file is treated as unset rather than letting AddTTFFont
+// fail with a less informative error later.
+func resolveFontFromEnv(name string) string {
+	p := strings.TrimSpace(os.Getenv(name))
+	if p == "" {
+		return ""
+	}
+	if _, err := os.Stat(p); err != nil {
+		return ""
+	}
+	return p
 }
 
 // formatFontCandidates is the joined-with-commas form used in error
