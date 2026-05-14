@@ -238,6 +238,7 @@ func allCases() []verifyCase {
 		caseMoveToMoveFrom(),
 		caseOLEObjectPlaceholder(),
 		caseSettingsDefaultTabStop(),
+		caseVMLImage(),
 		// — batch Q: context cancel ---
 		// (tested separately via TestContextCancel, not the harness)
 	}
@@ -3576,6 +3577,54 @@ func bboxXMin(bboxXML, label string) (float64, bool) {
 		return 0, false
 	}
 	return v, true
+}
+
+// caseVMLImage exercises the legacy w:pict / v:imagedata route. Common in
+// older Word docs and Excel/Outlook pastes; previously skipped entirely so
+// the image went missing. The case asserts the image renders by checking
+// for an embedded /Image XObject in the PDF stream — image presence is the
+// only signal pdftotext can't give us.
+func caseVMLImage() verifyCase {
+	img := makeSolidPNG(40, 20, color.RGBA{R: 30, G: 200, B: 30, A: 255})
+	return verifyCase{
+		name:        "113_vml_image",
+		description: "w:pict / v:imagedata routes through the same image renderer as w:drawing",
+		build: func(t *testing.T, dir string) string {
+			return newDocx().
+				Body(`
+    <w:p>
+      <w:r><w:t xml:space="preserve">before </w:t></w:r>
+      <w:r>
+        <w:pict>
+          <v:shape xmlns:v="urn:schemas-microsoft-com:vml" style="width:40pt;height:20pt">
+            <v:imagedata r:id="rImg"/>
+          </v:shape>
+        </w:pict>
+      </w:r>
+      <w:r><w:t xml:space="preserve"> after</w:t></w:r>
+    </w:p>`).
+				Media("image1.png", img).
+				Rels(`<?xml version="1.0"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rImg" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image1.png"/>
+</Relationships>`).
+				Write(t, dir)
+		},
+		expectText:  []string{"before", "after"},
+		expectPages: 1,
+		custom: func(t *testing.T, pdf string, fail func(format string, args ...any)) {
+			// Raw scan: gopdf emits images as /Image XObjects. If we routed
+			// through the image path, the PDF stream will contain "/Image".
+			data, err := os.ReadFile(pdf)
+			if err != nil {
+				fail("read pdf: %v", err)
+				return
+			}
+			if !bytes.Contains(data, []byte("/Image")) {
+				fail("no /Image XObject in PDF — VML image did not render")
+			}
+		},
+	}
 }
 
 // writeReport renders an HTML index showing every case's pages with badges.

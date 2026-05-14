@@ -127,6 +127,7 @@ The image already includes Noto Sans + Noto CJK at the paths above
 | Multi-page tables (crosses page boundaries cleanly) | ✅ |
 | Inline images: PNG / JPEG / GIF | ✅ |
 | Anchored images (`wp:anchor`) — rendered as inline best-effort | ✅ |
+| Legacy VML images (`w:pict` / `v:imagedata`) — older Word docs, pasted content | ✅ |
 | Paragraph styles with `basedOn` chains + `docDefaults` (rPr + pPr) | ✅ |
 | Multi-section documents — different page sizes / orientations per section | ✅ |
 | Headers and footers — per-section, with full block content | ✅ |
@@ -280,7 +281,8 @@ to their Go service.
 Issues and PRs welcome. Highest-impact missing features (in roughly that
 order):
 
-1. Text wrap around floating images (`wp:anchor` with wrap geometry)
+1. Text wrap around floating images / frames (`wp:anchor` with wrap geometry,
+   `w:framePr`)
 2. RTL layout for Hebrew / Arabic (bidi line breaker)
 3. Equations (`m:oMath`)
 4. Comments and revision tracking

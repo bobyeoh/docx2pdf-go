@@ -2049,8 +2049,21 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 					})
 				}
 			case "pict":
-				// Legacy VML images; skip for now (docx4j supports via fallback).
-				_ = dec.Skip()
+				// Legacy VML images: <w:pict><v:shape style="..."><v:imagedata r:id="..."/>
+				// </v:shape></w:pict>. Older Word docs, Excel/Outlook pastes, and
+				// some converters still emit these instead of w:drawing.
+				vi, err := findPictInfo(dec, t)
+				if err != nil {
+					return nil, err
+				}
+				if vi.RID != "" {
+					atoms = append(atoms, Run{
+						ImageID:       vi.RID,
+						ImageWidthPt:  vi.WPt,
+						ImageHeightPt: vi.HPt,
+						Props:         rp,
+					})
+				}
 			case "object":
 				// w:object wraps OLE/embedded content (Excel range, Visio,
 				// chart, equation, ...). We can't render the foreign payload,
@@ -2138,6 +2151,114 @@ func findDrawingInfo(dec *xml.Decoder, start xml.StartElement) (info drawingInfo
 		}
 	}
 	return info, nil
+}
+
+// pictInfo carries the bits we extract from a VML <w:pict> subtree.
+type pictInfo struct {
+	RID      string
+	WPt, HPt float64
+}
+
+// findPictInfo walks a w:pict subtree pulling out the embedded image rId
+// (from v:imagedata) and the shape's declared size (from v:shape's
+// CSS-style "style" attribute: width:1.5in;height:0.75in). Returns an
+// empty RID when no image reference is present — caller drops the run.
+func findPictInfo(dec *xml.Decoder, start xml.StartElement) (info pictInfo, err error) {
+	depth := 1
+	for depth > 0 {
+		tok, e := dec.Token()
+		if e != nil {
+			return info, e
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			depth++
+			switch t.Name.Local {
+			case "shape", "rect", "roundrect", "oval", "line":
+				// VML shape carrying the image. Parse style for size.
+				if style := attr(t, "style"); style != "" {
+					w, h := parseVMLSize(style)
+					if w > 0 {
+						info.WPt = w
+					}
+					if h > 0 {
+						info.HPt = h
+					}
+				}
+			case "imagedata":
+				// r:id (or r:relid) references the image part. Accept either
+				// since some converters use relid.
+				for _, a := range t.Attr {
+					if a.Name.Local == "id" || a.Name.Local == "relid" {
+						info.RID = a.Value
+						break
+					}
+				}
+			}
+		case xml.EndElement:
+			depth--
+		}
+	}
+	return info, nil
+}
+
+// parseVMLSize extracts width and height in points from a VML CSS-like
+// style string ("width:1.5in;height:0.75in"). Unrecognized units fall back
+// to zero so the renderer uses the image's natural size.
+func parseVMLSize(style string) (w, h float64) {
+	for _, decl := range strings.Split(style, ";") {
+		colon := strings.IndexByte(decl, ':')
+		if colon < 0 {
+			continue
+		}
+		key := strings.TrimSpace(strings.ToLower(decl[:colon]))
+		val := strings.TrimSpace(decl[colon+1:])
+		switch key {
+		case "width":
+			w = parseCSSLength(val)
+		case "height":
+			h = parseCSSLength(val)
+		}
+	}
+	return w, h
+}
+
+// parseCSSLength converts a single CSS length token ("1.5in", "100pt",
+// "300px") to PostScript points. Returns 0 on failure or unknown unit.
+func parseCSSLength(s string) float64 {
+	s = strings.TrimSpace(s)
+	// Find where the number ends.
+	end := 0
+	for end < len(s) {
+		c := s[end]
+		if !(c >= '0' && c <= '9') && c != '.' && c != '-' && c != '+' {
+			break
+		}
+		end++
+	}
+	if end == 0 {
+		return 0
+	}
+	n, err := strconv.ParseFloat(s[:end], 64)
+	if err != nil {
+		return 0
+	}
+	unit := strings.ToLower(strings.TrimSpace(s[end:]))
+	switch unit {
+	case "pt", "":
+		return n
+	case "in":
+		return n * 72
+	case "cm":
+		return n * 72 / 2.54
+	case "mm":
+		return n * 72 / 25.4
+	case "px":
+		return n * 72 / 96
+	case "pc": // pica
+		return n * 12
+	}
+	return 0
 }
 
 func decodeTable(dec *xml.Decoder, start xml.StartElement, pctx *parseDocContext) (Table, error) {

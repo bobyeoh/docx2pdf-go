@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (later round)
+- **Legacy VML images render.** `w:pict` / `v:imagedata` (older Word output,
+  Excel/Outlook pasted images) now flows through the same image pipeline as
+  `w:drawing`. Sizes parsed from CSS-style `style="width:1in;height:0.5in"`
+  with pt/in/cm/mm/px/pc/no-unit support. Regression case #113.
+
 ### Added (this round)
 - **`word/settings.xml` is now parsed.** Three doc-level knobs flow into
   rendering:
