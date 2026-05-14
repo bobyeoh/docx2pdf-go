@@ -2175,6 +2175,15 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 						Props:         rp,
 					})
 				}
+				// Text-box body (wps:txbx) accompanies any image content
+				// the drawing also has — both can coexist on one shape.
+				// Inline-emit as italic so the reader can distinguish
+				// box content from surrounding flow text.
+				if di.TxbxText != "" {
+					trp := rp
+					trp.Italic = true
+					atoms = append(atoms, Run{Text: di.TxbxText, Props: trp})
+				}
 			case "pict":
 				// Legacy VML images: <w:pict><v:shape style="..."><v:imagedata r:id="..."/>
 				// </v:shape></w:pict>. Older Word docs, Excel/Outlook pastes, and
@@ -2213,11 +2222,16 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 }
 
 // drawingInfo captures everything we need from a w:drawing subtree: rId,
-// optional explicit extent, and optional a:srcRect crop percentages.
+// optional explicit extent, optional a:srcRect crop percentages, and
+// optional text-box body (when the drawing wraps a wps:txbx shape).
 type drawingInfo struct {
 	RID                        string
 	WPt, HPt                   float64
 	CropT, CropB, CropL, CropR float64 // pct
+	// TxbxText is the concatenated visible text inside a w:txbxContent,
+	// if present. Best-effort: structural formatting inside the text box
+	// is lost. Empty when the drawing is an image-only or shape-only.
+	TxbxText string
 }
 
 // emuPerPt is the OOXML "English Metric Unit" → PostScript point conversion.
@@ -2272,12 +2286,59 @@ func findDrawingInfo(dec *xml.Decoder, start xml.StartElement) (info drawingInfo
 				info.CropB = parseCrop("b")
 				info.CropL = parseCrop("l")
 				info.CropR = parseCrop("r")
+			case "txbxContent":
+				// Word text-box body. Real txbxContent holds a tree of
+				// w:p/w:r/w:t; we pull out the visible text with a single
+				// CharData sweep so the content survives even though
+				// internal formatting (bold, lists, tables-in-textboxes)
+				// is lost. Whitespace between paragraphs collapses; a
+				// single space is inserted to keep adjacent words apart.
+				txt, err := extractTxbxText(dec, t)
+				if err != nil {
+					return info, err
+				}
+				info.TxbxText = txt
+				// extractTxbxText consumed the matching EndElement, so
+				// undo the +1 we did at the top of this StartElement
+				// branch — otherwise depth never returns to 0.
+				depth--
 			}
 		case xml.EndElement:
 			depth--
 		}
 	}
 	return info, nil
+}
+
+// extractTxbxText concatenates the visible text inside a w:txbxContent
+// subtree. We separate paragraphs with a single space rather than try to
+// preserve them as standalone Paragraph blocks — text-box content lives
+// inline at a run level in our model, and inline runs don't carry
+// paragraph breaks. Inserting whitespace between paragraphs keeps words
+// from being run together.
+func extractTxbxText(dec *xml.Decoder, start xml.StartElement) (string, error) {
+	var sb []byte
+	depth := 1
+	for depth > 0 {
+		tok, err := dec.Token()
+		if err != nil {
+			return string(sb), err
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			depth++
+			// Treat a new w:p as a soft separator: insert a space before
+			// its content joins the accumulator.
+			if t.Name.Local == "p" && len(sb) > 0 {
+				sb = append(sb, ' ')
+			}
+		case xml.EndElement:
+			depth--
+		case xml.CharData:
+			sb = append(sb, t...)
+		}
+	}
+	return string(sb), nil
 }
 
 // pictInfo carries the bits we extract from a VML <w:pict> subtree.

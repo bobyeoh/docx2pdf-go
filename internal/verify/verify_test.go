@@ -247,6 +247,7 @@ func allCases() []verifyCase {
 		caseDisplayMath(),
 		caseFldSimplePage(),
 		caseRTLParagraph(),
+		caseTextBoxContent(),
 		// — batch Q: context cancel ---
 		// (tested separately via TestContextCancel, not the harness)
 	}
@@ -3975,6 +3976,44 @@ func hasWordRightOf(bboxXML string, threshold float64) bool {
 			return true
 		}
 		rest = rest[end+1:]
+	}
+}
+
+// caseTextBoxContent: a w:drawing wrapping a wps:txbx with paragraphs
+// inside. Without extraction the whole drawing falls through and the
+// text-box content is lost. We assert the text-box prose reaches the
+// PDF.
+func caseTextBoxContent() verifyCase {
+	return verifyCase{
+		name:        "122_textbox_content",
+		description: "wps:txbx text-box content is preserved as inline italic text",
+		build: func(t *testing.T, dir string) string {
+			return newDocx().Body(`
+    <w:p>
+      <w:r><w:t xml:space="preserve">before-box </w:t></w:r>
+      <w:r>
+        <w:drawing>
+          <wp:anchor xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">
+            <a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+              <a:graphicData>
+                <wps:wsp xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">
+                  <wps:txbx>
+                    <w:txbxContent>
+                      <w:p><w:r><w:t>FIRST-BOX-LINE</w:t></w:r></w:p>
+                      <w:p><w:r><w:t>SECOND-BOX-LINE</w:t></w:r></w:p>
+                    </w:txbxContent>
+                  </wps:txbx>
+                </wps:wsp>
+              </a:graphicData>
+            </a:graphic>
+          </wp:anchor>
+        </w:drawing>
+      </w:r>
+      <w:r><w:t xml:space="preserve"> after-box</w:t></w:r>
+    </w:p>`).Write(t, dir)
+		},
+		expectText:  []string{"before-box", "FIRST-BOX-LINE", "SECOND-BOX-LINE", "after-box"},
+		expectPages: 1,
 	}
 }
 

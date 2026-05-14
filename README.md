@@ -128,6 +128,7 @@ The image already includes Noto Sans + Noto CJK at the paths above
 | Inline images: PNG / JPEG / GIF | ✅ |
 | Anchored images (`wp:anchor`) — rendered as inline best-effort | ✅ |
 | Legacy VML images (`w:pict` / `v:imagedata`) — older Word docs, pasted content | ✅ |
+| Text boxes (`wps:txbx` / `w:txbxContent`) — content extracted as inline italic; box geometry not preserved | ⚠️ |
 | Paragraph styles with `basedOn` chains + `docDefaults` (rPr + pPr) | ✅ |
 | Multi-section documents — different page sizes / orientations per section | ✅ |
 | Headers and footers — per-section, with full block content | ✅ |

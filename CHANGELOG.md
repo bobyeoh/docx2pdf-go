@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added (later round)
+- **Text-box content (`wps:txbx` / `w:txbxContent`) is preserved.** A
+  Word drawing wrapping a shape with text — pull-quotes, callouts,
+  sidebars — used to be skipped entirely. Now the visible text is pulled
+  out of `w:txbxContent` and emitted as an inline italic run at the
+  drawing's position in the body flow. Box geometry, internal formatting,
+  and nested tables inside the box are lost; this is the same trade-off
+  as math and OLE. Regression case #122.
 - **Right-to-left paragraphs render in correct visual order.** A `w:bidi`
   paragraph now reverses the line-internal atom order at flush time and
   reverses the rune sequence inside each RTL-only word atom; default
