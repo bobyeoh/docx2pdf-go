@@ -91,6 +91,11 @@ func Parse(r io.ReaderAt, size int64) (*Document, error) {
 			return nil, fmt.Errorf("styles.xml: %w", err)
 		}
 	}
+	if f, ok := files["word/settings.xml"]; ok {
+		// Settings are best-effort: a malformed settings.xml shouldn't
+		// keep the document from rendering. Defaults take over.
+		_ = parseSettings(f, &doc.Settings)
+	}
 
 	rels := map[string]relEntry{} // rId → relationship metadata
 	if f, ok := files["word/_rels/document.xml.rels"]; ok {
@@ -415,6 +420,46 @@ func parseAppProps(f *zip.File, p *Properties) error {
 					p.Lines = x
 				}
 			}
+		}
+	}
+}
+
+// parseSettings reads the leaf flags from word/settings.xml that the
+// renderer can consume. Word stores most settings as empty elements where
+// presence = true (e.g. <w:evenAndOddHeaders/>); a few carry a w:val.
+func parseSettings(f *zip.File, s *Settings) error {
+	rc, err := openZipFile(f)
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+	dec := xml.NewDecoder(rc)
+	for {
+		tok, err := dec.Token()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		se, ok := tok.(xml.StartElement)
+		if !ok {
+			continue
+		}
+		switch se.Name.Local {
+		case "evenAndOddHeaders":
+			s.EvenAndOddHeaders = true
+			_ = dec.Skip()
+		case "displayBackgroundShape":
+			s.DisplayBackgroundShape = true
+			_ = dec.Skip()
+		case "defaultTabStop":
+			if v := attr(se, "val"); v != "" {
+				if x, err := strconv.Atoi(v); err == nil && x > 0 {
+					s.DefaultTabStopTwips = x
+				}
+			}
+			_ = dec.Skip()
 		}
 	}
 }
@@ -1525,14 +1570,15 @@ func decodeParagraph(dec *xml.Decoder, start xml.StartElement, pctx *parseDocCon
 					delete(bmActive, name)
 				}
 				_ = dec.Skip()
-			case "ins":
-				// w:ins wraps a tracked-change INSERTION — accept mode: render
-				// its child runs as normal text.
+			case "ins", "moveTo":
+				// Tracked-change INSERTION or move-to (the new location of
+				// moved content) — accept mode: render child runs as normal.
 				if err := decodeWrapper(dec, t, &p, paraRPr, pctx, false); err != nil {
 					return p, err
 				}
-			case "del":
-				// w:del wraps DELETED runs — accept mode: drop entirely.
+			case "del", "moveFrom":
+				// Tracked-change DELETION or move-from (the old location of
+				// moved content) — accept mode: drop entirely.
 				if err := decodeWrapper(dec, t, &p, paraRPr, pctx, true); err != nil {
 					return p, err
 				}
@@ -1606,11 +1652,11 @@ func decodeWrapper(dec *xml.Decoder, start xml.StartElement, p *Paragraph, paraR
 				if err := decodeHyperlink(dec, t, p, paraRPr, pctx); err != nil {
 					return err
 				}
-			case "ins", "del", "smartTag", "customXml":
-				// Nested wrappers: a w:del inside a w:ins still drops; a
-				// w:ins inside a w:del still drops (parent wins via the
-				// drop flag — Word's "accept all" semantics).
-				childDrop := drop || t.Name.Local == "del"
+			case "ins", "moveTo", "del", "moveFrom", "smartTag", "customXml":
+				// Nested wrappers: a delete-flavored wrapper inside an
+				// insert-flavored one still drops; parent wins via the drop
+				// flag (Word's "accept all" semantics).
+				childDrop := drop || t.Name.Local == "del" || t.Name.Local == "moveFrom"
 				if err := decodeWrapper(dec, t, p, paraRPr, pctx, childDrop); err != nil {
 					return err
 				}
@@ -2004,6 +2050,16 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 				}
 			case "pict":
 				// Legacy VML images; skip for now (docx4j supports via fallback).
+				_ = dec.Skip()
+			case "object":
+				// w:object wraps OLE/embedded content (Excel range, Visio,
+				// chart, equation, ...). We can't render the foreign payload,
+				// but emitting a marker run beats silently dropping it — at
+				// least the reader sees "something was here".
+				atoms = append(atoms, Run{
+					Text:  "[Embedded object]",
+					Props: rp,
+				})
 				_ = dec.Skip()
 			default:
 				_ = dec.Skip()

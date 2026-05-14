@@ -34,14 +34,22 @@ const (
 
 // nextTabAfterWithAlign returns the next tab stop strictly past relX
 // (measured from line left margin), along with its leader, alignment, and
-// a found flag.
+// a found flag. When no explicit w:tabs apply, falls back to a uniform
+// grid — using the doc's w:defaultTabStop when present, else the
+// half-inch (720 twips) Word default.
 func (r *renderer) nextTabAfterWithAlign(relX float64, p docx.RunProps) (float64, string, string, bool) {
 	for _, ts := range r.activeTabs {
 		if ts.Pos > relX+0.5 {
 			return ts.Pos, ts.Leader, ts.Val, true
 		}
 	}
-	const grid = 36.0
+	grid := 36.0 // 720 twips = 36pt, Word's default
+	if r.doc != nil && r.doc.Settings.DefaultTabStopTwips > 0 {
+		grid = twipsToPt(r.doc.Settings.DefaultTabStopTwips)
+	}
+	if grid <= 0 {
+		grid = 36.0
+	}
 	next := (float64(int(relX/grid)) + 1) * grid
 	if next > r.contentW {
 		return 0, "", "", false

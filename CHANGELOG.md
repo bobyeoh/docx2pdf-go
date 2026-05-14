@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (this round)
+- **`word/settings.xml` is now parsed.** Three doc-level knobs flow into
+  rendering:
+  - `w:defaultTabStop` drives the implicit tab grid (previously hard-coded
+    to 36pt).
+  - `w:evenAndOddHeaders` is now the master switch for even-page H/F — a
+    section's even references are honored only when the setting is on.
+  - `w:displayBackgroundShape` gates `w:background` color drawing, matching
+    Word's behavior (default off).
+- **`w:moveTo` / `w:moveFrom`** flow through the wrapper handler the same
+  way `w:ins` / `w:del` do (moveTo keeps content, moveFrom drops it).
+- **`w:object` (OLE / embedded content)** emits an `[Embedded object]`
+  marker run rather than silently disappearing.
+- Regression cases 110–112 covering the above.
+
 ### Fixed
 - **Image sizing was 33% too large.** Drawing extent EMU values were divided
   by 9525 (pixels-per-EMU @ 96 dpi) instead of 12700 (EMU-per-point). All

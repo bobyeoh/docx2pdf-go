@@ -58,7 +58,10 @@ func (r *renderer) stampPageDecorations(sections []docx.Section, sectionPageStar
 		r.marB = twipsToPt(sec.Margins.Bottom)
 		r.contentW = r.pageW - r.marL - r.marR
 
-		if sec.BackgroundColor != "" {
+		// Word only paints w:background when settings.xml declares
+		// w:displayBackgroundShape — without that switch the color is
+		// stored but suppressed at render time.
+		if sec.BackgroundColor != "" && r.doc.Settings.DisplayBackgroundShape {
 			r1, g1, b1 := parseHexColor(sec.BackgroundColor)
 			r.pdf.SetFillColor(r1, g1, b1)
 			r.pdf.Rectangle(0, 0, r.pageW, r.pageH, "F", 0, 0)
@@ -91,6 +94,11 @@ func (r *renderer) stampPageDecorations(sections []docx.Section, sectionPageStar
 		hdr := sec.HeaderBlocks
 		ftr := sec.FooterBlocks
 		pageWithinSection := i - sectionPageStart[sectionOf(i)] + 1
+		// Even-page H/F apply only when BOTH this section declared an even
+		// reference AND the doc-level setting (w:evenAndOddHeaders in
+		// settings.xml) is on. Either flag alone is insufficient per Word's
+		// behavior: the setting is the master switch.
+		evenActive := sec.EvenAndOddHeaders && r.doc.Settings.EvenAndOddHeaders
 		if sec.TitlePg && pageWithinSection == 1 {
 			if len(sec.HeaderFirstBlocks) > 0 {
 				hdr = sec.HeaderFirstBlocks
@@ -98,7 +106,7 @@ func (r *renderer) stampPageDecorations(sections []docx.Section, sectionPageStar
 			if len(sec.FooterFirstBlocks) > 0 {
 				ftr = sec.FooterFirstBlocks
 			}
-		} else if sec.EvenAndOddHeaders && i%2 == 0 {
+		} else if evenActive && i%2 == 0 {
 			if len(sec.HeaderEvenBlocks) > 0 {
 				hdr = sec.HeaderEvenBlocks
 			}

@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -234,6 +235,9 @@ func allCases() []verifyCase {
 		caseHangingIndent(),
 		caseSmartTagTransparent(),
 		caseInsHyperlinkSurvives(),
+		caseMoveToMoveFrom(),
+		caseOLEObjectPlaceholder(),
+		caseSettingsDefaultTabStop(),
 		// — batch Q: context cancel ---
 		// (tested separately via TestContextCancel, not the harness)
 	}
@@ -3443,6 +3447,135 @@ func caseInsHyperlinkSurvives() verifyCase {
 		expectText:  []string{"before", "INSERTED-LINK", "after"},
 		expectPages: 1,
 	}
+}
+
+// caseMoveToMoveFrom: tracked-change moves. moveTo (new location) renders;
+// moveFrom (old location) drops. Behaves identically to ins/del per Word's
+// "accept all" semantics.
+func caseMoveToMoveFrom() verifyCase {
+	return verifyCase{
+		name:        "110_move_to_move_from",
+		description: "w:moveTo keeps moved text; w:moveFrom drops the old location",
+		build: func(t *testing.T, dir string) string {
+			return newDocx().Body(`
+    <w:p>
+      <w:r><w:t xml:space="preserve">before </w:t></w:r>
+      <w:moveTo w:id="1" w:author="x" w:date="2026-01-01T00:00:00Z">
+        <w:r><w:t>MOVED-HERE</w:t></w:r>
+      </w:moveTo>
+      <w:r><w:t xml:space="preserve"> middle </w:t></w:r>
+      <w:moveFrom w:id="2" w:author="x" w:date="2026-01-01T00:00:00Z">
+        <w:r><w:t>SHOULD-NOT-APPEAR</w:t></w:r>
+      </w:moveFrom>
+      <w:r><w:t xml:space="preserve">after</w:t></w:r>
+    </w:p>`).Write(t, dir)
+		},
+		expectText:  []string{"before", "MOVED-HERE", "middle", "after"},
+		expectPages: 1,
+		custom: func(t *testing.T, pdf string, fail func(format string, args ...any)) {
+			txt := pdftotext(t, pdf)
+			if strings.Contains(txt, "SHOULD-NOT-APPEAR") {
+				fail("moveFrom content leaked into output")
+			}
+		},
+	}
+}
+
+// caseOLEObjectPlaceholder: a w:object (embedded OLE) should produce a
+// visible marker rather than silently disappearing.
+func caseOLEObjectPlaceholder() verifyCase {
+	return verifyCase{
+		name:        "111_ole_object_placeholder",
+		description: "w:object emits an [Embedded object] marker so the reader sees something was there",
+		build: func(t *testing.T, dir string) string {
+			return newDocx().Body(`
+    <w:p>
+      <w:r><w:t xml:space="preserve">before </w:t></w:r>
+      <w:r>
+        <w:object>
+          <o:OLEObject xmlns:o="urn:schemas-microsoft-com:office:office" Type="Embed"/>
+        </w:object>
+      </w:r>
+      <w:r><w:t xml:space="preserve"> after</w:t></w:r>
+    </w:p>`).Write(t, dir)
+		},
+		expectText:  []string{"before", "Embedded object", "after"},
+		expectPages: 1,
+	}
+}
+
+// caseSettingsDefaultTabStop: settings.xml declares a 4-inch defaultTabStop
+// (5760 twips). A paragraph with a single tab and no explicit tabs should
+// snap to that grid instead of the 36pt half-inch fallback. We use 4 inches
+// so the resulting layout gap is unmistakable in pdftotext output.
+func caseSettingsDefaultTabStop() verifyCase {
+	return verifyCase{
+		name:        "112_settings_default_tab_stop",
+		description: "w:defaultTabStop from settings.xml drives the implicit tab grid",
+		build: func(t *testing.T, dir string) string {
+			return newDocx().
+				Body(`
+    <w:p>
+      <w:r><w:t>L</w:t></w:r>
+      <w:r><w:tab/></w:r>
+      <w:r><w:t>R</w:t></w:r>
+    </w:p>`).
+				Part("settings.xml", `<?xml version="1.0"?>
+<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:defaultTabStop w:val="5760"/>
+</w:settings>`).
+				Write(t, dir)
+		},
+		expectText:  []string{"L", "R"},
+		expectPages: 1,
+		custom: func(t *testing.T, pdf string, fail func(format string, args ...any)) {
+			// pdftotext -bbox emits each word with absolute coordinates in
+			// PDF points. With the 4-inch (288pt) defaultTabStop, R should
+			// sit at xMin ≥ 270 (allowing some slack). The half-inch fallback
+			// would put R near xMin ≈ 108.
+			out, _ := combinedOutput("pdftotext", "-bbox", pdf, "-")
+			txt := string(out)
+			lxMin, ok := bboxXMin(txt, "L")
+			if !ok {
+				fail("could not find L bbox in:\n%s", txt)
+				return
+			}
+			rxMin, ok := bboxXMin(txt, "R")
+			if !ok {
+				fail("could not find R bbox in:\n%s", txt)
+				return
+			}
+			if rxMin-lxMin < 250 {
+				fail("L→R gap = %.1fpt, want ≥ 250pt (4-inch tab grid)", rxMin-lxMin)
+			}
+		},
+	}
+}
+
+// bboxXMin pulls the xMin attribute of the first <word>…label</word> entry
+// from pdftotext -bbox output. Returns (0, false) when not found.
+func bboxXMin(bboxXML, label string) (float64, bool) {
+	needle := ">" + label + "</word>"
+	idx := strings.Index(bboxXML, needle)
+	if idx < 0 {
+		return 0, false
+	}
+	// Walk back to find the most recent xMin=" before this label.
+	prefix := bboxXML[:idx]
+	xi := strings.LastIndex(prefix, `xMin="`)
+	if xi < 0 {
+		return 0, false
+	}
+	rest := prefix[xi+len(`xMin="`):]
+	end := strings.IndexByte(rest, '"')
+	if end < 0 {
+		return 0, false
+	}
+	v, err := strconv.ParseFloat(rest[:end], 64)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
 }
 
 // writeReport renders an HTML index showing every case's pages with badges.

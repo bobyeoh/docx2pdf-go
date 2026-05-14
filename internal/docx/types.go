@@ -40,6 +40,8 @@ type Document struct {
 	// Properties from core.xml / app.xml when present — used for AUTHOR /
 	// TITLE fields and for /Info dictionary in the PDF.
 	Properties Properties
+	// Settings from word/settings.xml — doc-wide rendering knobs.
+	Settings Settings
 }
 
 // Theme holds the bits of theme1.xml we read.
@@ -66,6 +68,27 @@ type TableCondPr struct {
 	Run         RunProps
 	CellShading string
 	Borders     CellBorders
+}
+
+// Settings captures the document-wide knobs from word/settings.xml that the
+// renderer actually consumes. Everything in this struct is doc-level — per-
+// section overrides live on Section. Unset (zero) values mean "fall back to
+// the renderer's built-in default".
+type Settings struct {
+	// DefaultTabStopTwips is w:defaultTabStop — grid spacing for implicit
+	// tabs when a paragraph defines no explicit w:tabs. Zero → renderer
+	// uses 720 twips (half inch), the typical Word default.
+	DefaultTabStopTwips int
+	// EvenAndOddHeaders is w:evenAndOddHeaders — when true, sections may
+	// supply distinct even-page header/footer references. When the setting
+	// is absent, even-page references in sectPr should be ignored. We OR
+	// this with the per-section flag so docs that only declare one of the
+	// two still behave reasonably.
+	EvenAndOddHeaders bool
+	// DisplayBackgroundShape is w:displayBackgroundShape — the master
+	// switch for w:background (page color). When absent, Word does NOT
+	// paint the background even if a color is defined.
+	DisplayBackgroundShape bool
 }
 
 // Properties mirrors a slice of word/docProps/core.xml + app.xml. Word/Office
