@@ -3,6 +3,8 @@ package render
 import (
 	"os"
 	"strings"
+
+	"golang.org/x/image/font/gofont/goregular"
 )
 
 // Env-var names honored when Options.FontRegular / FontFallback are
@@ -12,6 +14,21 @@ const (
 	envFontRegular  = "DOCX2PDF_FONT"
 	envFontFallback = "DOCX2PDF_FONT_CJK"
 )
+
+// embeddedRegularFont is the MIT-licensed Go font (~150KB, Latin only).
+// It is the final fallback when no env var, system font, or caller-
+// supplied TTF is available — guarantees the binary can always render
+// Latin text even in scratch / distroless / fontless containers.
+//
+// Exported via a private sentinel rather than a path: the caller's
+// loadFont path checks for `embeddedFontSentinel` and routes the bytes
+// through AddTTFFontData instead of stat'ing the filesystem.
+var embeddedRegularFont = goregular.TTF
+
+// embeddedFontSentinel is the magic path string returned by
+// findSystemFont when nothing else matches. loadFont recognizes it and
+// uses embeddedRegularFont instead of touching the filesystem.
+const embeddedFontSentinel = "<embedded:goregular>"
 
 // systemFontCandidates returns paths to TTF/TTC fonts that commonly exist
 // on the major platforms. Used as the fallback when a caller doesn't
@@ -48,16 +65,19 @@ func systemFontCandidates() []string {
 }
 
 // findSystemFont returns the first existing path from systemFontCandidates,
-// or "" if none of them exist on the host. Pure I/O — no caching, since
-// font installation between Convert calls is implausible and a cache
-// would just hide test fixtures.
+// or the embeddedFontSentinel as a final fallback. Never returns "" —
+// the embedded Go font is always available, so the renderer will always
+// have *something* to draw Latin glyphs with even in scratch /
+// distroless / fontless containers. Pure I/O — no caching, since font
+// installation between Convert calls is implausible and a cache would
+// just hide test fixtures.
 func findSystemFont() string {
 	for _, p := range systemFontCandidates() {
 		if _, err := os.Stat(p); err == nil {
 			return p
 		}
 	}
-	return ""
+	return embeddedFontSentinel
 }
 
 // resolveFontFromEnv reads the named environment variable; returns the

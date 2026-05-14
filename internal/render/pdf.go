@@ -53,8 +53,10 @@ type Options struct {
 	// FontRegular is the path to the TTF used for normal text. When
 	// empty, resolution order is: $DOCX2PDF_FONT env var, then a list
 	// of common system-font locations (Arial / Helvetica on macOS,
-	// DejaVu / Liberation / Noto on Linux). The error from RenderWriter
-	// lists the paths tried when nothing is found.
+	// DejaVu / Liberation / Noto on Linux), then a small embedded Go
+	// font that ships with the binary so scratch / distroless /
+	// fontless containers still work. The embedded face is Latin only;
+	// CJK documents still need an explicit FontFallback.
 	FontRegular string
 	FontBold    string // optional; falls back to FontRegular
 	FontItalic  string // optional
@@ -120,17 +122,12 @@ func RenderWriter(doc *docx.Document, w io.Writer, opts Options) error {
 		//      convenient knob for containerized deployments).
 		//   2. findSystemFont(): a list of common /usr/share/fonts/
 		//      and macOS / Windows paths.
-		// If neither yields a real file, surface a clear error listing
-		// the candidates we tried so the caller knows what to provide.
+		//   3. Embedded Go font (~150 KB Latin face bundled into the
+		//      binary) — last resort so scratch / distroless / fontless
+		//      containers still produce output.
 		opts.FontRegular = resolveFontFromEnv(envFontRegular)
 		if opts.FontRegular == "" {
-			opts.FontRegular = findSystemFont()
-		}
-		if opts.FontRegular == "" {
-			return fmt.Errorf(
-				"render: FontRegular not specified and no system font found; "+
-					"set Options.FontRegular (or $%s) to a TTF/TTC path. Tried: %s",
-				envFontRegular, formatFontCandidates())
+			opts.FontRegular = findSystemFont() // never empty: falls back to embedded
 		}
 	}
 	// Symmetric env-var fallback for the CJK fallback font. Optional —

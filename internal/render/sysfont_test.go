@@ -30,17 +30,41 @@ func TestSystemFontCandidates(t *testing.T) {
 	}
 }
 
-// TestFindSystemFont confirms that on a typical dev host (macOS or
-// Linux with default font packages), findSystemFont returns a real
-// path. Skipped on hosts where none of the candidates exist so the
-// test still passes inside a stripped container.
+// TestFindSystemFont confirms findSystemFont always returns something
+// usable — either a real path on a host with fonts installed, or the
+// embedded-font sentinel on a stripped container. Empty result would
+// mean the embedded fallback failed to wire up.
 func TestFindSystemFont(t *testing.T) {
 	got := findSystemFont()
 	if got == "" {
-		t.Skip("no system font found on this host — skipping (this is OK on minimal containers)")
+		t.Fatal("findSystemFont returned empty — embedded fallback not wired up")
 	}
+	if got == embeddedFontSentinel {
+		// On a fontless host, the sentinel is the correct answer.
+		// embeddedRegularFont must be non-empty for the sentinel path
+		// to produce a working font in loadFont.
+		if len(embeddedRegularFont) == 0 {
+			t.Error("embeddedRegularFont is empty — sentinel would fail at load time")
+		}
+		return
+	}
+	// Otherwise findSystemFont must have returned a real file.
 	if _, err := os.Stat(got); err != nil {
 		t.Errorf("findSystemFont returned %q but the file doesn't exist: %v", got, err)
+	}
+}
+
+// TestEmbeddedFontRenders verifies the embedded font actually works
+// end-to-end through gopdf — protects against the goregular.TTF
+// dependency drifting in a future Go release.
+func TestEmbeddedFontRenders(t *testing.T) {
+	if len(embeddedRegularFont) == 0 {
+		t.Fatal("embeddedRegularFont is empty")
+	}
+	// Reasonable size check: Go font is ~150KB, never zero, never
+	// huge.
+	if n := len(embeddedRegularFont); n < 10_000 || n > 5_000_000 {
+		t.Errorf("embeddedRegularFont size = %d, sanity range [10KB, 5MB] failed", n)
 	}
 }
 

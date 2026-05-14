@@ -30,15 +30,25 @@ func (r *renderer) registerFonts() error {
 	return nil
 }
 
-// loadFont handles both plain TTF files and TrueType Collections.
-// gopdf's AddTTFFont parses the first 4 bytes as an sfnt version and
-// rejects "ttcf"-tagged collections; we detect that header and extract
-// face 0 from the collection before handing it to AddTTFFontData.
-// Errors from gopdf are returned wrapped with the path so callers can
-// see exactly which face failed.
+// loadFont handles plain TTF files, TrueType Collections, and the
+// embedded-Go-font sentinel.
+//
+//   - embeddedFontSentinel ("<embedded:goregular>"): load the bundled
+//     Go font bytes via AddTTFFontData. Used as the final fallback so
+//     the renderer always has *something* to draw with.
+//   - TTC (file with "ttcf" header): gopdf's AddTTFFont rejects these
+//     because it parses the first 4 bytes as an sfnt version. We
+//     extract face 0 ourselves and feed the result to AddTTFFontData.
+//   - Anything else: plain TTF, hand off to AddTTFFont directly.
+//
+// Errors are returned wrapped with the path so callers can see exactly
+// which face failed.
 func (r *renderer) loadFont(family, path string) error {
 	if path == "" {
 		return fmt.Errorf("empty path")
+	}
+	if path == embeddedFontSentinel {
+		return r.pdf.AddTTFFontData(family, embeddedRegularFont)
 	}
 	if looksLikeTTC(path) {
 		data, err := extractTTCFace0(path)

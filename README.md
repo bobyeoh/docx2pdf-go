@@ -38,8 +38,10 @@ external runtimes.
 
 ### What you get
 
-- **Deploys as a 12 MB static binary.** `CGO_ENABLED=0`, single file, runs
-  anywhere Go runs.
+- **Deploys as a ~3.5 MB static binary.** `CGO_ENABLED=0`, single file,
+  runs anywhere Go runs — including `scratch` / `distroless` / Alpine
+  with no fonts installed. A small Latin font (Go fonts, MIT-licensed,
+  ~150 KB) is embedded in the binary as a final fallback.
 - **Ships as a ~70 MB Docker image** with Noto Sans + WenQuanYi Zen Hei
   fonts baked in (Latin + CJK fallback, no Word installation needed).
 - **`go get`-able library**, with a stable public surface and a streaming
@@ -119,21 +121,47 @@ docker run --rm -v "$PWD":/work bobyeoh/docx2pdf-go \
     -in /work/in.docx -out /work/out.pdf -page-numbers
 ```
 
-The image (~70 MB) ships **Noto Sans** for Latin text and **WenQuanYi
-Zen Hei** for CJK fallback. Noto Sans CJK is *not* bundled because it
-uses CFF/PostScript outlines (`.ttc` with `OTTO` faces) which gopdf's
-TrueType-only parser can't render; WQY Zen Hei is a TrueType TTC that
-the runtime extracts face 0 from automatically.
+The official image (~70 MB) ships **Noto Sans** for Latin text and
+**WenQuanYi Zen Hei** for CJK fallback. Noto Sans CJK is *not*
+bundled because it uses CFF/PostScript outlines (`.ttc` with `OTTO`
+faces) which gopdf's TrueType-only parser can't render; WQY Zen Hei
+is a TrueType TTC that the runtime extracts face 0 from automatically.
 
-The env vars `DOCX2PDF_FONT` and `DOCX2PDF_FONT_CJK` are honored by the
-binary when no `-font` / `-font-fallback` flag is given, so the
-Dockerfile's `ENV` directives make the container work out of the box.
-Override by mounting your own TTF and pointing the env var at it:
+The env vars `DOCX2PDF_FONT` and `DOCX2PDF_FONT_CJK` are honored by
+the binary when no `-font` / `-font-fallback` flag is given, so the
+container works out of the box.
+
+#### Running in *any* container — including `scratch` / `distroless`
+
+The binary embeds a small Latin font as a last-resort fallback, so
+even minimal images with no fonts at all produce a valid PDF for
+Latin-only documents:
+
+```dockerfile
+# Multi-stage build into distroless: total size ~5 MB.
+FROM golang:alpine AS build
+WORKDIR /src
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" \
+    -o /docx2pdf ./cmd/docx2pdf
+
+FROM gcr.io/distroless/static-debian12
+COPY --from=build /docx2pdf /docx2pdf
+ENTRYPOINT ["/docx2pdf"]
+```
+
+```bash
+docker run --rm -v "$PWD":/work my-image \
+    -in /work/in.docx -out /work/out.pdf  # no -font needed
+```
+
+CJK content in a fontless image still needs a CJK TTF — mount it and
+point `$DOCX2PDF_FONT_CJK` at it:
 
 ```bash
 docker run --rm -v "$PWD":/work \
     -e DOCX2PDF_FONT_CJK=/work/SimSun.ttf \
-    bobyeoh/docx2pdf-go -in /work/in.docx -out /work/out.pdf
+    my-image -in /work/in.docx -out /work/out.pdf
 ```
 
 ---
