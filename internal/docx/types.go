@@ -28,6 +28,10 @@ type Document struct {
 	// "Endnotes" trailing section at document end so the content survives.
 	Footnotes map[string][]Block
 	Endnotes  map[string][]Block
+	// Comments are reviewer annotations from word/comments.xml, keyed by
+	// w:id. The renderer appends a "Comments" trailing section so the
+	// notes survive into the PDF rather than being silently dropped.
+	Comments map[string][]Block
 	// Theme is the parsed contents of word/theme/theme1.xml — color scheme +
 	// font scheme — used to resolve w:themeColor / rFonts w:asciiTheme refs.
 	Theme Theme

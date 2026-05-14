@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added (later round)
+- **Comments are surfaced.** `word/comments.xml` is now parsed and
+  appended at document end as a "Comments" trailer alongside the
+  existing Endnotes section. Reviewer markup that would have been
+  silently dropped now survives into the PDF in a clearly-labeled
+  section. Regression case #125.
 - **`mc:AlternateContent` (Markup Compatibility) is honored.** Word
   wraps newer feature output in `<mc:Choice>` with a `<mc:Fallback>`
   for older readers. Previously the whole wrapper fell into

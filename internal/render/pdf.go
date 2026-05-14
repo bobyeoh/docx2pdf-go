@@ -276,6 +276,13 @@ func RenderWriter(doc *docx.Document, w io.Writer, opts Options) error {
 	if err := r.appendNotesSection(doc.Endnotes, "Endnotes"); err != nil {
 		return err
 	}
+	// Comments are reviewer markup; they're not part of the visible body
+	// in Word's default print view, but dropping them silently loses
+	// content. Surface them as a trailing section after endnotes so a
+	// human can still see them in the produced PDF.
+	if err := r.appendNotesSection(doc.Comments, "Comments"); err != nil {
+		return err
+	}
 
 	if err := r.stampPageDecorations(sections, sectionPageStart); err != nil {
 		return err

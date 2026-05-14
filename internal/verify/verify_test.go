@@ -250,6 +250,7 @@ func allCases() []verifyCase {
 		caseTextBoxContent(),
 		caseAlternateContentChoice(),
 		caseAlternateContentFallback(),
+		caseComments(),
 		// — batch Q: context cancel ---
 		// (tested separately via TestContextCancel, not the harness)
 	}
@@ -4105,6 +4106,50 @@ func caseAlternateContentFallback() verifyCase {
 			}
 			if !bytes.Contains(data, []byte("/Image")) {
 				fail("no /Image XObject — Fallback VML image did not render")
+			}
+		},
+	}
+}
+
+// caseComments: reviewer markup from word/comments.xml. Body has
+// commentRangeStart/End wrapping a phrase and commentReference at the
+// site. We don't render any inline marker — the comment text appears
+// in the trailing "Comments" section.
+func caseComments() verifyCase {
+	return verifyCase{
+		name:        "125_comments_trailer",
+		description: "Comments survive as a trailing 'Comments' section, like endnotes",
+		build: func(t *testing.T, dir string) string {
+			return newDocx().
+				Body(`
+    <w:p>
+      <w:commentRangeStart w:id="0"/>
+      <w:r><w:t>The reviewed phrase</w:t></w:r>
+      <w:commentRangeEnd w:id="0"/>
+      <w:r><w:commentReference w:id="0"/></w:r>
+      <w:r><w:t xml:space="preserve"> stays in the body.</w:t></w:r>
+    </w:p>`).
+				Part("comments.xml", `<?xml version="1.0"?>
+<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:comment w:id="0" w:author="Reviewer" w:date="2026-01-01T00:00:00Z">
+    <w:p><w:r><w:t>FIRST-COMMENT-BODY</w:t></w:r></w:p>
+  </w:comment>
+</w:comments>`).
+				Write(t, dir)
+		},
+		expectText:  []string{"reviewed phrase", "FIRST-COMMENT-BODY"},
+		expectPages: 1,
+		custom: func(t *testing.T, pdf string, fail func(format string, args ...any)) {
+			// Order check: body text comes before the comment trailer.
+			txt := pdftotext(t, pdf)
+			b := strings.Index(txt, "reviewed phrase")
+			c := strings.Index(txt, "FIRST-COMMENT-BODY")
+			if b < 0 || c < 0 {
+				fail("missing markers in:\n%s", txt)
+				return
+			}
+			if !(b < c) {
+				fail("comment appears before body text (idx %d > %d)", c, b)
 			}
 		},
 	}

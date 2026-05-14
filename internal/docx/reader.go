@@ -61,6 +61,7 @@ func Parse(r io.ReaderAt, size int64) (*Document, error) {
 		TableStyles: map[string]TableStyle{},
 		Footnotes:   map[string][]Block{},
 		Endnotes:    map[string][]Block{},
+		Comments:    map[string][]Block{},
 		Bookmarks:   map[string]string{},
 		Theme: Theme{
 			Colors: map[string]string{},
@@ -138,6 +139,14 @@ func Parse(r io.ReaderAt, size int64) (*Document, error) {
 	if f, ok := files["word/endnotes.xml"]; ok {
 		if err := parseNotes(f, doc, "endnote", doc.Endnotes); err != nil {
 			return nil, fmt.Errorf("endnotes.xml: %w", err)
+		}
+	}
+	if f, ok := files["word/comments.xml"]; ok {
+		// Comments share the parseNotes structure: each <w:comment w:id="…">
+		// holds inner paragraphs. We reuse the same decoder with the
+		// element name "comment".
+		if err := parseNotes(f, doc, "comment", doc.Comments); err != nil {
+			return nil, fmt.Errorf("comments.xml: %w", err)
 		}
 	}
 
