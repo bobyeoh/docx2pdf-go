@@ -252,6 +252,7 @@ func allCases() []verifyCase {
 		caseAlternateContentFallback(),
 		caseComments(),
 		caseHeadingOutline(),
+		caseChartTextExtraction(),
 		// — batch Q: context cancel ---
 		// (tested separately via TestContextCancel, not the harness)
 	}
@@ -4205,6 +4206,75 @@ func caseHeadingOutline() verifyCase {
 				fail("found %d /Title entries in PDF, want ≥ 3 (one per heading)", n)
 			}
 		},
+	}
+}
+
+// caseChartTextExtraction: a w:drawing referencing an embedded chart
+// part. The chart XML carries a title and axis labels; without
+// extraction, the reader loses every word the chart was telling them.
+// We assert the chart's distinctive labels appear in the produced PDF.
+func caseChartTextExtraction() verifyCase {
+	return verifyCase{
+		name:        "127_chart_text",
+		description: "c:chart text (title + labels) is surfaced from the chart part",
+		build: func(t *testing.T, dir string) string {
+			chart := `<?xml version="1.0"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
+              xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <c:chart>
+    <c:title>
+      <c:tx><c:rich><a:p><a:r><a:t>SALES-PER-QUARTER</a:t></a:r></a:p></c:rich></c:tx>
+    </c:title>
+    <c:plotArea>
+      <c:barChart>
+        <c:ser>
+          <c:tx><c:strRef><c:strCache><c:pt><c:v>SERIES-A</c:v></c:pt></c:strCache></c:strRef></c:tx>
+          <c:cat>
+            <c:strRef><c:strCache>
+              <c:pt><c:v>Q1-LABEL</c:v></c:pt>
+              <c:pt><c:v>Q2-LABEL</c:v></c:pt>
+            </c:strCache></c:strRef>
+          </c:cat>
+        </c:ser>
+      </c:barChart>
+    </c:plotArea>
+  </c:chart>
+</c:chartSpace>`
+			body := `
+    <w:p>
+      <w:r><w:t xml:space="preserve">See the chart: </w:t></w:r>
+      <w:r>
+        <w:drawing>
+          <wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">
+            <wp:extent cx="3000000" cy="2000000"/>
+            <a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+              <a:graphicData>
+                <c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" r:id="rChart"/>
+              </a:graphicData>
+            </a:graphic>
+          </wp:inline>
+        </w:drawing>
+      </w:r>
+      <w:r><w:t xml:space="preserve"> below.</w:t></w:r>
+    </w:p>`
+			return newDocx().
+				RawBody(docHeader+body+docFooter).
+				Part("charts/chart1.xml", chart).
+				Rels(`<?xml version="1.0"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rChart" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="charts/chart1.xml"/>
+</Relationships>`).
+				Write(t, dir)
+		},
+		expectText: []string{
+			"See the chart",
+			"SALES-PER-QUARTER",
+			"SERIES-A",
+			"Q1-LABEL",
+			"Q2-LABEL",
+			"below",
+		},
+		expectPages: 1,
 	}
 }
 

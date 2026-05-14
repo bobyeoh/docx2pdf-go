@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added (later round)
+- **Chart text (titles, axis labels, series names) is surfaced.** A
+  `<w:drawing>` containing `<c:chart r:id="…">` references a separate
+  chart part (`word/charts/chartN.xml`). The parser now loads that
+  part and concatenates its CharData into `Document.Charts[rId]`; the
+  surrounding paragraph emits the labels as `[Chart: …]` italic text.
+  The data graphic itself is still not drawn — that needs a parallel
+  charting renderer. Regression case #127.
 - **PDF outline / sidebar bookmarks** are emitted from `Heading1`..`Heading9`
   and `Title` styled paragraphs. PDF readers (Preview, Adobe, ...) show a
   clickable chapter navigator. Field markers and bookmark anchors inside

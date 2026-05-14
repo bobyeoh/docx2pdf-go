@@ -145,6 +145,7 @@ The image already includes Noto Sans + Noto CJK at the paths above
 | PDF outline / clickable sidebar bookmarks from `Heading1..Heading9` + `Title` styles | ✅ |
 | Content controls (`w:sdt`) — block and inline; transparent wrapper, text preserved | ✅ |
 | Math equations (`m:oMath` / `m:oMathPara`) — text extracted as italic, structure lost | ⚠️ |
+| Charts (`c:chart`) — title, axis labels, series names extracted as `[Chart: …]` text; data graphic not drawn | ⚠️ |
 | Multi-column layout (`w:cols`) | ✅ |
 | Floating frames (`w:framePr` placement) — anchored at the right page position | ⚠️ — positioned correctly; body text does NOT wrap around |
 | Text wrap around floating images | ❌ — anchor falls back to inline |

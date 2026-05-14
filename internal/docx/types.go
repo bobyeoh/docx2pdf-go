@@ -32,6 +32,11 @@ type Document struct {
 	// w:id. The renderer appends a "Comments" trailing section so the
 	// notes survive into the PDF rather than being silently dropped.
 	Comments map[string][]Block
+	// Charts maps relationship id → flattened text extracted from a
+	// referenced chart part (word/charts/chartN.xml). We can't render
+	// the data graphic but we surface titles, axis labels, and data
+	// labels so the prose around the chart still makes sense.
+	Charts map[string]string
 	// Theme is the parsed contents of word/theme/theme1.xml — color scheme +
 	// font scheme — used to resolve w:themeColor / rFonts w:asciiTheme refs.
 	Theme Theme

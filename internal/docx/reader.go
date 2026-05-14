@@ -62,6 +62,7 @@ func Parse(r io.ReaderAt, size int64) (*Document, error) {
 		Footnotes:   map[string][]Block{},
 		Endnotes:    map[string][]Block{},
 		Comments:    map[string][]Block{},
+		Charts:      map[string]string{},
 		Bookmarks:   map[string]string{},
 		Theme: Theme{
 			Colors: map[string]string{},
@@ -171,6 +172,21 @@ func Parse(r io.ReaderAt, size int64) (*Document, error) {
 			} else {
 				footerParts[rid] = blocks
 			}
+		case isChartRel(e.Type):
+			// Charts live in their own part (word/charts/chartN.xml).
+			// Best-effort: pull all CharData out of the chart subtree so
+			// titles, axis labels, and data labels survive. Geometry
+			// and the actual series glyphs are out of scope.
+			full := "word/" + e.Target
+			zf, ok := files[full]
+			if !ok {
+				continue
+			}
+			txt, err := extractChartText(zf)
+			if err != nil {
+				continue // tolerate malformed chart part
+			}
+			doc.Charts[rid] = txt
 		}
 	}
 
@@ -1051,6 +1067,49 @@ func parseRels(f *zip.File, out map[string]relEntry) error {
 // by suffix so we don't have to hardcode the full schema URL.
 func isHeaderRel(t string) bool { return strings.HasSuffix(t, "/header") }
 func isFooterRel(t string) bool { return strings.HasSuffix(t, "/footer") }
+func isChartRel(t string) bool  { return strings.HasSuffix(t, "/chart") }
+
+// extractChartText reads a chart XML part (chartN.xml) and concatenates
+// all CharData found anywhere in the tree. Titles, axis labels, data
+// labels, legend entries, and series names all end up as text nodes
+// somewhere; concatenating them is rough but preserves the document's
+// signal that "the chart says these things". Repeated entries (e.g.
+// numeric data labels) may produce noise — acceptable for "the data
+// graphic isn't lost".
+func extractChartText(f *zip.File) (string, error) {
+	rc, err := openZipFile(f)
+	if err != nil {
+		return "", err
+	}
+	defer rc.Close()
+	dec := xml.NewDecoder(rc)
+	var sb []byte
+	var prevWasText bool
+	for {
+		tok, err := dec.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return string(sb), err
+		}
+		switch t := tok.(type) {
+		case xml.CharData:
+			s := strings.TrimSpace(string(t))
+			if s == "" {
+				continue
+			}
+			if prevWasText {
+				sb = append(sb, ' ')
+			}
+			sb = append(sb, s...)
+			prevWasText = true
+		case xml.StartElement, xml.EndElement:
+			prevWasText = false
+		}
+	}
+	return string(sb), nil
+}
 
 // --- numbering.xml -------------------------------------------------------
 
@@ -2228,6 +2287,20 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 					trp.Italic = true
 					atoms = append(atoms, Run{Text: di.TxbxText, Props: trp})
 				}
+				// Chart reference: surface the pre-extracted labels so
+				// the reader sees what the chart said. If the chart part
+				// wasn't loadable we still emit a "[Chart]" placeholder.
+				if di.ChartRID != "" {
+					trp := rp
+					trp.Italic = true
+					txt := doc.Charts[di.ChartRID]
+					if txt == "" {
+						txt = "[Chart]"
+					} else {
+						txt = "[Chart: " + txt + "]"
+					}
+					atoms = append(atoms, Run{Text: txt, Props: trp})
+				}
 			case "pict":
 				// Legacy VML images: <w:pict><v:shape style="..."><v:imagedata r:id="..."/>
 				// </v:shape></w:pict>. Older Word docs, Excel/Outlook pastes, and
@@ -2276,7 +2349,7 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 
 // drawingInfo captures everything we need from a w:drawing subtree: rId,
 // optional explicit extent, optional a:srcRect crop percentages, and
-// optional text-box body (when the drawing wraps a wps:txbx shape).
+// optional text-box / chart references.
 type drawingInfo struct {
 	RID                        string
 	WPt, HPt                   float64
@@ -2285,6 +2358,10 @@ type drawingInfo struct {
 	// if present. Best-effort: structural formatting inside the text box
 	// is lost. Empty when the drawing is an image-only or shape-only.
 	TxbxText string
+	// ChartRID is set when the drawing references a chart part via
+	// <c:chart r:id="…">. The renderer looks up Document.Charts[ChartRID]
+	// to surface chart labels as plain text. Empty for non-chart drawings.
+	ChartRID string
 }
 
 // emuPerPt is the OOXML "English Metric Unit" → PostScript point conversion.
@@ -2339,6 +2416,16 @@ func findDrawingInfo(dec *xml.Decoder, start xml.StartElement) (info drawingInfo
 				info.CropB = parseCrop("b")
 				info.CropL = parseCrop("l")
 				info.CropR = parseCrop("r")
+			case "chart":
+				// <c:chart r:id="…"> inside a drawing — references the
+				// chart part. Record the rId; renderer looks up the
+				// pre-extracted text in Document.Charts.
+				for _, a := range t.Attr {
+					if a.Name.Local == "id" {
+						info.ChartRID = a.Value
+						break
+					}
+				}
 			case "txbxContent":
 				// Word text-box body. Real txbxContent holds a tree of
 				// w:p/w:r/w:t; we pull out the visible text with a single
