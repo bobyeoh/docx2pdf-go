@@ -245,6 +245,7 @@ func allCases() []verifyCase {
 		caseSdtInTableCell(),
 		caseInlineMath(),
 		caseDisplayMath(),
+		caseFldSimplePage(),
 		// — batch Q: context cancel ---
 		// (tested separately via TestContextCancel, not the harness)
 	}
@@ -3844,6 +3845,58 @@ func caseDisplayMath() verifyCase {
 			}
 			if !(b < e && e < a) {
 				fail("expected before<equation<after, got %d %d %d", b, e, a)
+			}
+		},
+	}
+}
+
+// caseFldSimplePage exercises the "simple" form of a field — w:fldSimple
+// with a PAGE instr. Word commonly writes this form in headers/footers
+// instead of the verbose fldChar/instrText complex form. Both should
+// substitute to the actual page number per the renderer's stamp pass.
+func caseFldSimplePage() verifyCase {
+	return verifyCase{
+		name:        "120_fldsimple_page",
+		description: "w:fldSimple PAGE in a header gets substituted to the actual page number",
+		build: func(t *testing.T, dir string) string {
+			hdr := `<?xml version="1.0"?>
+<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:p>
+    <w:r><w:t xml:space="preserve">Page </w:t></w:r>
+    <w:fldSimple w:instr="PAGE">
+      <w:r><w:t>OLD-CACHED-VAL</w:t></w:r>
+    </w:fldSimple>
+  </w:p>
+</w:hdr>`
+			body := `
+    <w:p><w:r><w:t>body of doc</w:t></w:r></w:p>
+    <w:sectPr>
+      <w:headerReference w:type="default" r:id="rH1"/>
+      <w:pgSz w:w="11906" w:h="16838"/>
+      <w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440"/>
+    </w:sectPr>`
+			return newDocx().
+				RawBody(docHeader+body+docFooter).
+				Part("header1.xml", hdr).
+				Rels(`<?xml version="1.0"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rH1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header1.xml"/>
+</Relationships>`).
+				Write(t, dir)
+		},
+		expectText:  []string{"Page", "1", "body of doc"},
+		expectPages: 1,
+		custom: func(t *testing.T, pdf string, fail func(format string, args ...any)) {
+			// The OLD cached value must be replaced — if it leaks through,
+			// our fldSimple expansion to the marker stream didn't reach
+			// flattenFields.
+			txt := pdftotext(t, pdf)
+			if strings.Contains(txt, "OLD-CACHED-VAL") {
+				fail("cached PAGE value leaked — fldSimple did not substitute:\n%s", txt)
+			}
+			// "Page 1" should appear on the page (header).
+			if !strings.Contains(txt, "Page") || !strings.Contains(txt, "1") {
+				fail("missing 'Page' or '1' in:\n%s", txt)
 			}
 		},
 	}

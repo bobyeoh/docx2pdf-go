@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added (later round)
+- **`w:fldSimple` (compact field encoding) is now recognized.** Word uses
+  this form a lot in headers/footers — `<w:fldSimple w:instr="PAGE">…</w:fldSimple>`.
+  Previously dropped, which made e.g. PAGE/NUMPAGES in headers render as
+  their stale cached value (or vanish). It now expands to the same
+  begin/instr/sep/.../end marker stream the complex `fldChar` form
+  produces, so the existing field state machine handles both. Regression
+  case #120.
 - **`m:oMath` / `m:oMathPara` math equations** extract their visible text
   and emit it as an italic run (inline) or italic centered paragraph
   (display). Structural typesetting (fractions, sub/superscripts, integral

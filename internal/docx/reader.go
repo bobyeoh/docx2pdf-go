@@ -1649,6 +1649,15 @@ func decodeParagraph(dec *xml.Decoder, start xml.StartElement, pctx *parseDocCon
 				if txt != "" {
 					p.Runs = append(p.Runs, mathRun(txt, paraRPr))
 				}
+			case "fldSimple":
+				// The "simple" form of a field. Its `w:instr` attribute
+				// carries the field code; child runs hold the cached
+				// result. Expand into the same begin/instr/sep/.../end
+				// marker sequence the complex form (fldChar) produces so
+				// flattenFields can handle it uniformly downstream.
+				if err := decodeFldSimple(dec, t, &p, paraRPr, pctx); err != nil {
+					return p, err
+				}
 			case "commentRangeStart", "commentRangeEnd", "commentReference":
 				// Comments are out-of-flow; we skip the inline markers.
 				_ = dec.Skip()
@@ -1735,6 +1744,14 @@ func decodeWrapper(dec *xml.Decoder, start xml.StartElement, p *Paragraph, paraR
 					continue
 				}
 				p.Runs = append(p.Runs, mathRun(txt, paraRPr))
+			case "fldSimple":
+				if drop {
+					_ = dec.Skip()
+					continue
+				}
+				if err := decodeFldSimple(dec, t, p, paraRPr, pctx); err != nil {
+					return err
+				}
 			case "bookmarkStart":
 				id := attr(t, "id")
 				name := attr(t, "name")
