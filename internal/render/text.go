@@ -539,31 +539,44 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 		effW := r.contentW + hang
 		// Over-wide word: a single word atom wider than the line's
 		// effective width can't be wrapped by the normal "atom-vs-atom"
-		// break logic. Split it into per-rune sub-atoms so the breaker
-		// can place as many characters as fit per line, then continue.
-		// Common in narrow table cells where identifiers like
-		// "submission_timestamp" exceed the column width.
+		// break logic. Try giving it a fresh line first — if it still
+		// doesn't fit (truly over-wide, e.g. "submission_timestamp" in a
+		// narrow column), fall back to splitting it per rune. Without
+		// this fresh-line attempt, an atom like "Name" that is just
+		// barely too wide for the remaining space on the current line
+		// would split mid-word ("Nam\ne") even though it fits cleanly
+		// when placed on the next line.
 		if a.kind == atomWord && effW > 0 && a.width > effW && a.text != "" {
-			subs := r.splitWordAtomByRune(a)
-			// Replay the per-rune sequence through the same loop logic.
-			for _, sub := range subs {
-				if lineW+sub.width > effW && len(line) > 0 {
-					if line[len(line)-1].kind == atomSpace {
-						lineW -= line[len(line)-1].width
-						line = line[:len(line)-1]
-					}
-					if err := flush(false); err != nil {
-						return err
-					}
+			if len(line) > 0 {
+				if line[len(line)-1].kind == atomSpace {
+					lineW -= line[len(line)-1].width
+					line = line[:len(line)-1]
 				}
-				line = append(line, sub)
-				lineW += sub.width
-				sh := atomHeight(sub, r.opts.DefaultFontSize)
-				if sh > lineMaxH {
-					lineMaxH = sh
+				if err := flush(false); err != nil {
+					return err
 				}
 			}
-			continue
+			if a.width > effW {
+				subs := r.splitWordAtomByRune(a)
+				for _, sub := range subs {
+					if lineW+sub.width > effW && len(line) > 0 {
+						if line[len(line)-1].kind == atomSpace {
+							lineW -= line[len(line)-1].width
+							line = line[:len(line)-1]
+						}
+						if err := flush(false); err != nil {
+							return err
+						}
+					}
+					line = append(line, sub)
+					lineW += sub.width
+					sh := atomHeight(sub, r.opts.DefaultFontSize)
+					if sh > lineMaxH {
+						lineMaxH = sh
+					}
+				}
+				continue
+			}
 		}
 		if lineW+a.width > effW && len(line) > 0 {
 			if len(line) > 0 && line[len(line)-1].kind == atomSpace {

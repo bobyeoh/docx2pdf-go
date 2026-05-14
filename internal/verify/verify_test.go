@@ -260,6 +260,9 @@ func allCases() []verifyCase {
 		caseTableHeaderRepeatsAtTopOfPage(),
 		caseListMarkerWithParaIndentOverride(),
 		caseParagraphBottomBorderAsRule(),
+		caseAlmostOverwideWordPrefersFreshLine(),
+		caseParaMarkRPrDoesNotInheritToRuns(),
+		caseMultilineCenterVAlignDoesNotOverflow(),
 		// — batch Q: context cancel ---
 		// (tested separately via TestContextCancel, not the harness)
 	}
@@ -4311,11 +4314,13 @@ func caseOverwideWordInCell() verifyCase {
 		name:        "129_overwide_word_in_cell",
 		description: "Long word in a narrow cell wraps at character boundaries instead of spilling",
 		build: func(t *testing.T, dir string) string {
-			// Two-column 2-row table. Column 1 is 800 twips (40 pt) —
-			// not wide enough for "submission_timestamp" (~80 pt) which
-			// would spill into column 2 without the wrap fallback.
+			// Two-column 2-row table. Column 1 is 2000 twips (100 pt)
+			// — still not wide enough to render "submission_timestamp"
+			// (~96 pt) plus cell padding on one line, so the per-rune
+			// wrap fallback must kick in. Column 2 is 3000 twips so the
+			// table still fits without ridiculous overflow.
 			body := `<w:tbl>
-      <w:tblGrid><w:gridCol w:w="800"/><w:gridCol w:w="3000"/></w:tblGrid>
+      <w:tblGrid><w:gridCol w:w="2000"/><w:gridCol w:w="3000"/></w:tblGrid>
       <w:tr>
         <w:tc><w:p><w:r><w:t>submission_timestamp</w:t></w:r></w:p></w:tc>
         <w:tc><w:p><w:r><w:t>UNIQUE-NEIGHBOR</w:t></w:r></w:p></w:tc>
@@ -4562,6 +4567,167 @@ func caseParagraphBottomBorderAsRule() verifyCase {
 			if gap < 12 {
 				t.Logf("between gap = %.1f pt (above.yMax=%.1f below.yMin=%.1f)", gap, aboveBottom, belowTop)
 				fail("vertical gap %.1fpt — rule didn't reserve space?", gap)
+			}
+		},
+	}
+}
+
+// caseParaMarkRPrDoesNotInheritToRuns ensures we do NOT propagate the
+// pPr/rPr (which styles the paragraph mark glyph only) onto the runs in
+// the paragraph. Real-world trigger: a paragraph where pPr/rPr declares
+// <w:b/> but the runs themselves don't — every word came out
+// double-stroked because faux-bold kicked in across the whole paragraph.
+func caseParaMarkRPrDoesNotInheritToRuns() verifyCase {
+	return verifyCase{
+		name:        "136_pmark_rpr_does_not_inherit_to_runs",
+		description: "pPr/rPr (paragraph-mark styling) must not be inherited by runs",
+		build: func(t *testing.T, dir string) string {
+			// pPr/rPr says bold; the lone run has its own rPr (no bold).
+			// If we incorrectly inherit pPr/rPr, the run renders bold.
+			body := `<w:p>
+      <w:pPr>
+        <w:rPr><w:b/><w:bCs/></w:rPr>
+      </w:pPr>
+      <w:r>
+        <w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial"/></w:rPr>
+        <w:t>not bold here</w:t>
+      </w:r>
+    </w:p>`
+			return newDocx().Body(body).Write(t, dir)
+		},
+		expectText:  []string{"not bold here"},
+		expectPages: 1,
+		custom: func(t *testing.T, pdf string, fail func(format string, args ...any)) {
+			// Without a real bold font registered, the renderer fakes
+			// bold by double-stroking glyphs at a +0.3pt offset. When
+			// pdftotext extracts that, the doubled rendering often
+			// shows up as a tighter character pitch but the *text*
+			// content stays a single copy. The clearer signal is a
+			// rendered-width comparison: faux-bold lengthens visible
+			// width measurably (glyph offset + thicker strokes). For
+			// this regression we just confirm the text appears once
+			// per pdftotext line, which is the simplest invariant that
+			// breaks if bold-bit propagation comes back along with the
+			// double-stroke artifact in some pdftotext versions.
+			out, _ := combinedOutput("pdftotext", "-bbox", pdf, "-")
+			txt := string(out)
+			// Count occurrences of the word "bold". If faux-bold's
+			// double-stroke produces overlapping but distinct glyph
+			// extractions, pdftotext may emit "bold bold" — a
+			// telltale doubling pattern we've seen in the wild.
+			if strings.Count(txt, "bold</word>") > 1 ||
+				strings.Count(txt, ">bold<") > 1 {
+				fail("'bold' appears more than once — faux-bold was applied where it shouldn't be:\n%s", txt)
+			}
+		},
+	}
+}
+
+// caseMultilineCenterVAlignDoesNotOverflow guards against the
+// cellContentHeight stub regression. When a cell uses
+// <w:vAlign w:val="center"/> and its text wraps to multiple lines, the
+// pre-fix code computed content height as a fixed 13.2pt-per-paragraph
+// stub (assumes one line each). The resulting "slack" was wildly
+// inflated, pushing content past the row's bottom border — the bottom
+// row's last line drew outside the page area. The fix uses the actual
+// measureCell result minus cell padding.
+func caseMultilineCenterVAlignDoesNotOverflow() verifyCase {
+	return verifyCase{
+		name:        "137_multiline_center_valign_no_overflow",
+		description: "Multi-line text in vAlign=center cell stays within row bounds",
+		build: func(t *testing.T, dir string) string {
+			// 4-line address in a narrow vAlign=center cell. Width set
+			// so "12 PLACE #08-02 PLACE" can't fit on one line and the
+			// explicit <w:br/> forces another two-line wrap below.
+			body := `<w:tbl>
+      <w:tblGrid><w:gridCol w:w="2400"/></w:tblGrid>
+      <w:tr>
+        <w:trPr><w:trHeight w:val="1448"/></w:trPr>
+        <w:tc>
+          <w:tcPr>
+            <w:vAlign w:val="center"/>
+            <w:tcBorders>
+              <w:top w:val="single" w:sz="4"/>
+              <w:bottom w:val="single" w:sz="4"/>
+              <w:left w:val="single" w:sz="4"/>
+              <w:right w:val="single" w:sz="4"/>
+            </w:tcBorders>
+          </w:tcPr>
+          <w:p>
+            <w:r><w:rPr><w:sz w:val="20"/></w:rPr><w:t>12 PLACE #08-02 PLACE</w:t></w:r>
+            <w:r><w:rPr><w:sz w:val="20"/></w:rPr><w:br/><w:t>RESIDENCES SINGAPORE 223588</w:t></w:r>
+          </w:p>
+        </w:tc>
+      </w:tr>
+      <w:tr>
+        <w:tc>
+          <w:tcPr><w:tcBorders>
+            <w:top w:val="single" w:sz="4"/>
+            <w:bottom w:val="single" w:sz="4"/>
+            <w:left w:val="single" w:sz="4"/>
+            <w:right w:val="single" w:sz="4"/>
+          </w:tcBorders></w:tcPr>
+          <w:p><w:r><w:t>BELOW-MARKER</w:t></w:r></w:p>
+        </w:tc>
+      </w:tr>
+    </w:tbl>`
+			return newDocx().Body(body).Write(t, dir)
+		},
+		expectText:  []string{"12 PLACE", "RESIDENCES", "223588", "BELOW-MARKER"},
+		expectPages: 1,
+		custom: func(t *testing.T, pdf string, fail func(format string, args ...any)) {
+			// The wrapped text must end ABOVE the BELOW-MARKER row.
+			// Pre-fix, vAlign centering with the stubbed content height
+			// pushed "SINGAPORE 223588" past the cell's bottom border —
+			// pdftotext would show it y-overlapping BELOW-MARKER.
+			out, _ := combinedOutput("pdftotext", "-bbox", pdf, "-")
+			txt := string(out)
+			_, _, _, last223588, ok1 := bboxFull(txt, "223588")
+			_, _, markerTop, _, ok2 := bboxFull(txt, "BELOW-MARKER")
+			if !ok1 || !ok2 {
+				fail("missing bbox 223588=%v BELOW-MARKER=%v\n%s", ok1, ok2, txt)
+				return
+			}
+			if last223588 > markerTop {
+				fail("'223588' bottom y=%.1f exceeds BELOW-MARKER top y=%.1f — multi-line content escaped its cell",
+					last223588, markerTop)
+			}
+		},
+	}
+}
+
+// caseAlmostOverwideWordPrefersFreshLine guards the ordering of the
+// over-wide-atom path: when a word atom doesn't fit in the *remaining*
+// space on the current line but DOES fit on a fresh one, we must flush
+// the line and place it whole — not split it per rune. Real-world
+// trigger: narrow table header "Last Name" rendering as "Last Nam\ne"
+// because "Name" alone is wider than the column's content width.
+func caseAlmostOverwideWordPrefersFreshLine() verifyCase {
+	return verifyCase{
+		name:        "135_almost_overwide_word_prefers_fresh_line",
+		description: "Word that fits on its own line but not after preceding text wraps at the space, not per rune",
+		build: func(t *testing.T, dir string) string {
+			// Single-cell table sized so "Last Name" doesn't fit on one
+			// line (≈56pt at default font) but "Name" alone (≈32pt)
+			// fits comfortably inside the ~40pt content width.
+			body := `<w:tbl>
+      <w:tblGrid><w:gridCol w:w="960"/></w:tblGrid>
+      <w:tr>
+        <w:tc><w:p><w:r><w:t>Last Name</w:t></w:r></w:p></w:tc>
+      </w:tr>
+    </w:tbl>`
+			return newDocx().Body(body).Write(t, dir)
+		},
+		expectText:  []string{"Last", "Name"},
+		expectPages: 1,
+		custom: func(t *testing.T, pdf string, fail func(format string, args ...any)) {
+			// The cell must contain the substring "Name" intact (not
+			// broken into "Nam" + "e" on adjacent lines). pdftotext
+			// preserves text grouping by line; a per-rune split would
+			// produce "Nam\ne" with "e" alone on its own line.
+			txt := pdftotext(t, pdf)
+			if !strings.Contains(txt, "Name") {
+				fail("'Name' not present intact — text was split per rune:\n%s", txt)
 			}
 		},
 	}

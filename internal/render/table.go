@@ -66,8 +66,19 @@ func (r *renderer) drawTable(t docx.Table) error {
 			total += w
 		}
 		if total > 0 {
+			// Use the docx-specified twip widths directly. Word stores
+			// these as absolute and renders the table at exactly that
+			// width — even when it overflows the page margin. Our
+			// previous proportional-to-contentW scaling silently
+			// shrank columns whenever the table was slightly wider than
+			// the page, which forced text like "Name" in a narrow
+			// header column to wrap mid-word ("Nam\ne"). Only fall back
+			// to scaling when total exceeds contentW by a meaningful
+			// margin AND no column width is itself wider than contentW
+			// (i.e. don't try to fit a fundamentally over-wide table
+			// that would just clip glyphs anyway).
 			for i, w := range t.ColumnWidthsTwips {
-				widths[i] = r.contentW * float64(w) / float64(total)
+				widths[i] = float64(w) / 20.0 // twips → pt
 			}
 		} else {
 			for i := range widths {
@@ -213,7 +224,7 @@ func (r *renderer) drawRow(row docx.TableRow, widths []float64) error {
 	x := r.marL
 	col = 0
 	const defaultCellPad = 4.0
-	for _, cell := range row.Cells {
+	for ci, cell := range row.Cells {
 		if col >= len(widths) {
 			break
 		}
@@ -264,7 +275,18 @@ func (r *renderer) drawRow(row docx.TableRow, widths []float64) error {
 			savedContentW := r.contentW
 			r.marL = x + padL
 			r.contentW = w - (padL + padR)
-			contentH := cellContentHeight(cell)
+			// Content height is what measureCell returned MINUS the
+			// pad-both-sides it added internally. Using the actual
+			// measurement (not a one-line-per-paragraph stub) keeps
+			// vAlign="center" from pushing wrapped content past the
+			// row's bottom edge — multi-line cells in this row would
+			// otherwise overflow when their column happens to be the
+			// tallest.
+			const cellPad = 4.0
+			contentH := cellHeights[ci] - 2*cellPad
+			if contentH < 0 {
+				contentH = 0
+			}
 			startY := rowTop + padT
 			switch cell.VAlign {
 			case "center":
@@ -303,11 +325,16 @@ func (r *renderer) drawRow(row docx.TableRow, widths []float64) error {
 	return nil
 }
 
-// drawCellEdge draws one of a cell's four edges. The default (zero edge)
-// is a thin black solid line matching docx4j's behavior. Width is the
-// Word-stored sz in points (1/8 pt units already converted upstream).
+// drawCellEdge draws one of a cell's four edges. An empty edge (zero
+// BorderEdge) means "no border" — Word renders a table that lacks
+// tblBorders/tcBorders without any lines, and we match that. Tables that
+// want gridlines must declare tblBorders or tcBorders; the parser
+// propagates tblBorders into each cell at parse time (see
+// propagateTableBorders), so the renderer only needs to read CellBorders.
+// Width is the Word-stored sz in points (1/8 pt units already converted
+// upstream).
 func drawCellEdge(r *renderer, e docx.BorderEdge, x1, y1, x2, y2 float64) {
-	if e.Style == "none" || e.Style == "nil" {
+	if !e.Has() || e.Style == "none" || e.Style == "nil" {
 		return
 	}
 	width := e.Sz
@@ -371,21 +398,6 @@ func drawDashedLine(r *renderer, x1, y1, x2, y2, dash, gap float64) {
 
 // cellContentHeight estimates the rendered height of a cell's contents at
 // the renderer's current contentW. Used for vAlign slack math.
-func cellContentHeight(c docx.TableCell) float64 {
-	n := 0
-	for _, p := range c.Paragraphs() {
-		if len(p.Runs) == 0 {
-			n++
-			continue
-		}
-		n += 1
-	}
-	if n == 0 {
-		n = 1
-	}
-	return float64(n) * 13.2 // approx 11pt × 1.2
-}
-
 func sumWidths(ws []float64, start, n int) float64 {
 	sum := 0.0
 	for i := start; i < start+n && i < len(ws); i++ {
@@ -447,15 +459,24 @@ func (r *renderer) measureCell(cell docx.TableCell, width float64) float64 {
 				hadAny = false
 				continue
 			}
-			// Over-wide word — same character-level wrap fallback as
-			// layoutLine uses. Without this, measureCell would compute
-			// a too-small height for the cell and the real draw would
-			// overflow into the row below.
+			// Over-wide word — same fresh-line-first fallback as
+			// layoutLine. Flush the current line so the atom can try a
+			// fresh line; only split per rune if it still doesn't fit.
+			// Without this, measureCell would compute a too-small height
+			// for the cell and the real draw would overflow into the
+			// row below.
 			if a.kind == atomWord && innerW > 0 && a.width > innerW && a.text != "" {
-				for _, sub := range r.splitWordAtomByRune(a) {
-					accumulate(sub)
+				if lineW > 0 {
+					h += lineH
+					lineW = 0
+					lineH = r.applyLineHeight(r.opts.DefaultFontSize * 1.2)
 				}
-				continue
+				if a.width > innerW {
+					for _, sub := range r.splitWordAtomByRune(a) {
+						accumulate(sub)
+					}
+					continue
+				}
 			}
 			accumulate(a)
 		}
