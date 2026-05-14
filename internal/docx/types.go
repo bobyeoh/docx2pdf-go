@@ -67,6 +67,13 @@ type TableStyle struct {
 	// Table-level defaults applied to every cell unless the cell overrides.
 	CellShading string
 	Borders     CellBorders
+	// TableBorders mirrors the style's <w:tblPr><w:tblBorders>. Used by
+	// decodeTable to seed the table's effective tblBorders before the
+	// table's own tblBorders override. Critical for the built-in
+	// "TableGrid" style, which is how Word's default bordered tables
+	// declare their grid lines — without applying this, those tables
+	// render borderless.
+	TableBorders TableBorders
 	// Conditional formatting blocks keyed by Word's tblStylePr w:type.
 	Conditional map[string]TableCondPr
 }
@@ -422,6 +429,11 @@ type Table struct {
 	// blocks should apply (firstRow / lastRow / firstColumn / lastColumn,
 	// banding etc.).
 	Look TableLook
+	// Borders carries <w:tblBorders> straight from tblPr. After parsing
+	// is complete these are propagated into each cell's CellBorders (with
+	// outer rows/columns taking the outer edge and interior cells taking
+	// insideH/insideV) so the renderer only has to read CellBorders.
+	Borders TableBorders
 }
 
 // TableLook is the parsed w:tblLook bitfield.
@@ -489,9 +501,25 @@ func (c TableCell) Paragraphs() []Paragraph {
 }
 
 // CellBorders carries the four per-edge border specs. A zero Edge means
-// "fall back to default thin black solid".
+// "no border on that edge" — table-level borders are propagated into
+// cells at parse time (see propagateTableBorders), so by the time the
+// renderer sees a cell every meaningful edge is filled in.
 type CellBorders struct {
 	Top, Bottom, Left, Right BorderEdge
+}
+
+// TableBorders mirrors <w:tblBorders>. It carries the four outer edges
+// plus the two "inside" edges that apply between cells (insideH between
+// rows, insideV between columns).
+type TableBorders struct {
+	Top, Bottom, Left, Right BorderEdge
+	InsideH, InsideV         BorderEdge
+}
+
+// Has reports whether any of the six edges is non-zero.
+func (b TableBorders) Has() bool {
+	return b.Top.Has() || b.Bottom.Has() || b.Left.Has() || b.Right.Has() ||
+		b.InsideH.Has() || b.InsideV.Has()
 }
 
 // BorderEdge holds the style, width (points), and color (hex) for one edge.

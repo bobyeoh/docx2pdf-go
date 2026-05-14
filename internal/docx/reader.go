@@ -672,8 +672,44 @@ type xmlStyle struct {
 	BasedOn *struct {
 		Val string `xml:"val,attr"`
 	} `xml:"basedOn"`
-	PPr *xmlStylePPr `xml:"pPr"`
-	RPr *xmlRPr      `xml:"rPr"`
+	PPr   *xmlStylePPr   `xml:"pPr"`
+	RPr   *xmlRPr        `xml:"rPr"`
+	TblPr *xmlStyleTblPr `xml:"tblPr"`
+}
+
+// xmlStyleTblPr captures the table-level properties a w:style of
+// type="table" carries. We only care about tblBorders today; the rest
+// of tblPr (tblInd, tblCellMar, etc.) is intentionally ignored.
+type xmlStyleTblPr struct {
+	TblBorders *xmlTblBorders `xml:"tblBorders"`
+}
+
+type xmlTblBorders struct {
+	Top     *xmlBorderEdge `xml:"top"`
+	Bottom  *xmlBorderEdge `xml:"bottom"`
+	Left    *xmlBorderEdge `xml:"left"`
+	Right   *xmlBorderEdge `xml:"right"`
+	InsideH *xmlBorderEdge `xml:"insideH"`
+	InsideV *xmlBorderEdge `xml:"insideV"`
+}
+
+type xmlBorderEdge struct {
+	Val   string `xml:"val,attr"`
+	Sz    string `xml:"sz,attr"`
+	Color string `xml:"color,attr"`
+}
+
+func (e *xmlBorderEdge) toBorderEdge() BorderEdge {
+	if e == nil {
+		return BorderEdge{}
+	}
+	out := BorderEdge{Style: e.Val, Color: e.Color}
+	if e.Sz != "" {
+		if x, err := strconv.Atoi(e.Sz); err == nil {
+			out.Sz = float64(x) / 8.0 // Word stores 1/8 pt
+		}
+	}
+	return out
 }
 
 type xmlStylePPr struct {
@@ -760,6 +796,17 @@ func parseStyles(f *zip.File, doc *Document) error {
 		}
 		if xs.RPr != nil {
 			ts.Run = rPrToProps(*xs.RPr, RunProps{})
+		}
+		if xs.TblPr != nil && xs.TblPr.TblBorders != nil {
+			tb := xs.TblPr.TblBorders
+			ts.TableBorders = TableBorders{
+				Top:     tb.Top.toBorderEdge(),
+				Bottom:  tb.Bottom.toBorderEdge(),
+				Left:    tb.Left.toBorderEdge(),
+				Right:   tb.Right.toBorderEdge(),
+				InsideH: tb.InsideH.toBorderEdge(),
+				InsideV: tb.InsideV.toBorderEdge(),
+			}
 		}
 		doc.TableStyles[xs.StyleID] = ts
 	}
@@ -1638,7 +1685,10 @@ func decodeParagraph(dec *xml.Decoder, start xml.StartElement, pctx *parseDocCon
 		SpacingAfter:  doc.ParaDefaults.SpacingAfter,
 		LineHeight:    doc.ParaDefaults.LineHeight,
 	}
-	paraRPr := doc.Defaults // paragraph-level rPr inherited by runs
+	// Base run properties for runs in this paragraph: doc-defaults plus
+	// whatever the paragraph's pStyle contributes (pPr/rPr is intentionally
+	// excluded — that styles only the paragraph mark glyph).
+	paraRPr := doc.Defaults
 
 	// Bookmark state lives on pctx so a bookmark that opens in one paragraph
 	// and closes in another still captures all text in between.
@@ -2158,11 +2208,14 @@ func decodePPr(dec *xml.Decoder, start xml.StartElement, p *Paragraph, paraRPr *
 				}
 				_ = dec.Skip()
 			case "rPr":
-				var r xmlRPr
-				if err := dec.DecodeElement(&r, &t); err != nil {
-					return err
-				}
-				*paraRPr = rPrToProps(r, *paraRPr)
+				// <w:pPr><w:rPr> styles the paragraph mark glyph (¶)
+				// itself; it is NOT a default for the paragraph's runs.
+				// ECMA-376: "specifies the run properties that shall be
+				// applied to the paragraph mark for the paragraph." We
+				// must NOT merge it into paraRPr or every run in the
+				// paragraph would inherit it — e.g. a bold pilcrow
+				// would faux-bold the body text. Skip the subtree.
+				_ = dec.Skip()
 			default:
 				_ = dec.Skip()
 			}
@@ -2648,8 +2701,106 @@ func decodeTable(dec *xml.Decoder, start xml.StartElement, pctx *parseDocContext
 			}
 		case xml.EndElement:
 			if t.Name.Local == start.Name.Local {
+				// Layer in the named tblStyle's borders BEFORE
+				// propagating to cells. Word's built-in "TableGrid"
+				// style declares its grid lines via the style's
+				// tblBorders rather than at the table level; without
+				// this layering those tables would render borderless.
+				// Per-edge override order: table's own tblBorders
+				// (already in tbl.Borders) wins over the style's
+				// tblBorders.
+				if tbl.StyleID != "" && pctx != nil && pctx.doc != nil {
+					if ts, ok := pctx.doc.TableStyles[tbl.StyleID]; ok {
+						tbl.Borders = mergeTableBorders(ts.TableBorders, tbl.Borders)
+					}
+				}
+				propagateTableBorders(&tbl)
 				return tbl, nil
 			}
+		}
+	}
+}
+
+// mergeTableBorders overlays `overlay` on top of `base`: for each edge,
+// the overlay value wins if it carries any styling, otherwise the base
+// edge survives. Used to layer a table's explicit tblBorders on top of
+// the tblStyle's defaults.
+func mergeTableBorders(base, overlay TableBorders) TableBorders {
+	pick := func(b, o BorderEdge) BorderEdge {
+		if o.Has() {
+			return o
+		}
+		return b
+	}
+	return TableBorders{
+		Top:     pick(base.Top, overlay.Top),
+		Bottom:  pick(base.Bottom, overlay.Bottom),
+		Left:    pick(base.Left, overlay.Left),
+		Right:   pick(base.Right, overlay.Right),
+		InsideH: pick(base.InsideH, overlay.InsideH),
+		InsideV: pick(base.InsideV, overlay.InsideV),
+	}
+}
+
+// propagateTableBorders fills in each cell's CellBorders from the
+// table-level <w:tblBorders> (the outer edges for cells on the table's
+// rim, insideH/insideV for cells in the interior). Cells that already
+// set their own tcBorders keep them — tcBorders wins over tblBorders
+// per OOXML's overlay rules.
+//
+// Without this, a table that puts a "single 0.5pt" tblBorders at the
+// table level and no per-cell tcBorders would render borderless
+// (cell.Borders is zero-valued and the renderer treats empty styles as
+// "draw nothing"). With this, the renderer's only job is to emit what
+// CellBorders says.
+func propagateTableBorders(tbl *Table) {
+	if !tbl.Borders.Has() {
+		return
+	}
+	nRows := len(tbl.Rows)
+	totalCols := len(tbl.ColumnWidthsTwips)
+	for ri := range tbl.Rows {
+		row := &tbl.Rows[ri]
+		colIdx := 0
+		for ci := range row.Cells {
+			cell := &row.Cells[ci]
+			span := cell.GridSpan
+			if span < 1 {
+				span = 1
+			}
+			firstRow := ri == 0
+			lastRow := ri == nRows-1
+			firstCol := colIdx == 0
+			lastCol := totalCols > 0 && colIdx+span >= totalCols
+			if !cell.Borders.Top.Has() {
+				if firstRow {
+					cell.Borders.Top = tbl.Borders.Top
+				} else {
+					cell.Borders.Top = tbl.Borders.InsideH
+				}
+			}
+			if !cell.Borders.Bottom.Has() {
+				if lastRow {
+					cell.Borders.Bottom = tbl.Borders.Bottom
+				} else {
+					cell.Borders.Bottom = tbl.Borders.InsideH
+				}
+			}
+			if !cell.Borders.Left.Has() {
+				if firstCol {
+					cell.Borders.Left = tbl.Borders.Left
+				} else {
+					cell.Borders.Left = tbl.Borders.InsideV
+				}
+			}
+			if !cell.Borders.Right.Has() {
+				if lastCol {
+					cell.Borders.Right = tbl.Borders.Right
+				} else {
+					cell.Borders.Right = tbl.Borders.InsideV
+				}
+			}
+			colIdx += span
 		}
 	}
 }
@@ -2669,6 +2820,11 @@ func decodeTblPr(dec *xml.Decoder, start xml.StartElement, tbl *Table) error {
 			switch t.Name.Local {
 			case "tblStyle":
 				tbl.StyleID = attr(t, "val")
+			case "tblBorders":
+				if err := decodeTableBorders(dec, t, &tbl.Borders); err != nil {
+					return err
+				}
+				continue
 			case "tblLook":
 				// Word can encode either via individual w:firstRow="1" attrs
 				// or via a single w:val hex bitmask. Handle both.
@@ -3001,6 +3157,49 @@ func decodeCellBorders(dec *xml.Decoder, start xml.StartElement, b *CellBorders)
 				b.Left = edge
 			case "right", "end":
 				b.Right = edge
+			}
+			_ = dec.Skip()
+		case xml.EndElement:
+			if t.Name.Local == start.Name.Local {
+				return nil
+			}
+		}
+	}
+}
+
+// decodeTableBorders reads <w:tblBorders>'s edge children. Same shape as
+// decodeCellBorders but with two extra edges (insideH / insideV) that
+// apply between rows and between columns respectively.
+func decodeTableBorders(dec *xml.Decoder, start xml.StartElement, b *TableBorders) error {
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			edge := BorderEdge{
+				Style: attr(t, "val"),
+				Color: attr(t, "color"),
+			}
+			if v := attr(t, "sz"); v != "" {
+				if x, err := strconv.Atoi(v); err == nil {
+					edge.Sz = float64(x) / 8.0
+				}
+			}
+			switch t.Name.Local {
+			case "top":
+				b.Top = edge
+			case "bottom":
+				b.Bottom = edge
+			case "left", "start":
+				b.Left = edge
+			case "right", "end":
+				b.Right = edge
+			case "insideH":
+				b.InsideH = edge
+			case "insideV":
+				b.InsideV = edge
 			}
 			_ = dec.Skip()
 		case xml.EndElement:

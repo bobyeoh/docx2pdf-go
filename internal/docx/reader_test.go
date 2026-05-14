@@ -580,3 +580,224 @@ func TestParseGridSpanAndVMerge(t *testing.T) {
 		t.Errorf("row1 cell0 vMerge = %q want continue (implicit)", r1c0.VMerge)
 	}
 }
+
+func TestTblBordersPropagateIntoCells(t *testing.T) {
+	docXML := `<?xml version="1.0"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:tbl>
+      <w:tblPr>
+        <w:tblBorders>
+          <w:top w:val="single" w:sz="8" w:color="auto"/>
+          <w:bottom w:val="single" w:sz="8" w:color="auto"/>
+          <w:left w:val="single" w:sz="8" w:color="auto"/>
+          <w:right w:val="single" w:sz="8" w:color="auto"/>
+          <w:insideH w:val="double" w:sz="12" w:color="FF0000"/>
+          <w:insideV w:val="dashed" w:sz="6" w:color="00FF00"/>
+        </w:tblBorders>
+      </w:tblPr>
+      <w:tblGrid><w:gridCol w:w="1000"/><w:gridCol w:w="1000"/></w:tblGrid>
+      <w:tr>
+        <w:tc><w:p><w:r><w:t>A</w:t></w:r></w:p></w:tc>
+        <w:tc><w:p><w:r><w:t>B</w:t></w:r></w:p></w:tc>
+      </w:tr>
+      <w:tr>
+        <w:tc><w:p><w:r><w:t>C</w:t></w:r></w:p></w:tc>
+        <w:tc><w:p><w:r><w:t>D</w:t></w:r></w:p></w:tc>
+      </w:tr>
+    </w:tbl>
+  </w:body>
+</w:document>`
+	path := buildDocxWithStyles(t, docXML, "")
+	doc, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	tbl := doc.Body[0].(Table)
+	// Top-left cell: outer top, outer left; bottom/right are interior.
+	a := tbl.Rows[0].Cells[0].Borders
+	if a.Top.Style != "single" {
+		t.Errorf("A.top.style=%q want single (outer)", a.Top.Style)
+	}
+	if a.Left.Style != "single" {
+		t.Errorf("A.left.style=%q want single (outer)", a.Left.Style)
+	}
+	if a.Bottom.Style != "double" {
+		t.Errorf("A.bottom.style=%q want double (insideH)", a.Bottom.Style)
+	}
+	if a.Right.Style != "dashed" {
+		t.Errorf("A.right.style=%q want dashed (insideV)", a.Right.Style)
+	}
+	// Bottom-right cell: bottom & right are outer, top & left are interior.
+	d := tbl.Rows[1].Cells[1].Borders
+	if d.Top.Style != "double" {
+		t.Errorf("D.top.style=%q want double (insideH)", d.Top.Style)
+	}
+	if d.Left.Style != "dashed" {
+		t.Errorf("D.left.style=%q want dashed (insideV)", d.Left.Style)
+	}
+	if d.Bottom.Style != "single" {
+		t.Errorf("D.bottom.style=%q want single (outer)", d.Bottom.Style)
+	}
+	if d.Right.Style != "single" {
+		t.Errorf("D.right.style=%q want single (outer)", d.Right.Style)
+	}
+}
+
+func TestBorderlessTableHasNoCellBorders(t *testing.T) {
+	docXML := `<?xml version="1.0"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:tbl>
+      <w:tblGrid><w:gridCol w:w="1000"/><w:gridCol w:w="1000"/></w:tblGrid>
+      <w:tr>
+        <w:tc><w:p><w:r><w:t>A</w:t></w:r></w:p></w:tc>
+        <w:tc><w:p><w:r><w:t>B</w:t></w:r></w:p></w:tc>
+      </w:tr>
+    </w:tbl>
+  </w:body>
+</w:document>`
+	path := buildDocxWithStyles(t, docXML, "")
+	doc, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	tbl := doc.Body[0].(Table)
+	for ri, row := range tbl.Rows {
+		for ci, cell := range row.Cells {
+			b := cell.Borders
+			if b.Top.Has() || b.Bottom.Has() || b.Left.Has() || b.Right.Has() {
+				t.Errorf("row%d cell%d has unexpected borders: %+v — table had no tblBorders/tcBorders", ri, ci, b)
+			}
+		}
+	}
+}
+
+func TestTblStyleBordersFlowToCells(t *testing.T) {
+	// Style "TableGrid" declares a single-line grid in its tblPr.
+	// A table that uses <w:tblStyle w:val="TableGrid"/> but has no
+	// inline <w:tblBorders> must inherit the style's grid lines.
+	stylesXML := `<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:style w:type="table" w:styleId="TableGrid">
+    <w:tblPr>
+      <w:tblBorders>
+        <w:top w:val="single" w:sz="4" w:color="auto"/>
+        <w:bottom w:val="single" w:sz="4" w:color="auto"/>
+        <w:left w:val="single" w:sz="4" w:color="auto"/>
+        <w:right w:val="single" w:sz="4" w:color="auto"/>
+        <w:insideH w:val="single" w:sz="4" w:color="auto"/>
+        <w:insideV w:val="single" w:sz="4" w:color="auto"/>
+      </w:tblBorders>
+    </w:tblPr>
+  </w:style>
+</w:styles>`
+	docXML := `<?xml version="1.0"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:tbl>
+      <w:tblPr><w:tblStyle w:val="TableGrid"/></w:tblPr>
+      <w:tblGrid><w:gridCol w:w="1000"/><w:gridCol w:w="1000"/></w:tblGrid>
+      <w:tr>
+        <w:tc><w:p><w:r><w:t>A</w:t></w:r></w:p></w:tc>
+        <w:tc><w:p><w:r><w:t>B</w:t></w:r></w:p></w:tc>
+      </w:tr>
+    </w:tbl>
+  </w:body>
+</w:document>`
+	path := buildDocxWithStyles(t, docXML, stylesXML)
+	doc, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	tbl := doc.Body[0].(Table)
+	a := tbl.Rows[0].Cells[0].Borders
+	if a.Top.Style != "single" || a.Bottom.Style != "single" ||
+		a.Left.Style != "single" || a.Right.Style != "single" {
+		t.Errorf("TableGrid style borders did not reach cell A: %+v", a)
+	}
+}
+
+func TestInlineTblBordersOverrideTblStyle(t *testing.T) {
+	// Style declares "single"; table's own tblBorders override to
+	// "double" on top edge only. Other edges keep the style's "single".
+	stylesXML := `<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:style w:type="table" w:styleId="MyGrid">
+    <w:tblPr>
+      <w:tblBorders>
+        <w:top w:val="single" w:sz="4" w:color="auto"/>
+        <w:bottom w:val="single" w:sz="4" w:color="auto"/>
+        <w:left w:val="single" w:sz="4" w:color="auto"/>
+        <w:right w:val="single" w:sz="4" w:color="auto"/>
+      </w:tblBorders>
+    </w:tblPr>
+  </w:style>
+</w:styles>`
+	docXML := `<?xml version="1.0"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:tbl>
+      <w:tblPr>
+        <w:tblStyle w:val="MyGrid"/>
+        <w:tblBorders><w:top w:val="double" w:sz="12" w:color="FF0000"/></w:tblBorders>
+      </w:tblPr>
+      <w:tblGrid><w:gridCol w:w="1000"/></w:tblGrid>
+      <w:tr><w:tc><w:p><w:r><w:t>cell</w:t></w:r></w:p></w:tc></w:tr>
+    </w:tbl>
+  </w:body>
+</w:document>`
+	path := buildDocxWithStyles(t, docXML, stylesXML)
+	doc, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	tbl := doc.Body[0].(Table)
+	c := tbl.Rows[0].Cells[0].Borders
+	if c.Top.Style != "double" || c.Top.Color != "FF0000" {
+		t.Errorf("inline tblBorders.top did not override style.top: %+v", c.Top)
+	}
+	if c.Bottom.Style != "single" {
+		t.Errorf("style.bottom did not survive when inline did not set it: %+v", c.Bottom)
+	}
+}
+
+func TestTcBordersOverrideTblBorders(t *testing.T) {
+	docXML := `<?xml version="1.0"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:tbl>
+      <w:tblPr>
+        <w:tblBorders>
+          <w:top w:val="single" w:sz="8" w:color="auto"/>
+          <w:bottom w:val="single" w:sz="8" w:color="auto"/>
+          <w:left w:val="single" w:sz="8" w:color="auto"/>
+          <w:right w:val="single" w:sz="8" w:color="auto"/>
+        </w:tblBorders>
+      </w:tblPr>
+      <w:tblGrid><w:gridCol w:w="1000"/></w:tblGrid>
+      <w:tr>
+        <w:tc>
+          <w:tcPr>
+            <w:tcBorders>
+              <w:top w:val="double" w:sz="16" w:color="FF0000"/>
+            </w:tcBorders>
+          </w:tcPr>
+          <w:p><w:r><w:t>cell</w:t></w:r></w:p>
+        </w:tc>
+      </w:tr>
+    </w:tbl>
+  </w:body>
+</w:document>`
+	path := buildDocxWithStyles(t, docXML, "")
+	doc, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	tbl := doc.Body[0].(Table)
+	c := tbl.Rows[0].Cells[0].Borders
+	if c.Top.Style != "double" || c.Top.Color != "FF0000" {
+		t.Errorf("tcBorders.top did not override tblBorders.top: %+v", c.Top)
+	}
+	if c.Bottom.Style != "single" {
+		t.Errorf("tblBorders.bottom did not propagate: %+v", c.Bottom)
+	}
+}
