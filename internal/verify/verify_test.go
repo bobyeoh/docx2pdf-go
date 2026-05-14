@@ -257,6 +257,7 @@ func allCases() []verifyCase {
 		caseOverwideWordInCell(),
 		caseHorizontalRuleVMLPict(),
 		caseSymbolRoutesToFallback(),
+		caseTableHeaderRepeatsAtTopOfPage(),
 		// — batch Q: context cancel ---
 		// (tested separately via TestContextCancel, not the harness)
 	}
@@ -4397,6 +4398,69 @@ func caseSymbolRoutesToFallback() verifyCase {
 			// glyph isn't found).
 			if strings.Contains(txt, "✓") && !strings.Contains(txt, "claim") {
 				fail("got ✓ but lost surrounding text — encoding issue")
+			}
+		},
+	}
+}
+
+// caseTableHeaderRepeatsAtTopOfPage exercises the pre-flight
+// page-break check that injects the repeating tblHeader BEFORE the
+// row that would overflow. Without the pre-flight, the repeated
+// header lands AFTER that row, mid-page, on every page where the
+// table continues — clearly visible as "data | header | data" on
+// every page break boundary.
+func caseTableHeaderRepeatsAtTopOfPage() verifyCase {
+	return verifyCase{
+		name:        "132_table_header_at_top_of_page",
+		description: "Repeating tblHeader appears at the top of each new page, before body rows",
+		build: func(t *testing.T, dir string) string {
+			// Build a 2-column table with 80 body rows, each row's cell
+			// containing enough text to wrap to 2-3 lines. Default A4
+			// page can fit ~30 such rows; 80 guarantees ≥ 2 pages of
+			// table content.
+			var rows strings.Builder
+			rows.WriteString(`<w:tbl>
+      <w:tblGrid><w:gridCol w:w="2500"/><w:gridCol w:w="2500"/></w:tblGrid>
+      <w:tr><w:trPr><w:tblHeader/></w:trPr>
+        <w:tc><w:p><w:r><w:rPr><w:b/></w:rPr><w:t>HEADER-LEFT</w:t></w:r></w:p></w:tc>
+        <w:tc><w:p><w:r><w:rPr><w:b/></w:rPr><w:t>HEADER-RIGHT</w:t></w:r></w:p></w:tc>
+      </w:tr>`)
+			for i := 0; i < 80; i++ {
+				fmt.Fprintf(&rows, `<w:tr>
+        <w:tc><w:p><w:r><w:t>row-%02d-left has body text long enough to fill a few lines so each row takes vertical space</w:t></w:r></w:p></w:tc>
+        <w:tc><w:p><w:r><w:t>row-%02d-right also has similarly long content to push row height up</w:t></w:r></w:p></w:tc>
+      </w:tr>`, i, i)
+			}
+			rows.WriteString(`</w:tbl>`)
+			return newDocx().Body(rows.String()).Write(t, dir)
+		},
+		// page count not asserted — depends on row heights
+		custom: func(t *testing.T, pdf string, fail func(format string, args ...any)) {
+			pages := pdfPageCount(t, pdf)
+			if pages < 2 {
+				fail("table should span at least 2 pages, got %d", pages)
+				return
+			}
+			for p := 1; p <= pages; p++ {
+				txt := pdftotextRange(t, pdf, p, p)
+				if !strings.Contains(txt, "HEADER-LEFT") {
+					continue // page without table → no assertion
+				}
+				headerIdx := strings.Index(txt, "HEADER-LEFT")
+				// Find first body row on this page.
+				firstBodyIdx := -1
+				for i := 0; i < 80; i++ {
+					marker := fmt.Sprintf("row-%02d-left", i)
+					if idx := strings.Index(txt, marker); idx >= 0 {
+						if firstBodyIdx < 0 || idx < firstBodyIdx {
+							firstBodyIdx = idx
+						}
+					}
+				}
+				if firstBodyIdx >= 0 && headerIdx > firstBodyIdx {
+					fail("page %d: header (idx %d) appears AFTER first body row (idx %d)",
+						p, headerIdx, firstBodyIdx)
+				}
 			}
 		},
 	}

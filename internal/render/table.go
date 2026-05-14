@@ -91,20 +91,69 @@ func (r *renderer) drawTable(t docx.Table) error {
 	}
 
 	for i, row := range t.Rows {
-		pageBefore := r.pdf.GetNumberOfPages()
-		if err := r.drawRow(row, widths); err != nil {
-			return err
-		}
-		pageAfter := r.pdf.GetNumberOfPages()
-		if pageAfter > pageBefore && len(headerRows) > 0 && i >= len(headerRows) {
-			for _, hr := range headerRows {
-				if err := r.drawRow(hr, widths); err != nil {
-					return err
+		// Pre-flight: if this is a body row and it won't fit on the
+		// current page, force a page break and re-draw the header rows
+		// BEFORE the row that triggered the break. Without this the
+		// header lands after the row, mid-page, on every page where
+		// the table continues.
+		if len(headerRows) > 0 && i >= len(headerRows) && !r.noPageBreak {
+			rowH := r.predictRowHeight(row, widths)
+			if r.cursorY+rowH > r.pageH-r.marB {
+				r.drawFootnotesAtBottom()
+				r.newPage()
+				for _, hr := range headerRows {
+					if err := r.drawRow(hr, widths); err != nil {
+						return err
+					}
 				}
 			}
 		}
+		if err := r.drawRow(row, widths); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+// predictRowHeight computes the row's rendered height without drawing
+// anything. Used by drawTable for pre-flight page-break detection so we
+// can inject the repeating header BEFORE the row that overflows
+// (otherwise the header lands after the row, mid-page).
+func (r *renderer) predictRowHeight(row docx.TableRow, widths []float64) float64 {
+	cellHeights := make([]float64, len(row.Cells))
+	col := 0
+	for i, cell := range row.Cells {
+		if col >= len(widths) {
+			break
+		}
+		span := cell.GridSpan
+		if span < 1 {
+			span = 1
+		}
+		w := sumWidths(widths, col, span)
+		if cell.VMerge == "continue" {
+			cellHeights[i] = 0
+		} else {
+			cellHeights[i] = r.measureCell(cell, w)
+		}
+		col += span
+	}
+	rowH := 0.0
+	for _, h := range cellHeights {
+		if h > rowH {
+			rowH = h
+		}
+	}
+	if rowH < r.opts.DefaultFontSize*1.4 {
+		rowH = r.opts.DefaultFontSize * 1.4
+	}
+	if row.HeightTwips > 0 {
+		minH := float64(row.HeightTwips) / 20.0
+		if row.HeightRuleExact || minH > rowH {
+			rowH = minH
+		}
+	}
+	return rowH
 }
 
 func (r *renderer) drawRow(row docx.TableRow, widths []float64) error {
