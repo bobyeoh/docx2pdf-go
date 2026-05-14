@@ -415,6 +415,17 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 				if err := r.pdf.Cell(nil, a.text); err != nil {
 					return err
 				}
+				// Faux bold: when the run wants bold but no bold face was
+				// registered, re-draw the same glyph stream at a small
+				// horizontal offset so the strokes look thicker. This is
+				// the same trick browsers use for fonts that don't ship a
+				// bold variant — readable, not pretty. A real bold TTF
+				// (Options.FontBold) is always better when available.
+				if a.props.Bold && !r.fonts[boldFamily] && a.text != "" {
+					r.pdf.SetX(cx + 0.3)
+					r.pdf.SetY(topY)
+					_ = r.pdf.Cell(nil, a.text)
+				}
 				if a.props.Underline || a.props.Strike {
 					r.pdf.SetLineWidth(0.5)
 					r.pdf.SetStrokeColor(0, 0, 0)
@@ -520,6 +531,34 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 		// hang is zeroed inside flush() so this naturally tightens after the
 		// first wrap.
 		effW := r.contentW + hang
+		// Over-wide word: a single word atom wider than the line's
+		// effective width can't be wrapped by the normal "atom-vs-atom"
+		// break logic. Split it into per-rune sub-atoms so the breaker
+		// can place as many characters as fit per line, then continue.
+		// Common in narrow table cells where identifiers like
+		// "submission_timestamp" exceed the column width.
+		if a.kind == atomWord && effW > 0 && a.width > effW && a.text != "" {
+			subs := r.splitWordAtomByRune(a)
+			// Replay the per-rune sequence through the same loop logic.
+			for _, sub := range subs {
+				if lineW+sub.width > effW && len(line) > 0 {
+					if line[len(line)-1].kind == atomSpace {
+						lineW -= line[len(line)-1].width
+						line = line[:len(line)-1]
+					}
+					if err := flush(false); err != nil {
+						return err
+					}
+				}
+				line = append(line, sub)
+				lineW += sub.width
+				sh := atomHeight(sub, r.opts.DefaultFontSize)
+				if sh > lineMaxH {
+					lineMaxH = sh
+				}
+			}
+			continue
+		}
 		if lineW+a.width > effW && len(line) > 0 {
 			if len(line) > 0 && line[len(line)-1].kind == atomSpace {
 				lineW -= line[len(line)-1].width
@@ -539,6 +578,31 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 		}
 	}
 	return flush(true)
+}
+
+// splitWordAtomByRune breaks a word atom into one atom per rune, each
+// measured at the run's font. Used as the last-resort wrap mechanism
+// when a word doesn't fit in the available width (most often in narrow
+// table cells). Inherits all metadata — same fontFamily, props, link
+// annotation — so each piece styles identically to the parent.
+func (r *renderer) splitWordAtomByRune(a atom) []atom {
+	_ = r.applyFontFamily(a.props, a.fontFamily)
+	runes := []rune(a.text)
+	out := make([]atom, 0, len(runes))
+	for _, rn := range runes {
+		s := string(rn)
+		w, _ := r.pdf.MeasureTextWidth(s)
+		out = append(out, atom{
+			kind:       atomWord,
+			text:       s,
+			props:      a.props,
+			fontFamily: a.fontFamily,
+			width:      w,
+			linkRID:    a.linkRID,
+			linkAnchor: a.linkAnchor,
+		})
+	}
+	return out
 }
 
 func atomHeight(a atom, defaultSize float64) float64 {

@@ -253,6 +253,9 @@ func allCases() []verifyCase {
 		caseComments(),
 		caseHeadingOutline(),
 		caseChartTextExtraction(),
+		casePageBreakBeforeValZero(),
+		caseOverwideWordInCell(),
+		caseHorizontalRuleVMLPict(),
 		// — batch Q: context cancel ---
 		// (tested separately via TestContextCancel, not the harness)
 	}
@@ -4267,6 +4270,91 @@ func caseChartTextExtraction() verifyCase {
 			"Q2-LABEL",
 			"below",
 		},
+		expectPages: 1,
+	}
+}
+
+// casePageBreakBeforeValZero exercises the OOXML on/off attribute
+// convention. Heading paragraphs in markdown-converted docx commonly
+// carry <w:pageBreakBefore w:val="0"/> — meaning "explicitly NO page
+// break before". Treating the element's mere presence as ON used to
+// produce one-page-per-heading output on real-world docs. This case
+// puts the same flag on a body paragraph and asserts the document
+// stays on a single page.
+func casePageBreakBeforeValZero() verifyCase {
+	return verifyCase{
+		name:        "128_pagebreakbefore_val_zero",
+		description: "<w:pageBreakBefore w:val=\"0\"/> means OFF, not ON",
+		build: func(t *testing.T, dir string) string {
+			return newDocx().Body(`
+    <w:p><w:r><w:t>first paragraph</w:t></w:r></w:p>
+    <w:p>
+      <w:pPr><w:pageBreakBefore w:val="0"/></w:pPr>
+      <w:r><w:t>second paragraph (NO break before)</w:t></w:r>
+    </w:p>`).Write(t, dir)
+		},
+		expectText:  []string{"first paragraph", "second paragraph"},
+		expectPages: 1, // would be 2 with the old eager-true parser
+	}
+}
+
+// caseOverwideWordInCell exercises the character-level wrap fallback
+// triggered when a single word atom is wider than its cell's content
+// width. Without the fallback, long identifiers would spill into the
+// next cell (visible as "member_idClaims" with no border between).
+func caseOverwideWordInCell() verifyCase {
+	return verifyCase{
+		name:        "129_overwide_word_in_cell",
+		description: "Long word in a narrow cell wraps at character boundaries instead of spilling",
+		build: func(t *testing.T, dir string) string {
+			// Two-column 2-row table. Column 1 is 800 twips (40 pt) —
+			// not wide enough for "submission_timestamp" (~80 pt) which
+			// would spill into column 2 without the wrap fallback.
+			body := `<w:tbl>
+      <w:tblGrid><w:gridCol w:w="800"/><w:gridCol w:w="3000"/></w:tblGrid>
+      <w:tr>
+        <w:tc><w:p><w:r><w:t>submission_timestamp</w:t></w:r></w:p></w:tc>
+        <w:tc><w:p><w:r><w:t>UNIQUE-NEIGHBOR</w:t></w:r></w:p></w:tc>
+      </w:tr>
+    </w:tbl>`
+			return newDocx().Body(body).Write(t, dir)
+		},
+		expectText:  []string{"submission", "UNIQUE-NEIGHBOR"},
+		expectPages: 1,
+		custom: func(t *testing.T, pdf string, fail func(format string, args ...any)) {
+			// The two cells must NOT be concatenated. pdftotext extracts
+			// cell text with whitespace between columns; if the long word
+			// spilled into the neighbor, "submission_timestamp" and
+			// "UNIQUE-NEIGHBOR" would appear adjacent. Confirm there's
+			// some separation (any whitespace) between them.
+			txt := pdftotext(t, pdf)
+			if strings.Contains(txt, "submission_timestampUNIQUE-NEIGHBOR") {
+				fail("over-wide word spilled into neighbor cell:\n%s", txt)
+			}
+		},
+	}
+}
+
+// caseHorizontalRuleVMLPict covers Office's HTML-compat <hr> form:
+// <w:pict><v:rect o:hr="t"/></w:pict>. Markdown → docx converters emit
+// this for "---" thematic breaks. The renderer turns the whole
+// paragraph into a thin gray line.
+func caseHorizontalRuleVMLPict() verifyCase {
+	return verifyCase{
+		name:        "130_horizontal_rule_vml",
+		description: "VML <v:rect o:hr=\"t\"> renders as a horizontal separator line",
+		build: func(t *testing.T, dir string) string {
+			return newDocx().Body(`
+    <w:p><w:r><w:t>before-rule</w:t></w:r></w:p>
+    <w:p><w:r>
+      <w:pict><v:rect xmlns:v="urn:schemas-microsoft-com:vml"
+              xmlns:o="urn:schemas-microsoft-com:office:office"
+              style="width:0.0pt;height:1.5pt"
+              o:hr="t" o:hralign="center"/></w:pict>
+    </w:r></w:p>
+    <w:p><w:r><w:t>after-rule</w:t></w:r></w:p>`).Write(t, dir)
+		},
+		expectText:  []string{"before-rule", "after-rule"},
 		expectPages: 1,
 	}
 }

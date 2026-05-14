@@ -368,6 +368,25 @@ func (r *renderer) measureCell(cell docx.TableCell, width float64) float64 {
 		lineW := 0.0
 		lineH := r.applyLineHeight(r.opts.DefaultFontSize * 1.2)
 		hadAny := false
+		// Inline helper mirroring layoutLine's accumulator. Defined as a
+		// closure so the per-rune fallback below can recurse cleanly.
+		accumulate := func(a atom) {
+			ah := atomHeight(a, r.opts.DefaultFontSize)
+			if lineW+a.width > innerW && lineW > 0 {
+				h += lineH
+				lineW = 0
+				lineH = r.applyLineHeight(r.opts.DefaultFontSize * 1.2)
+				if a.kind == atomSpace {
+					return
+				}
+			}
+			lineW += a.width
+			scaled := r.applyLineHeight(ah)
+			if scaled > lineH {
+				lineH = scaled
+			}
+			hadAny = true
+		}
 		for _, a := range atoms {
 			if a.kind == atomBookmark {
 				continue
@@ -379,21 +398,17 @@ func (r *renderer) measureCell(cell docx.TableCell, width float64) float64 {
 				hadAny = false
 				continue
 			}
-			ah := atomHeight(a, r.opts.DefaultFontSize)
-			if lineW+a.width > innerW && lineW > 0 {
-				h += lineH
-				lineW = 0
-				lineH = r.applyLineHeight(r.opts.DefaultFontSize * 1.2)
-				if a.kind == atomSpace {
-					continue
+			// Over-wide word — same character-level wrap fallback as
+			// layoutLine uses. Without this, measureCell would compute
+			// a too-small height for the cell and the real draw would
+			// overflow into the row below.
+			if a.kind == atomWord && innerW > 0 && a.width > innerW && a.text != "" {
+				for _, sub := range r.splitWordAtomByRune(a) {
+					accumulate(sub)
 				}
+				continue
 			}
-			lineW += a.width
-			scaled := r.applyLineHeight(ah)
-			if scaled > lineH {
-				lineH = scaled
-			}
-			hadAny = true
+			accumulate(a)
 		}
 		if hadAny || lineW > 0 || len(atoms) == 0 {
 			h += lineH

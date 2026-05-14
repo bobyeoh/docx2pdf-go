@@ -323,6 +323,11 @@ type Run struct {
 	// superscript marker); the renderer also queues the corresponding note
 	// body for the current page's bottom area.
 	FootnoteID string
+	// HorizontalRule marks a run that should render as a horizontal
+	// separator line at the paragraph's vertical position. Word emits
+	// these as <w:pict><v:rect o:hr="t"/></w:pict> — Office's HTML-
+	// compatibility way of representing markdown's "---" thematic break.
+	HorizontalRule bool
 	// IsEndnote distinguishes endnote refs from footnote refs (different
 	// lookup map on the renderer side).
 	IsEndnote bool

@@ -18,6 +18,13 @@ func (r *renderer) drawParagraph(p docx.Paragraph) error {
 	if p.Frame != nil {
 		return r.drawFrame(p)
 	}
+	// Horizontal rule paragraph (markdown's "---" / Word's o:hr="t"
+	// VML rect). Draw a thin gray line spanning the content width
+	// instead of running through the normal text-layout pipeline.
+	if isHorizontalRuleParagraph(p) {
+		r.drawHorizontalRule(p)
+		return nil
+	}
 	if p.PageBreak {
 		r.pdf.AddPage()
 		r.cursorY = r.marT
@@ -105,10 +112,17 @@ func (r *renderer) drawParagraph(p docx.Paragraph) error {
 	var atoms []atom
 	if p.IndentFirstLinePt > 0 {
 		atoms = append(atoms, atom{kind: atomSpace, width: p.IndentFirstLinePt})
-	} else if p.IndentFirstLinePt < 0 {
+	} else if p.IndentFirstLinePt < 0 && p.List == nil {
 		// Hanging indent: first physical line starts further left and is
 		// proportionally wider. Carried as renderer state so layoutLine can
 		// apply it on the very first flush only.
+		//
+		// Skip when this paragraph has a list marker. Word duplicates the
+		// "hanging" geometry on both the abstractNum lvl AND the
+		// paragraph's pPr/w:ind for legacy-reader compatibility; applying
+		// both would shift the first line into the marker column and
+		// render content overlapping the marker (visible as a black dot
+		// next to each list item's first letter).
 		r.firstLineHangPt = -p.IndentFirstLinePt
 	}
 	runs := p.Runs
@@ -333,4 +347,39 @@ func isHeadingStyle(id string) bool {
 		return true
 	}
 	return false
+}
+
+// isHorizontalRuleParagraph reports whether p is a "thematic break"
+// paragraph (markdown's "---" or any other source that Word encoded
+// as a <v:rect o:hr="t">). True iff any run in the paragraph carries
+// HorizontalRule = true. We treat the whole paragraph as the
+// separator rather than mixing line content with a rule.
+func isHorizontalRuleParagraph(p docx.Paragraph) bool {
+	for _, run := range p.Runs {
+		if run.HorizontalRule {
+			return true
+		}
+	}
+	return false
+}
+
+// drawHorizontalRule paints a thin gray line spanning the current
+// content width and advances cursorY by a small fixed amount so
+// surrounding paragraphs get appropriate breathing room.
+func (r *renderer) drawHorizontalRule(p docx.Paragraph) {
+	// SpacingBefore from the paragraph's pPr still applies — gives the
+	// rule some air above it.
+	if p.SpacingBefore > 0 {
+		r.cursorY += p.SpacingBefore
+	}
+	const rulePad = 6.0 // half-em above + below the line
+	r.ensureRoom(rulePad*2 + 1)
+	y := r.cursorY + rulePad
+	r.pdf.SetLineWidth(0.6)
+	r.pdf.SetStrokeColor(160, 160, 160)
+	r.pdf.Line(r.marL, y, r.marL+r.contentW, y)
+	r.cursorY = y + rulePad
+	if p.SpacingAfter > 0 {
+		r.cursorY += p.SpacingAfter
+	}
 }

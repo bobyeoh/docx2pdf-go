@@ -2046,19 +2046,25 @@ func decodePPr(dec *xml.Decoder, start xml.StartElement, p *Paragraph, paraRPr *
 				}
 				_ = dec.Skip()
 			case "pageBreakBefore":
-				p.PageBreak = true
+				// Important: <w:pageBreakBefore w:val="0"/> means
+				// EXPLICITLY OFF (used by styles to disable an
+				// inherited break). Treating the element as
+				// unconditionally-true used to produce one-page-per-
+				// heading documents when the source was a markdown
+				// export that set val="0" on every heading style.
+				p.PageBreak = onOff(t)
 				_ = dec.Skip()
 			case "keepNext":
-				p.KeepNext = true
+				p.KeepNext = onOff(t)
 				_ = dec.Skip()
 			case "keepLines":
-				p.KeepLines = true
+				p.KeepLines = onOff(t)
 				_ = dec.Skip()
 			case "contextualSpacing":
-				p.ContextualSpacing = true
+				p.ContextualSpacing = onOff(t)
 				_ = dec.Skip()
 			case "bidi":
-				p.Bidi = true
+				p.Bidi = onOff(t)
 				_ = dec.Skip()
 			case "tabs":
 				if err := decodeTabs(dec, t, p); err != nil {
@@ -2310,7 +2316,11 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 				if err != nil {
 					return nil, err
 				}
-				if vi.RID != "" {
+				if vi.IsHR {
+					// HTML/markdown <hr> separator. Renderer turns this
+					// into a horizontal line at the paragraph's position.
+					atoms = append(atoms, Run{HorizontalRule: true, Props: rp})
+				} else if vi.RID != "" {
 					atoms = append(atoms, Run{
 						ImageID:       vi.RID,
 						ImageWidthPt:  vi.WPt,
@@ -2486,6 +2496,10 @@ func extractTxbxText(dec *xml.Decoder, start xml.StartElement) (string, error) {
 type pictInfo struct {
 	RID      string
 	WPt, HPt float64
+	// IsHR marks a "horizontal rule" pict: <v:rect o:hr="t">. Word writes
+	// these to represent HTML/markdown <hr> separators. No image data
+	// involved — the renderer just draws a horizontal line.
+	IsHR bool
 }
 
 // findPictInfo walks a w:pict subtree pulling out the embedded image rId
@@ -2513,6 +2527,13 @@ func findPictInfo(dec *xml.Decoder, start xml.StartElement) (info pictInfo, err 
 					if h > 0 {
 						info.HPt = h
 					}
+				}
+				// Office uses <v:rect o:hr="t"> (sometimes <v:line>) as
+				// the HTML/markdown <hr> separator. No imagedata is
+				// involved — flagging IsHR is the signal the renderer
+				// needs to draw a horizontal line.
+				if attr(t, "hr") == "t" {
+					info.IsHR = true
 				}
 			case "imagedata":
 				// r:id (or r:relid) references the image part. Accept either
@@ -3133,6 +3154,24 @@ func attr(se xml.StartElement, local string) string {
 		}
 	}
 	return ""
+}
+
+// onOff interprets OOXML's two-valued attribute convention. A property
+// element like <w:b/> or <w:pageBreakBefore/> turns its flag ON; the
+// SAME element with w:val="0" / "false" / "off" turns it OFF. The
+// distinction matters when a style sets the flag and an individual
+// paragraph/run wants to disable it ("explicitly not bold despite the
+// style being Bold"). Returns true for ON, false for OFF.
+//
+// Treats `w:val` absent the same as ON, per spec. Common ON values
+// ("1", "true", "on") all map to true; everything else is OFF.
+func onOff(se xml.StartElement) bool {
+	v := attr(se, "val")
+	switch v {
+	case "", "1", "true", "on", "True", "On":
+		return true
+	}
+	return false
 }
 
 // frameHasPositioning reports whether a w:framePr element carries any
