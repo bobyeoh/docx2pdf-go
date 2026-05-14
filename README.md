@@ -141,6 +141,7 @@ The image already includes Noto Sans + Noto CJK at the paths above
 | Cell shading (`w:shd`) + per-edge borders (single/double/dashed/dotted) | ✅ |
 | Footnotes & endnotes: refs as `[N]` superscript, bodies at page bottom; endnotes as document trailer | ✅ |
 | Multi-column layout (`w:cols`) | ✅ |
+| Floating frames (`w:framePr` placement) — anchored at the right page position | ⚠️ — positioned correctly; body text does NOT wrap around |
 | Text wrap around floating images | ❌ — anchor falls back to inline |
 | SmartArt / shapes / charts / equations | ❌ |
 | Form controls, comments, revision tracking | ❌ |

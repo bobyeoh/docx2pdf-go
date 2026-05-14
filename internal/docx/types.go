@@ -125,6 +125,25 @@ type PageBorders struct {
 	Top, Bottom, Left, Right BorderEdge
 }
 
+// FrameInfo encodes w:framePr's positioning attributes for a paragraph
+// that should render as a floating frame rather than in the normal flow.
+//
+// Drop-cap framing is a special case handled separately on Paragraph
+// (DropCap / DropCapLines); this struct is only populated when the frame
+// has at least one positioning attribute (w:w, w:x, w:y, w:xAlign, ...).
+type FrameInfo struct {
+	WidthTwips  int    // w:w — frame width
+	HeightTwips int    // w:h — frame height (0 = fit content)
+	XTwips      int    // w:x — absolute horizontal offset from HAnchor
+	YTwips      int    // w:y — absolute vertical offset from VAnchor
+	HAnchor     string // "margin" (default), "page", "text"
+	VAnchor     string // "margin", "page" (default), "text"
+	XAlign      string // "", "left", "center", "right", "inside", "outside"
+	YAlign      string // "", "top", "center", "bottom", "inside", "outside"
+	Wrap        string // "auto" (default), "around", "tight", "through", "none", "notBeside"
+	HRule       string // "auto", "exact", "atLeast" — applies to HeightTwips
+}
+
 // LineNumbering encodes w:lnNumType. The renderer paints at a fixed
 // horizontal inset, so w:distance is intentionally not modeled — a per-doc
 // value would drift from the actual draw position.
@@ -225,6 +244,13 @@ type Paragraph struct {
 	// DropCapLines is the number of body lines the drop-cap visually spans.
 	// Pulled from w:framePr w:lines; defaults to 3 when DropCap is set.
 	DropCapLines int
+	// Frame, when non-nil, declares this paragraph is a positioned frame
+	// (w:framePr with placement attributes — distinct from the drop-cap
+	// variant). The renderer draws at the anchored position without
+	// advancing the document cursor; surrounding body text is NOT
+	// reflowed around the frame, so wrapping with `wrap="around"` may
+	// visually overlap.
+	Frame *FrameInfo
 
 	// endsSection is set when this paragraph's pPr contained an inline sectPr.
 	// Internal-only: the parser uses it to know when to close out a section.

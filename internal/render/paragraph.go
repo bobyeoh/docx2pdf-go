@@ -9,6 +9,15 @@ import (
 )
 
 func (r *renderer) drawParagraph(p docx.Paragraph) error {
+	// Positioned frame (w:framePr with placement attrs): render the
+	// paragraph in its anchored absolute position without touching the
+	// document flow. Surrounding body text is NOT reflowed around the
+	// frame, so a w:wrap="around" frame may visually overlap — matching
+	// docx4j's "absolute-positioned-block" behavior. drawFrame returns
+	// nil for nothing-to-do (zero-width frames or missing geometry).
+	if p.Frame != nil {
+		return r.drawFrame(p)
+	}
 	if p.PageBreak {
 		r.pdf.AddPage()
 		r.cursorY = r.marT

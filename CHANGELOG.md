@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added (later round)
+- **`w:framePr`-positioned paragraphs render at their anchored location**
+  rather than falling through to inline flow. Resolves `hAnchor` / `vAnchor`
+  (margin / page / text) plus `xAlign` / `yAlign` / `w:x` / `w:y` to absolute
+  page coordinates; the document cursor stays put so frames are truly
+  out-of-flow. Surrounding body text does NOT yet wrap around — that needs
+  per-line shape exclusion in the layout pass (separate, larger piece of
+  work; docx4j's FOP path has the same limitation). Regression case #114.
 - **Legacy VML images render.** `w:pict` / `v:imagedata` (older Word output,
   Excel/Outlook pasted images) now flows through the same image pipeline as
   `w:drawing`. Sizes parsed from CSS-style `style="width:1in;height:0.5in"`

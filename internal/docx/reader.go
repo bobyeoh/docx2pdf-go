@@ -1882,6 +1882,41 @@ func decodePPr(dec *xml.Decoder, start xml.StartElement, p *Paragraph, paraRPr *
 				if p.DropCap != "" && p.DropCapLines == 0 {
 					p.DropCapLines = 3
 				}
+				// Positioned-frame attributes are independent of drop-cap.
+				// Build a FrameInfo only when at least one placement
+				// attribute is present, so plain drop-cap paragraphs don't
+				// get flagged as floating.
+				if frameHasPositioning(t) {
+					fi := &FrameInfo{
+						HAnchor: attr(t, "hAnchor"),
+						VAnchor: attr(t, "vAnchor"),
+						XAlign:  attr(t, "xAlign"),
+						YAlign:  attr(t, "yAlign"),
+						Wrap:    attr(t, "wrap"),
+						HRule:   attr(t, "hRule"),
+					}
+					if v := attr(t, "w"); v != "" {
+						if x, err := strconv.Atoi(v); err == nil {
+							fi.WidthTwips = x
+						}
+					}
+					if v := attr(t, "h"); v != "" {
+						if x, err := strconv.Atoi(v); err == nil {
+							fi.HeightTwips = x
+						}
+					}
+					if v := attr(t, "x"); v != "" {
+						if x, err := strconv.Atoi(v); err == nil {
+							fi.XTwips = x
+						}
+					}
+					if v := attr(t, "y"); v != "" {
+						if x, err := strconv.Atoi(v); err == nil {
+							fi.YTwips = x
+						}
+					}
+					p.Frame = fi
+				}
 				_ = dec.Skip()
 			case "sectPr":
 				// Inline section break: paragraph belongs to current section
@@ -2792,4 +2827,21 @@ func attr(se xml.StartElement, local string) string {
 		}
 	}
 	return ""
+}
+
+// frameHasPositioning reports whether a w:framePr element carries any
+// floating-frame placement attributes. We treat the presence of any of
+// these as a signal to build a FrameInfo — purely-drop-cap framePrs (which
+// only set dropCap / lines) do not need one.
+func frameHasPositioning(se xml.StartElement) bool {
+	for _, a := range se.Attr {
+		switch a.Name.Local {
+		case "w", "h", "x", "y",
+			"hAnchor", "vAnchor",
+			"xAlign", "yAlign",
+			"wrap", "hRule":
+			return true
+		}
+	}
+	return false
 }

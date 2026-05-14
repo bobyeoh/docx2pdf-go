@@ -239,6 +239,7 @@ func allCases() []verifyCase {
 		caseOLEObjectPlaceholder(),
 		caseSettingsDefaultTabStop(),
 		caseVMLImage(),
+		caseFramePrPositioned(),
 		// — batch Q: context cancel ---
 		// (tested separately via TestContextCancel, not the harness)
 	}
@@ -3625,6 +3626,87 @@ func caseVMLImage() verifyCase {
 			}
 		},
 	}
+}
+
+// caseFramePrPositioned exercises a w:framePr-positioned paragraph that
+// should render at an absolute page-anchored location, not inline. The
+// frame's text ("FLOATED") must appear well to the right of the body's
+// natural left margin — confirming it didn't fall through to inline flow.
+func caseFramePrPositioned() verifyCase {
+	return verifyCase{
+		name:        "114_framepr_positioned",
+		description: "w:framePr with vAnchor=page + xAlign=right positions the paragraph absolutely",
+		build: func(t *testing.T, dir string) string {
+			// Frame anchored to page: 200pt wide, 4 inches down from page
+			// top, right-aligned to the margin region.
+			return newDocx().Body(`
+    <w:p><w:r><w:t>body line one</w:t></w:r></w:p>
+    <w:p>
+      <w:pPr>
+        <w:framePr w:w="4000" w:h="800" w:vAnchor="page" w:hAnchor="margin" w:xAlign="right" w:y="5760" w:wrap="around"/>
+      </w:pPr>
+      <w:r><w:t>FLOATED</w:t></w:r>
+    </w:p>
+    <w:p><w:r><w:t>body line two</w:t></w:r></w:p>`).Write(t, dir)
+		},
+		expectText:  []string{"body line one", "FLOATED", "body line two"},
+		expectPages: 1,
+		custom: func(t *testing.T, pdf string, fail func(format string, args ...any)) {
+			// FLOATED should sit to the right of the body lines. Bbox check:
+			// FLOATED.xMin > body.xMin by a wide margin (≥ 200pt).
+			out, _ := combinedOutput("pdftotext", "-bbox", pdf, "-")
+			txt := string(out)
+			bodyX, ok := bboxXMin(txt, "body")
+			if !ok {
+				fail("body bbox not found")
+				return
+			}
+			floatX, ok := bboxXMin(txt, "FLOATED")
+			if !ok {
+				fail("FLOATED bbox not found")
+				return
+			}
+			if floatX-bodyX < 200 {
+				fail("FLOATED.x (%.1f) only %.1fpt right of body.x (%.1f), want ≥ 200",
+					floatX, floatX-bodyX, bodyX)
+			}
+			// And FLOATED should sit at roughly y=288pt (4 inches from page top,
+			// per w:y=5760 twips). Allow ±20pt.
+			floatY, ok := bboxYMin(txt, "FLOATED")
+			if !ok {
+				fail("FLOATED y bbox not found")
+				return
+			}
+			if floatY < 268 || floatY > 308 {
+				fail("FLOATED.y = %.1f, want roughly 288 (5760 twips below page top)", floatY)
+			}
+		},
+	}
+}
+
+// bboxYMin pulls the yMin attribute of the first <word>…label</word> in
+// pdftotext -bbox output.
+func bboxYMin(bboxXML, label string) (float64, bool) {
+	needle := ">" + label + "</word>"
+	idx := strings.Index(bboxXML, needle)
+	if idx < 0 {
+		return 0, false
+	}
+	prefix := bboxXML[:idx]
+	yi := strings.LastIndex(prefix, `yMin="`)
+	if yi < 0 {
+		return 0, false
+	}
+	rest := prefix[yi+len(`yMin="`):]
+	end := strings.IndexByte(rest, '"')
+	if end < 0 {
+		return 0, false
+	}
+	v, err := strconv.ParseFloat(rest[:end], 64)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
 }
 
 // writeReport renders an HTML index showing every case's pages with badges.
