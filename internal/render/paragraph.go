@@ -18,9 +18,15 @@ func (r *renderer) drawParagraph(p docx.Paragraph) error {
 	if p.Frame != nil {
 		return r.drawFrame(p)
 	}
-	// Horizontal rule paragraph (markdown's "---" / Word's o:hr="t"
-	// VML rect). Draw a thin gray line spanning the content width
-	// instead of running through the normal text-layout pipeline.
+	// Horizontal rule paragraph. Word encodes "---" thematic breaks two
+	// different ways depending on the converter:
+	//   - <w:pict><v:rect o:hr="t"/></w:pict>   ← markdown via Word
+	//   - empty paragraph with <w:pBdr><w:bottom .../>  ← Google Docs,
+	//     and Word's own "Border Bottom" formatting on an empty para
+	// Both produce a thin horizontal line; isHorizontalRuleParagraph
+	// detects either form. Real content with a bottom border (e.g.
+	// section dividers under headings) falls through to the normal
+	// layout, with the border drawn at the bottom of the paragraph.
 	if isHorizontalRuleParagraph(p) {
 		r.drawHorizontalRule(p)
 		return nil
@@ -365,34 +371,63 @@ func isHeadingStyle(id string) bool {
 	return false
 }
 
-// isHorizontalRuleParagraph reports whether p is a "thematic break"
-// paragraph (markdown's "---" or any other source that Word encoded
-// as a <v:rect o:hr="t">). True iff any run in the paragraph carries
-// HorizontalRule = true. We treat the whole paragraph as the
-// separator rather than mixing line content with a rule.
+// isHorizontalRuleParagraph reports whether p should render as a
+// standalone horizontal-rule separator. Two source forms qualify:
+//  1. Any run with HorizontalRule = true (VML <v:rect o:hr="t">).
+//  2. An empty paragraph carrying ONLY a w:pBdr bottom edge — the
+//     "Border Bottom on an empty paragraph" pattern Google Docs and
+//     Word both produce for markdown "---" or the user's manual
+//     Border-Bottom-empty-paragraph trick.
+//
+// Non-empty paragraphs with bottom borders (e.g. headings underlined
+// by a w:bottom edge) are NOT considered HR; their content renders
+// normally and the border is painted at the paragraph's bottom edge
+// (see drawParagraphBorders).
 func isHorizontalRuleParagraph(p docx.Paragraph) bool {
 	for _, run := range p.Runs {
 		if run.HorizontalRule {
 			return true
 		}
 	}
-	return false
+	if !p.Borders.Bottom.Has() {
+		return false
+	}
+	for _, run := range p.Runs {
+		if run.Text != "" || run.ImageID != "" {
+			return false
+		}
+	}
+	return true
 }
 
-// drawHorizontalRule paints a thin gray line spanning the current
-// content width and advances cursorY by a small fixed amount so
-// surrounding paragraphs get appropriate breathing room.
+// drawHorizontalRule paints a thin line spanning the current content
+// width and advances cursorY by a small fixed amount so surrounding
+// paragraphs get appropriate breathing room. The line's thickness and
+// color come from p.Borders.Bottom when set (the w:pBdr / w:bottom
+// source form); otherwise we use a sensible default that matches
+// markdown viewers.
 func (r *renderer) drawHorizontalRule(p docx.Paragraph) {
-	// SpacingBefore from the paragraph's pPr still applies — gives the
-	// rule some air above it.
 	if p.SpacingBefore > 0 {
 		r.cursorY += p.SpacingBefore
 	}
 	const rulePad = 6.0 // half-em above + below the line
 	r.ensureRoom(rulePad*2 + 1)
 	y := r.cursorY + rulePad
-	r.pdf.SetLineWidth(0.6)
-	r.pdf.SetStrokeColor(160, 160, 160)
+
+	lw := 0.6
+	rr, gg, bb := uint8(160), uint8(160), uint8(160)
+	if p.Borders.Bottom.Has() {
+		if p.Borders.Bottom.Sz > 0 {
+			lw = p.Borders.Bottom.Sz
+		}
+		if c := p.Borders.Bottom.Color; c != "" && c != "auto" {
+			rr, gg, bb = parseHexColor(c)
+		} else {
+			rr, gg, bb = 0, 0, 0 // "auto" = black per spec
+		}
+	}
+	r.pdf.SetLineWidth(lw)
+	r.pdf.SetStrokeColor(rr, gg, bb)
 	r.pdf.Line(r.marL, y, r.marL+r.contentW, y)
 	r.cursorY = y + rulePad
 	if p.SpacingAfter > 0 {

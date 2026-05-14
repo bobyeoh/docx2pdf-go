@@ -259,6 +259,7 @@ func allCases() []verifyCase {
 		caseSymbolRoutesToFallback(),
 		caseTableHeaderRepeatsAtTopOfPage(),
 		caseListMarkerWithParaIndentOverride(),
+		caseParagraphBottomBorderAsRule(),
 		// — batch Q: context cancel ---
 		// (tested separately via TestContextCancel, not the harness)
 	}
@@ -4516,6 +4517,51 @@ func caseListMarkerWithParaIndentOverride() verifyCase {
 			}
 			if markerMax > bodyMin {
 				fail("marker xMax=%.1f overlaps body xMin=%.1f", markerMax, bodyMin)
+			}
+		},
+	}
+}
+
+// caseParagraphBottomBorderAsRule covers the empty-paragraph-with-
+// w:pBdr/w:bottom pattern used by Google Docs (and Word's manual
+// "Border Bottom on an empty paragraph" trick) to encode markdown
+// "---" thematic breaks. Distinct from #130 which exercises the VML
+// <v:rect o:hr="t"> form; both produce a line, the source XML
+// differs entirely.
+func caseParagraphBottomBorderAsRule() verifyCase {
+	return verifyCase{
+		name:        "134_pbdr_bottom_as_rule",
+		description: "Empty paragraph with w:pBdr/w:bottom renders as a horizontal line",
+		build: func(t *testing.T, dir string) string {
+			return newDocx().Body(`
+    <w:p><w:r><w:t>HEADING-ABOVE</w:t></w:r></w:p>
+    <w:p>
+      <w:pPr>
+        <w:pBdr><w:bottom w:val="single" w:sz="12" w:space="1" w:color="auto"/></w:pBdr>
+      </w:pPr>
+    </w:p>
+    <w:p><w:r><w:t>BODY-BELOW</w:t></w:r></w:p>`).Write(t, dir)
+		},
+		expectText:  []string{"HEADING-ABOVE", "BODY-BELOW"},
+		expectPages: 1,
+		custom: func(t *testing.T, pdf string, fail func(format string, args ...any)) {
+			// The horizontal-line region between the two visible
+			// paragraphs leaves ≥ 12 vertical points of separation.
+			// Without the rule the two paragraphs would render
+			// back-to-back with only their natural spacing — less
+			// than the rule pad + line thickness.
+			out, _ := combinedOutput("pdftotext", "-bbox", pdf, "-")
+			txt := string(out)
+			_, _, aboveBottom, _, ok1 := bboxFull(txt, "HEADING-ABOVE")
+			_, _, belowTop, _, ok2 := bboxFull(txt, "BODY-BELOW")
+			if !ok1 || !ok2 {
+				fail("missing bbox above=%v below=%v", ok1, ok2)
+				return
+			}
+			gap := belowTop - aboveBottom
+			if gap < 12 {
+				t.Logf("between gap = %.1f pt (above.yMax=%.1f below.yMin=%.1f)", gap, aboveBottom, belowTop)
+				fail("vertical gap %.1fpt — rule didn't reserve space?", gap)
 			}
 		},
 	}

@@ -260,6 +260,11 @@ type Paragraph struct {
 	// reflowed around the frame, so wrapping with `wrap="around"` may
 	// visually overlap.
 	Frame *FrameInfo
+	// Borders holds the four edges of <w:pBdr>. Markdown-style "---"
+	// thematic breaks are commonly encoded as an empty paragraph with
+	// only the bottom edge set. We reuse CellBorders because the shape
+	// (Top / Bottom / Left / Right BorderEdge) is identical.
+	Borders CellBorders
 
 	// endsSection is set when this paragraph's pPr contained an inline sectPr.
 	// Internal-only: the parser uses it to know when to close out a section.

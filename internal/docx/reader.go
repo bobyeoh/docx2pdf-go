@@ -2045,6 +2045,14 @@ func decodePPr(dec *xml.Decoder, start xml.StartElement, p *Paragraph, paraRPr *
 					}
 				}
 				_ = dec.Skip()
+			case "pBdr":
+				// <w:pBdr> wraps top/bottom/left/right edge defs that
+				// describe the paragraph's own border. Markdown's "---"
+				// thematic break is often encoded as an empty
+				// paragraph with only the bottom edge set.
+				if err := decodeParagraphBorders(dec, t, &p.Borders); err != nil {
+					return err
+				}
 			case "pageBreakBefore":
 				// Important: <w:pageBreakBefore w:val="0"/> means
 				// EXPLICITLY OFF (used by styles to disable an
@@ -2958,6 +2966,15 @@ func decodeTcMar(dec *xml.Decoder, start xml.StartElement, cell *TableCell) erro
 
 // decodeCellBorders reads tcBorders { top | bottom | left | right } children.
 // Each child element has Style/Sz/Color attrs. We map directly to BorderEdge.
+// decodeParagraphBorders parses <w:pBdr>'s edge children. Shape matches
+// <w:tcBorders> well enough that we share the decoder — paragraph
+// borders ALSO accept top/bottom/left/right (plus rarely-used "between"
+// and "bar" which we ignore). Used to render markdown's "---" thematic
+// break (empty paragraph with just w:bottom) and boxed callouts.
+func decodeParagraphBorders(dec *xml.Decoder, start xml.StartElement, b *CellBorders) error {
+	return decodeCellBorders(dec, start, b)
+}
+
 func decodeCellBorders(dec *xml.Decoder, start xml.StartElement, b *CellBorders) error {
 	for {
 		tok, err := dec.Token()
