@@ -1,0 +1,30 @@
+# Build artifacts
+/bin/
+*.test
+*.prof
+
+# Test artifacts
+cover.out
+coverage.html
+/testdata/out*.pdf
+/testdata/batch_in/
+/testdata/batch_out/
+/testdata/docker_out/
+/testdata/out_*/
+# Verify-harness output directories (regenerated on every test run).
+# The golden/ tree is checked in; out*/ trees are not.
+/internal/verify/out/
+/internal/verify/out_*/
+
+# Large test fixtures fetched out-of-band; tests skip when absent.
+/testdata/font.ttf
+/testdata/sample.docx
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Editor noise
+.idea/
+.vscode/
+*.swp

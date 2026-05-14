@@ -1,0 +1,7 @@
+bin/
+testdata/out*.pdf
+testdata/batch_out/
+testdata/font.ttf
+.git/
+.idea/
+.vscode/
