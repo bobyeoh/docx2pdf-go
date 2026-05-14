@@ -39,65 +39,13 @@ func (r *renderer) applyTableStyleToCells(t *docx.Table) {
 					continue
 				}
 				for k := range p.Runs {
-					base := mergeForRender(ts.Run, extra)
-					p.Runs[k].Props = mergeForRender(base, p.Runs[k].Props)
+					base := docx.MergeRunProps(ts.Run, extra)
+					p.Runs[k].Props = docx.MergeRunProps(base, p.Runs[k].Props)
 				}
 				cell.Blocks[bi] = p
 			}
 		}
 	}
-}
-
-// mergeForRender is the renderer-side equivalent of mergeRunProps from
-// the docx package. "child" wins where set.
-func mergeForRender(parent, child docx.RunProps) docx.RunProps {
-	out := parent
-	if child.Bold {
-		out.Bold = true
-	}
-	if child.Italic {
-		out.Italic = true
-	}
-	if child.Underline {
-		out.Underline = true
-	}
-	if child.Strike {
-		out.Strike = true
-	}
-	if child.Caps {
-		out.Caps = true
-	}
-	if child.SmallCaps {
-		out.SmallCaps = true
-	}
-	if child.FontSize != 0 {
-		out.FontSize = child.FontSize
-	}
-	if child.FontFamily != "" {
-		out.FontFamily = child.FontFamily
-	}
-	if child.Color != "" {
-		out.Color = child.Color
-	}
-	if child.ThemeColor != "" {
-		out.ThemeColor = child.ThemeColor
-	}
-	if child.Highlight != "" {
-		out.Highlight = child.Highlight
-	}
-	if child.Shading != "" {
-		out.Shading = child.Shading
-	}
-	if child.VertAlign != "" {
-		out.VertAlign = child.VertAlign
-	}
-	if child.LetterSpacingPt != 0 {
-		out.LetterSpacingPt = child.LetterSpacingPt
-	}
-	if child.TextEffect != "" {
-		out.TextEffect = child.TextEffect
-	}
-	return out
 }
 
 func (r *renderer) drawTable(t docx.Table) error {
@@ -195,9 +143,19 @@ func (r *renderer) drawRow(row docx.TableRow, widths []float64) error {
 		}
 	}
 
-	r.ensureRoom(rowH)
-	if r.cursorY != rowTop {
+	// CantSplit: if the row won't fit on the current page, push it to the
+	// next page intact rather than letting ensureRoom break it mid-row.
+	// ensureRoom is already conservative when noPageBreak is set (header /
+	// footer regions), so we only act when free flow is in effect.
+	if row.CantSplit && !r.noPageBreak && r.cursorY+rowH > r.pageH-r.marB {
+		r.drawFootnotesAtBottom()
+		r.newPage()
 		rowTop = r.cursorY
+	} else {
+		r.ensureRoom(rowH)
+		if r.cursorY != rowTop {
+			rowTop = r.cursorY
+		}
 	}
 
 	r.pdf.SetLineWidth(0.5)
@@ -389,12 +347,21 @@ func sumWidths(ws []float64, start, n int) float64 {
 
 // measureCell estimates rendered height for a cell at the given content
 // width. Does a dry layout reusing the line-breaker math without drawing.
+//
+// runsToAtoms has the side effect of queuing footnote IDs onto
+// pendingFootnotes, so we save and restore that slice — otherwise table
+// cells with footnote refs would queue each note twice (once in measure,
+// once in the real draw) and the page bottom would render duplicates.
 func (r *renderer) measureCell(cell docx.TableCell, width float64) float64 {
 	const cellPad = 4.0
 	h := 2 * cellPad
 	innerW := width - 2*cellPad
 	savedLine := r.lineHeight
-	defer func() { r.lineHeight = savedLine }()
+	savedFootnotes := r.pendingFootnotes
+	defer func() {
+		r.lineHeight = savedLine
+		r.pendingFootnotes = savedFootnotes
+	}()
 	for _, p := range cell.Paragraphs() {
 		r.lineHeight = p.LineHeight
 		atoms := r.runsToAtoms(p.Runs)

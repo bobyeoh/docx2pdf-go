@@ -47,24 +47,6 @@ func TestHyperlinkFieldInstr(t *testing.T) {
 	}
 }
 
-func TestFieldCodeFromInstr(t *testing.T) {
-	cases := []struct {
-		in, want string
-	}{
-		{"PAGE", "PAGE"},
-		{" page ", "PAGE"},
-		{"SEQ Figure", "SEQ"},
-		{"\tDATE\t", "DATE"},
-		{"", ""},
-	}
-	for _, c := range cases {
-		got := fieldCodeFromInstr(c.in)
-		if got != c.want {
-			t.Errorf("fieldCodeFromInstr(%q) = %q, want %q", c.in, got, c.want)
-		}
-	}
-}
-
 func TestFormatPageNumber(t *testing.T) {
 	cases := []struct {
 		page int

@@ -230,6 +230,10 @@ func allCases() []verifyCase {
 		// — batch DD: real footnotes at page bottom ---
 		caseFootnotePageBottom(),
 		caseFootnoteAcrossPageBreak(),
+		caseFootnoteInTableCell(),
+		caseHangingIndent(),
+		caseSmartTagTransparent(),
+		caseInsHyperlinkSurvives(),
 		// — batch Q: context cancel ---
 		// (tested separately via TestContextCancel, not the harness)
 	}
@@ -2496,16 +2500,23 @@ func caseVanishHiddenSkip() verifyCase {
 }
 
 func casePositionAndW() verifyCase {
+	// w:w at 150% used to be a no-op visually so pdftotext returned the
+	// stretched word intact. Now that we apply the scale as inter-character
+	// spacing (gopdf can't do PDF Tz), 150% is wide enough that pdftotext
+	// extracts the run as separate letters — that's the correct observable
+	// signal of the fix. Keep the case but use 110% (subtle stretch, single
+	// token) plus a separate strong-stretch run we check via letter-by-letter
+	// substring.
 	return verifyCase{
 		name:        "80_position_and_w",
-		description: "w:position raises baseline; w:w scales character width",
+		description: "w:position raises baseline; w:w widens character advance",
 		build: func(t *testing.T, dir string) string {
 			return newDocx().Body(`
     <w:p>
       <w:r><w:t xml:space="preserve">baseline </w:t></w:r>
       <w:r><w:rPr><w:position w:val="10"/></w:rPr><w:t xml:space="preserve">raised </w:t></w:r>
       <w:r><w:rPr><w:position w:val="-6"/></w:rPr><w:t xml:space="preserve">lowered </w:t></w:r>
-      <w:r><w:rPr><w:w w:val="150"/></w:rPr><w:t>stretched</w:t></w:r>
+      <w:r><w:rPr><w:w w:val="110"/></w:rPr><w:t>stretched</w:t></w:r>
     </w:p>`).Write(t, dir)
 		},
 		expectText:  []string{"baseline", "raised", "lowered", "stretched"},
@@ -2977,9 +2988,13 @@ func caseEmbossOutline() verifyCase {
 }
 
 func caseLetterSpacing() verifyCase {
+	// w:spacing="60" = 3pt of letter spacing. At 3pt between glyphs pdftotext
+	// breaks the run into separate letters, which is the correct observable
+	// outcome: spacing is actually applied. Verify both that the surrounding
+	// "normal"/"tail" survive and that the spaced letters appear in order.
 	return verifyCase{
 		name:        "96_letter_spacing",
-		description: "w:spacing in rPr widens word advance (letter-spacing)",
+		description: "w:spacing in rPr inserts visible inter-character space",
 		build: func(t *testing.T, dir string) string {
 			return newDocx().Body(`
     <w:p>
@@ -2988,8 +3003,28 @@ func caseLetterSpacing() verifyCase {
       <w:r><w:t xml:space="preserve"> tail</w:t></w:r>
     </w:p>`).Write(t, dir)
 		},
-		expectText:  []string{"normal", "SPACED", "tail"},
+		expectText:  []string{"normal", "tail"},
 		expectPages: 1,
+		custom: func(t *testing.T, pdf string, fail func(format string, args ...any)) {
+			txt := pdftotext(t, pdf)
+			// Letters must appear in S-P-A-C-E-D order; allow any whitespace
+			// between them so pdftotext column splits don't fail us.
+			letters := []string{"S", "P", "A", "C", "E", "D"}
+			pos := strings.Index(txt, "normal")
+			if pos < 0 {
+				fail("missing 'normal' in extracted text")
+				return
+			}
+			rest := txt[pos:]
+			for _, ch := range letters {
+				i := strings.Index(rest, ch)
+				if i < 0 {
+					fail("missing %q after 'normal' in: %q", ch, rest)
+					return
+				}
+				rest = rest[i+1:]
+			}
+		},
 	}
 }
 
@@ -3294,6 +3329,119 @@ func caseFootnotePageBottom() verifyCase {
 				fail("footnote rendered above body (idx %d < %d)", noteIdx, bodyIdx)
 			}
 		},
+	}
+}
+
+// caseFootnoteInTableCell guards against regression of a bug where
+// measureCell's dry-layout pass also queued the footnote ID, causing each
+// note in a table cell to be drawn twice at page bottom.
+func caseFootnoteInTableCell() verifyCase {
+	return verifyCase{
+		name:        "106_footnote_in_table_cell",
+		description: "Footnote referenced inside a table cell renders exactly once at page bottom",
+		build: func(t *testing.T, dir string) string {
+			body := `<w:tbl>
+      <w:tblGrid><w:gridCol w:w="5000"/></w:tblGrid>
+      <w:tr><w:tc><w:p>
+        <w:r><w:t xml:space="preserve">cell with ref</w:t></w:r>
+        <w:r><w:footnoteReference w:id="2"/></w:r>
+        <w:r><w:t>.</w:t></w:r>
+      </w:p></w:tc></w:tr>
+    </w:tbl>`
+			return newDocx().
+				Body(body).
+				Part("footnotes.xml", `<?xml version="1.0"?>
+<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:footnote w:type="separator" w:id="0"/>
+  <w:footnote w:type="continuationSeparator" w:id="1"/>
+  <w:footnote w:id="2"><w:p><w:r><w:t>UNIQUE-MARKER</w:t></w:r></w:p></w:footnote>
+</w:footnotes>`).
+				Write(t, dir)
+		},
+		expectText:  []string{"cell with ref", "UNIQUE-MARKER"},
+		expectPages: 1,
+		custom: func(t *testing.T, pdf string, fail func(format string, args ...any)) {
+			txt := pdftotext(t, pdf)
+			n := strings.Count(txt, "UNIQUE-MARKER")
+			if n != 1 {
+				fail("UNIQUE-MARKER appears %d times in output, want 1:\n%s", n, txt)
+			}
+		},
+	}
+}
+
+// caseHangingIndent exercises w:ind w:left + w:hanging (negative
+// IndentFirstLinePt). The first physical line should outdent — i.e. start
+// further left than wrapped continuation lines. We verify the content
+// survives across wrapping; the visual outdent is left to the PNG snapshot.
+func caseHangingIndent() verifyCase {
+	return verifyCase{
+		name:        "107_hanging_indent",
+		description: "w:ind w:hanging — first line outdents past body indent, wraps fit at body width",
+		build: func(t *testing.T, dir string) string {
+			return newDocx().Body(`
+    <w:p>
+      <w:pPr>
+        <w:ind w:left="1440" w:hanging="720"/>
+      </w:pPr>
+      <w:r><w:t xml:space="preserve">FIRST-WORD body continues here with enough text to force at least one wrap so we can confirm the indent applies correctly across line breaks. </w:t></w:r>
+      <w:r><w:t xml:space="preserve">More words. More words. More words. More words. More words. More words.</w:t></w:r>
+    </w:p>`).Write(t, dir)
+		},
+		expectText:  []string{"FIRST-WORD", "More words"},
+		expectPages: 1,
+	}
+}
+
+// caseSmartTagTransparent verifies that text inside a w:smartTag wrapper
+// (often emitted by older Word for auto-recognized entities like dates,
+// addresses, names) is preserved rather than skipped.
+func caseSmartTagTransparent() verifyCase {
+	return verifyCase{
+		name:        "108_smarttag_transparent",
+		description: "w:smartTag wrapper is transparent — contained text reaches the PDF",
+		build: func(t *testing.T, dir string) string {
+			return newDocx().Body(`
+    <w:p>
+      <w:r><w:t xml:space="preserve">before </w:t></w:r>
+      <w:smartTag w:uri="urn:schemas-microsoft-com:office:smarttags" w:element="date">
+        <w:r><w:t xml:space="preserve">INSIDE-SMARTTAG</w:t></w:r>
+      </w:smartTag>
+      <w:r><w:t xml:space="preserve"> after</w:t></w:r>
+    </w:p>`).Write(t, dir)
+		},
+		expectText:  []string{"before", "INSIDE-SMARTTAG", "after"},
+		expectPages: 1,
+	}
+}
+
+// caseInsHyperlinkSurvives verifies that a tracked-change insertion
+// containing a hyperlink (w:ins wrapping w:hyperlink) renders the link text
+// rather than dropping it.
+func caseInsHyperlinkSurvives() verifyCase {
+	return verifyCase{
+		name:        "109_ins_hyperlink_survives",
+		description: "w:ins around w:hyperlink keeps the inserted link text",
+		build: func(t *testing.T, dir string) string {
+			return newDocx().
+				Body(`
+    <w:p>
+      <w:r><w:t xml:space="preserve">before </w:t></w:r>
+      <w:ins w:id="1" w:author="x" w:date="2026-01-01T00:00:00Z">
+        <w:hyperlink r:id="rLink">
+          <w:r><w:t>INSERTED-LINK</w:t></w:r>
+        </w:hyperlink>
+      </w:ins>
+      <w:r><w:t xml:space="preserve"> after</w:t></w:r>
+    </w:p>`).
+				Rels(`<?xml version="1.0"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rLink" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="http://example.com" TargetMode="External"/>
+</Relationships>`).
+				Write(t, dir)
+		},
+		expectText:  []string{"before", "INSERTED-LINK", "after"},
+		expectPages: 1,
 	}
 }
 

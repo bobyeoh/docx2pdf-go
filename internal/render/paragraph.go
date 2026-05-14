@@ -72,6 +72,11 @@ func (r *renderer) drawParagraph(p docx.Paragraph) error {
 	var atoms []atom
 	if p.IndentFirstLinePt > 0 {
 		atoms = append(atoms, atom{kind: atomSpace, width: p.IndentFirstLinePt})
+	} else if p.IndentFirstLinePt < 0 {
+		// Hanging indent: first physical line starts further left and is
+		// proportionally wider. Carried as renderer state so layoutLine can
+		// apply it on the very first flush only.
+		r.firstLineHangPt = -p.IndentFirstLinePt
 	}
 	runs := p.Runs
 	if p.DropCap != "" {
@@ -82,10 +87,12 @@ func (r *renderer) drawParagraph(p docx.Paragraph) error {
 	if err := r.layoutLine(atoms, p.Alignment); err != nil {
 		r.restoreParagraphState(savedColIdx, savedMarL, savedContentW, savedLine)
 		r.pendingMarker = nil
+		r.firstLineHangPt = 0
 		return err
 	}
 	r.restoreParagraphState(savedColIdx, savedMarL, savedContentW, savedLine)
 	r.pendingMarker = nil
+	r.firstLineHangPt = 0
 
 	if p.SpacingAfter > 0 {
 		r.cursorY += p.SpacingAfter

@@ -365,6 +365,17 @@ func (r *renderer) drawFootnotesAtBottom() {
 	r.pdf.Line(r.marL, startY, r.marL+r.contentW*0.3, startY)
 	r.cursorY = startY + 2
 
+	logFn := r.opts.Logger
+	if logFn == nil && r.opts.Verbose {
+		logFn = func(s string) { fmt.Println(s) }
+	}
+	logErr := func(msg string, err error) {
+		if err == nil || logFn == nil {
+			return
+		}
+		logFn(fmt.Sprintf("footnote: %s: %v", msg, err))
+	}
+
 	for _, pn := range r.pendingFootnotes {
 		var blocks []docx.Block
 		if pn.endnote {
@@ -377,7 +388,7 @@ func (r *renderer) drawFootnotesAtBottom() {
 				Text: "[" + pn.id + "] ", Props: docx.RunProps{Bold: true, FontSize: 9},
 			}},
 		}
-		_ = r.drawParagraph(marker)
+		logErr("marker "+pn.id, r.drawParagraph(marker))
 		for _, b := range blocks {
 			switch v := b.(type) {
 			case docx.Paragraph:
@@ -386,7 +397,7 @@ func (r *renderer) drawFootnotesAtBottom() {
 						v.Runs[k].Props.FontSize = 9
 					}
 				}
-				_ = r.drawParagraph(v)
+				logErr("body "+pn.id, r.drawParagraph(v))
 			}
 		}
 	}

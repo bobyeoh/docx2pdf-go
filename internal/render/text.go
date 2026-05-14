@@ -32,14 +32,9 @@ const (
 	atomBookmark // zero-width marker; registers a named PDF anchor at this position
 )
 
-// nextTabAfter returns the next tab stop strictly past relX (measured from
-// line left margin), along with its leader and a found flag.
-func (r *renderer) nextTabAfter(relX float64, p docx.RunProps) (float64, string, bool) {
-	pos, leader, _, ok := r.nextTabAfterWithAlign(relX, p)
-	return pos, leader, ok
-}
-
-// nextTabAfterWithAlign also returns the tab's alignment.
+// nextTabAfterWithAlign returns the next tab stop strictly past relX
+// (measured from line left margin), along with its leader, alignment, and
+// a found flag.
 func (r *renderer) nextTabAfterWithAlign(relX float64, p docx.RunProps) (float64, string, string, bool) {
 	for _, ts := range r.activeTabs {
 		if ts.Pos > relX+0.5 {
@@ -153,12 +148,15 @@ func (r *renderer) runsToAtoms(runs []docx.Run) []atom {
 			if !ok {
 				continue
 			}
-			if run.CropTopPct > 0 || run.CropBottomPct > 0 || run.CropLeftPct > 0 || run.CropRightPct > 0 {
+			cropped := run.CropTopPct > 0 || run.CropBottomPct > 0 || run.CropLeftPct > 0 || run.CropRightPct > 0
+			imgID := run.ImageID
+			if cropped {
 				img = cropImage(img, run.CropTopPct, run.CropBottomPct, run.CropLeftPct, run.CropRightPct)
 				if r.croppedCache == nil {
 					r.croppedCache = map[string]image.Image{}
 				}
-				r.croppedCache[run.ImageID+":crop"] = img
+				imgID = run.ImageID + ":crop"
+				r.croppedCache[imgID] = img
 			}
 			var w, h float64
 			if run.ImageWidthPt > 0 && run.ImageHeightPt > 0 {
@@ -170,11 +168,6 @@ func (r *renderer) runsToAtoms(runs []docx.Run) []atom {
 				}
 			} else {
 				w, h = r.fitImage(img)
-			}
-			imgID := run.ImageID
-			if run.CropTopPct > 0 || run.CropBottomPct > 0 || run.CropLeftPct > 0 || run.CropRightPct > 0 {
-				imgID = run.ImageID + ":crop"
-				r.croppedCache[imgID] = img
 			}
 			out = append(out, atom{kind: atomImage, imageID: imgID, width: w, height: h, props: run.Props, linkRID: run.LinkURL, linkAnchor: run.LinkAnchor})
 			continue
@@ -284,9 +277,17 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 	var lineW float64
 	var lineMaxH float64
 
+	// Hanging indent: the first physical line gets `hang` extra width and
+	// starts `hang` to the left. Captured once here so it can't change
+	// mid-paragraph; consumed and zeroed on the first flush.
+	hang := r.firstLineHangPt
+
 	flush := func(isLast bool) error {
 		if len(line) == 0 {
 			r.cursorY += r.applyLineHeight(r.opts.DefaultFontSize * 1.2)
+			// An empty first line still "uses up" the hanging — clear so the
+			// next non-empty line wraps at the normal margin.
+			hang = 0
 			return nil
 		}
 		if lineMaxH == 0 {
@@ -295,13 +296,16 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 		lineMaxH = r.applyLineHeight(lineMaxH)
 		r.ensureRoom(lineMaxH)
 
-		x := r.marL
+		// Effective geometry for this specific line: first physical line gets
+		// the hanging outdent; later lines use the paragraph's normal margin.
+		x := r.marL - hang
+		effW := r.contentW + hang
 		extraSpace := 0.0
 		switch align {
 		case docx.AlignCenter:
-			x += (r.contentW - lineW) / 2
+			x = r.marL + (r.contentW-lineW)/2
 		case docx.AlignRight:
-			x += r.contentW - lineW
+			x = r.marL + r.contentW - lineW
 		case docx.AlignJustify:
 			if !isLast {
 				spaces := 0
@@ -310,11 +314,13 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 						spaces++
 					}
 				}
-				if spaces > 0 && r.contentW > lineW {
-					extraSpace = (r.contentW - lineW) / float64(spaces)
+				if spaces > 0 && effW > lineW {
+					extraSpace = (effW - lineW) / float64(spaces)
 				}
 			}
 		}
+		// One-shot: subsequent flushes use the normal margin.
+		hang = 0
 
 		baseline := r.cursorY + lineMaxH*0.8
 
@@ -409,10 +415,6 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 					r.pdf.AddInternalLink(a.linkAnchor, cx, topY, a.width, h)
 				}
 				cx += a.width
-				if a.props.LetterSpacingPt != 0 && a.text != "" {
-					nch := float64(len([]rune(a.text)))
-					cx += nch * a.props.LetterSpacingPt
-				}
 			case atomSpace:
 				cx += a.width + extraSpace
 			case atomTab:
@@ -490,7 +492,11 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 			continue
 		}
 		h := atomHeight(a, r.opts.DefaultFontSize)
-		if lineW+a.width > r.contentW && len(line) > 0 {
+		// First line gets hang extra width; subsequent lines use r.contentW.
+		// hang is zeroed inside flush() so this naturally tightens after the
+		// first wrap.
+		effW := r.contentW + hang
+		if lineW+a.width > effW && len(line) > 0 {
 			if len(line) > 0 && line[len(line)-1].kind == atomSpace {
 				lineW -= line[len(line)-1].width
 				line = line[:len(line)-1]

@@ -187,6 +187,12 @@ type parseDocContext struct {
 	// curSection accumulates blocks for the section currently being parsed.
 	// Each sectPr (inline or top-level) finalizes it and starts a new one.
 	curSection Section
+
+	// Bookmark state lives at document scope so bookmarkStart in one
+	// paragraph and bookmarkEnd in another can still capture the text in
+	// between for REF field resolution. Maps are nil when nothing is open.
+	bmIDToName map[string]string
+	bmActive   map[string]bool
 }
 
 // finalizeSection appends the in-progress section to doc.Sections, applies
@@ -641,7 +647,7 @@ func parseStyles(f *zip.File, doc *Document) error {
 			return r.Run
 		}
 		parent := resolveChar(r.BasedOn, seen)
-		return mergeRunProps(parent, r.Run)
+		return MergeRunProps(parent, r.Run)
 	}
 	for id := range rawChar {
 		doc.CharStyles[id] = resolveChar(id, map[string]bool{})
@@ -745,7 +751,7 @@ func mergeStyles(parent, child ParagraphStyle) ParagraphStyle {
 	out := parent
 	out.ID = child.ID
 	out.BasedOn = child.BasedOn
-	out.Run = mergeRunProps(parent.Run, child.Run)
+	out.Run = MergeRunProps(parent.Run, child.Run)
 	if child.HasAlignment {
 		out.Alignment = child.Alignment
 		out.HasAlignment = true
@@ -762,9 +768,11 @@ func mergeStyles(parent, child ParagraphStyle) ParagraphStyle {
 	return out
 }
 
-// mergeRunProps overlays a child run-props block on top of a parent block.
+// MergeRunProps overlays a child run-props block on top of a parent block.
 // Each field's "set" predicate matches what rPrToProps actually writes.
-func mergeRunProps(parent, child RunProps) RunProps {
+// Exported because the renderer needs the same logic for table-style
+// flattening — keeping one canonical implementation here avoids drift.
+func MergeRunProps(parent, child RunProps) RunProps {
 	out := parent
 	if child.Bold {
 		out.Bold = true
@@ -1451,11 +1459,16 @@ func decodeParagraph(dec *xml.Decoder, start xml.StartElement, pctx *parseDocCon
 	}
 	paraRPr := doc.Defaults // paragraph-level rPr inherited by runs
 
-	// Per-paragraph bookmark scope. We map w:id → w:name when bookmarkStart
-	// fires, then while a name is active we accumulate run text into
-	// doc.Bookmarks[name] so REF fields can resolve later.
-	bmIDToName := map[string]string{}
-	bmActive := map[string]bool{}
+	// Bookmark state lives on pctx so a bookmark that opens in one paragraph
+	// and closes in another still captures all text in between.
+	if pctx.bmIDToName == nil {
+		pctx.bmIDToName = map[string]string{}
+	}
+	if pctx.bmActive == nil {
+		pctx.bmActive = map[string]bool{}
+	}
+	bmIDToName := pctx.bmIDToName
+	bmActive := pctx.bmActive
 
 	for {
 		tok, err := dec.Token()
@@ -1515,12 +1528,19 @@ func decodeParagraph(dec *xml.Decoder, start xml.StartElement, pctx *parseDocCon
 			case "ins":
 				// w:ins wraps a tracked-change INSERTION — accept mode: render
 				// its child runs as normal text.
-				if err := decodeRevisionWrapper(dec, t, &p, paraRPr, pctx, false); err != nil {
+				if err := decodeWrapper(dec, t, &p, paraRPr, pctx, false); err != nil {
 					return p, err
 				}
 			case "del":
 				// w:del wraps DELETED runs — accept mode: drop entirely.
-				if err := decodeRevisionWrapper(dec, t, &p, paraRPr, pctx, true); err != nil {
+				if err := decodeWrapper(dec, t, &p, paraRPr, pctx, true); err != nil {
+					return p, err
+				}
+			case "smartTag", "customXml":
+				// Auto-recognized text / structured-doc wrapper. The wrapper
+				// itself has no rendering effect — recurse into its child
+				// runs so the contained text isn't lost.
+				if err := decodeWrapper(dec, t, &p, paraRPr, pctx, false); err != nil {
 					return p, err
 				}
 			case "commentRangeStart", "commentRangeEnd", "commentReference":
@@ -1539,10 +1559,15 @@ func decodeParagraph(dec *xml.Decoder, start xml.StartElement, pctx *parseDocCon
 	}
 }
 
-// decodeRevisionWrapper handles <w:ins> and <w:del>. In accept mode (Word's
-// default for read-only render) we either keep all child runs (ins) or drop
-// them (del). The decoder structurally mirrors decodeHyperlink.
-func decodeRevisionWrapper(dec *xml.Decoder, start xml.StartElement, p *Paragraph, paraRPr RunProps, pctx *parseDocContext, drop bool) error {
+// decodeWrapper handles transparent paragraph-child wrappers: w:ins / w:del
+// (tracked-changes), w:smartTag (auto-recognized text), w:customXml
+// (structured document tags). The wrapper itself has no rendering effect —
+// we recurse into its child runs (and nested wrappers) and append them to
+// the parent paragraph, except in "drop" mode (w:del) where we discard.
+//
+// Bookmark text capture continues to work because pctx.bmActive is checked
+// for every emitted run regardless of nesting depth.
+func decodeWrapper(dec *xml.Decoder, start xml.StartElement, p *Paragraph, paraRPr RunProps, pctx *parseDocContext, drop bool) error {
 	for {
 		tok, err := dec.Token()
 		if err != nil {
@@ -1550,15 +1575,62 @@ func decodeRevisionWrapper(dec *xml.Decoder, start xml.StartElement, p *Paragrap
 		}
 		switch t := tok.(type) {
 		case xml.StartElement:
-			if t.Name.Local == "r" {
+			switch t.Name.Local {
+			case "r":
 				runs, err := decodeRun(dec, t, paraRPr, pctx.doc)
 				if err != nil {
 					return err
 				}
-				if !drop {
-					p.Runs = append(p.Runs, runs...)
+				if drop {
+					continue
 				}
-			} else {
+				p.Runs = append(p.Runs, runs...)
+				// Bookmark capture: same logic as decodeParagraph's r branch,
+				// so a bookmark spanning wrapped text still captures it.
+				if len(pctx.bmActive) > 0 {
+					var sb strings.Builder
+					for _, rn := range runs {
+						sb.WriteString(rn.Text)
+					}
+					if s := sb.String(); s != "" {
+						for name := range pctx.bmActive {
+							pctx.doc.Bookmarks[name] += s
+						}
+					}
+				}
+			case "hyperlink":
+				if drop {
+					_ = dec.Skip()
+					continue
+				}
+				if err := decodeHyperlink(dec, t, p, paraRPr, pctx); err != nil {
+					return err
+				}
+			case "ins", "del", "smartTag", "customXml":
+				// Nested wrappers: a w:del inside a w:ins still drops; a
+				// w:ins inside a w:del still drops (parent wins via the
+				// drop flag — Word's "accept all" semantics).
+				childDrop := drop || t.Name.Local == "del"
+				if err := decodeWrapper(dec, t, p, paraRPr, pctx, childDrop); err != nil {
+					return err
+				}
+			case "bookmarkStart":
+				id := attr(t, "id")
+				name := attr(t, "name")
+				if name != "" && pctx.bmIDToName != nil {
+					pctx.bmIDToName[id] = name
+					pctx.bmActive[name] = true
+				}
+				_ = dec.Skip()
+			case "bookmarkEnd":
+				id := attr(t, "id")
+				if pctx.bmIDToName != nil {
+					if name, ok := pctx.bmIDToName[id]; ok {
+						delete(pctx.bmActive, name)
+					}
+				}
+				_ = dec.Skip()
+			default:
 				_ = dec.Skip()
 			}
 		case xml.EndElement:
@@ -1672,7 +1744,7 @@ func decodePPr(dec *xml.Decoder, start xml.StartElement, p *Paragraph, paraRPr *
 				if styleID != "" {
 					p.StyleID = styleID
 					if st, ok := doc.Styles[styleID]; ok {
-						*paraRPr = mergeRunProps(*paraRPr, st.Run)
+						*paraRPr = MergeRunProps(*paraRPr, st.Run)
 						if st.HasAlignment {
 							p.Alignment = st.Alignment
 						}
@@ -1838,7 +1910,7 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 				// rPrToProps writing-on-top).
 				if rp.StyleID != "" && doc != nil {
 					if sp, ok := doc.CharStyles[rp.StyleID]; ok {
-						rp = mergeRunProps(sp, rp)
+						rp = MergeRunProps(sp, rp)
 					}
 				}
 			case "t":
@@ -1952,8 +2024,12 @@ type drawingInfo struct {
 	CropT, CropB, CropL, CropR float64 // pct
 }
 
+// emuPerPt is the OOXML "English Metric Unit" → PostScript point conversion.
+// 1 inch = 914400 EMU, 1 pt = 1/72 inch, so 1 pt = 914400/72 = 12700 EMU.
+// (The often-seen value 9525 is EMU-per-pixel-at-96dpi, not per-point.)
+const emuPerPt = 12700.0
+
 // findDrawingInfo walks a w:drawing subtree and pulls out the drawing info.
-// EMU conversion: 914400 EMU = 1 inch = 72 pt; so pt = EMU / 9525.
 // srcRect: each side is in 1/1000ths of a percent (so 10000 = 10%).
 func findDrawingInfo(dec *xml.Decoder, start xml.StartElement) (info drawingInfo, err error) {
 	depth := 1
@@ -1977,11 +2053,11 @@ func findDrawingInfo(dec *xml.Decoder, start xml.StartElement) (info drawingInfo
 					switch a.Name.Local {
 					case "cx":
 						if x, err := strconv.ParseInt(a.Value, 10, 64); err == nil {
-							info.WPt = float64(x) / 9525.0
+							info.WPt = float64(x) / emuPerPt
 						}
 					case "cy":
 						if x, err := strconv.ParseInt(a.Value, 10, 64); err == nil {
-							info.HPt = float64(x) / 9525.0
+							info.HPt = float64(x) / emuPerPt
 						}
 					}
 				}
@@ -2006,58 +2082,6 @@ func findDrawingInfo(dec *xml.Decoder, start xml.StartElement) (info drawingInfo
 		}
 	}
 	return info, nil
-}
-
-// findBlipEmbed is kept for backward compatibility; deprecated wrapper.
-func findBlipEmbed(dec *xml.Decoder, start xml.StartElement) (string, error) {
-	depth := 1
-	for depth > 0 {
-		tok, err := dec.Token()
-		if err != nil {
-			return "", err
-		}
-		switch t := tok.(type) {
-		case xml.StartElement:
-			depth++
-			if t.Name.Local == "blip" {
-				// r:embed is namespace-qualified; we accept any "embed" attr name.
-				for _, a := range t.Attr {
-					if a.Name.Local == "embed" {
-						// consume rest of subtree
-						for depth > 1 {
-							tok2, err := dec.Token()
-							if err != nil {
-								return "", err
-							}
-							switch tok2.(type) {
-							case xml.StartElement:
-								depth++
-							case xml.EndElement:
-								depth--
-							}
-						}
-						// Now consume the drawing closing token.
-						for depth > 0 {
-							tok3, err := dec.Token()
-							if err != nil {
-								return a.Value, err
-							}
-							switch tok3.(type) {
-							case xml.StartElement:
-								depth++
-							case xml.EndElement:
-								depth--
-							}
-						}
-						return a.Value, nil
-					}
-				}
-			}
-		case xml.EndElement:
-			depth--
-		}
-	}
-	return "", nil
 }
 
 func decodeTable(dec *xml.Decoder, start xml.StartElement, pctx *parseDocContext) (Table, error) {
@@ -2519,11 +2543,7 @@ func decodeSectPr(dec *xml.Decoder, start xml.StartElement, pctx *parseDocContex
 						sec.LineNumbering.Start = x
 					}
 				}
-				if v := attr(t, "distance"); v != "" {
-					if x, err := strconv.Atoi(v); err == nil {
-						sec.LineNumbering.Distance = x
-					}
-				}
+				// w:distance is intentionally not modeled — see LineNumbering doc.
 				sec.LineNumbering.Restart = attr(t, "restart")
 				_ = dec.Skip()
 			case "cols":

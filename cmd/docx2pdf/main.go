@@ -34,6 +34,7 @@ func main() {
 	font := flag.String("font", "", "path to regular TTF font (required)")
 	fontBold := flag.String("font-bold", "", "path to bold TTF font (optional)")
 	fontItalic := flag.String("font-italic", "", "path to italic TTF font (optional)")
+	fontHeading := flag.String("font-heading", "", "path to TTF used for theme-major (heading) runs; e.g. Cambria (optional)")
 	fontFallback := flag.String("font-fallback", "", "path to fallback TTF used for CJK glyphs (optional)")
 	size := flag.Float64("size", 11, "default font size in points")
 	pageNumbers := flag.Bool("page-numbers", false, "draw 'X / N' page numbers at the bottom of every page")
@@ -54,6 +55,7 @@ func main() {
 		FontRegular:     *font,
 		FontBold:        *fontBold,
 		FontItalic:      *fontItalic,
+		FontHeading:     *fontHeading,
 		FontFallback:    *fontFallback,
 		DefaultFontSize: *size,
 		PageNumbers:     *pageNumbers,

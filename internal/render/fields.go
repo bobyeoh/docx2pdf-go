@@ -188,18 +188,6 @@ func flattenFields(runs []docx.Run, vars fieldVars) []docx.Run {
 	return out
 }
 
-func fieldCodeFromInstr(s string) string {
-	s = strings.TrimSpace(s)
-	if i := strings.IndexAny(s, " \t"); i >= 0 {
-		s = s[:i]
-	}
-	return strings.ToUpper(s)
-}
-
-func lookupFieldValue(code string, vars fieldVars) (string, bool) {
-	return lookupFieldValueWith(code, "", vars)
-}
-
 // lookupFieldValueWith resolves one field code+arg pair to its rendered
 // value. Returning (_, false) lets the caller fall back to the cached Word
 // result.

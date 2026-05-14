@@ -102,12 +102,13 @@ type PageBorders struct {
 	Top, Bottom, Left, Right BorderEdge
 }
 
-// LineNumbering encodes w:lnNumType.
+// LineNumbering encodes w:lnNumType. The renderer paints at a fixed
+// horizontal inset, so w:distance is intentionally not modeled — a per-doc
+// value would drift from the actual draw position.
 type LineNumbering struct {
-	Start    int    // first line number (default 1)
-	Distance int    // EMU from text, ignored — we use a small fixed offset
-	CountBy  int    // every Nth line shown (default 1)
-	Restart  string // "newPage", "newSection", "continuous"
+	Start   int    // first line number (default 1)
+	CountBy int    // every Nth line shown (default 1)
+	Restart string // "newPage", "newSection", "continuous"
 }
 
 // Section represents one continuous range of body blocks that share the same

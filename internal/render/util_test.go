@@ -54,15 +54,6 @@ func TestParseHexColor(t *testing.T) {
 	}
 }
 
-func TestBoolFloat(t *testing.T) {
-	if boolFloat(true) != 1 {
-		t.Error("boolFloat(true) != 1")
-	}
-	if boolFloat(false) != 0 {
-		t.Error("boolFloat(false) != 0")
-	}
-}
-
 func TestFileExists(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "hello.txt")

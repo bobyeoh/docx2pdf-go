@@ -55,6 +55,12 @@ type Options struct {
 	FontRegular string
 	FontBold    string // optional; falls back to FontRegular
 	FontItalic  string // optional
+	// FontHeading is an optional TTF used for runs that the theme tags with
+	// a "major" font role (w:rFonts w:asciiTheme="majorHAnsi" etc.). When
+	// empty, theme-major runs fall back to FontRegular — which means modern
+	// Word templates render headings in the body face. Set this to e.g.
+	// Cambria.ttf to get the visual distinction Office shows by default.
+	FontHeading string
 	// FontFallback is a TTF used for runes the regular font cannot render
 	// (typically CJK). Recommended: Noto Sans CJK or similar.
 	FontFallback string
@@ -193,8 +199,6 @@ func RenderWriter(doc *docx.Document, w io.Writer, opts Options) error {
 		marL += twipsToPt(sec.GutterTwips)
 		r.marL, r.marR, r.marT, r.marB = marL, marR, marT, marB
 		r.contentW = r.pageW - r.marL - r.marR
-		r.sectionMarL = marL
-		r.sectionMarR = marR
 		r.lineNumCounter = sec.LineNumbering.Start
 		if r.lineNumCounter < 1 {
 			r.lineNumCounter = 1
@@ -306,12 +310,11 @@ type renderer struct {
 	counters    map[int]map[int]int // numId → level → next counter value
 	noPageBreak bool                // when true, ensureRoom never adds pages
 	// Multi-column layout (w:cols).
-	numColumns               float64
-	colW                     float64
-	colGap                   float64
-	colBaseX                 float64
-	colIdx                   int
-	sectionMarL, sectionMarR float64
+	numColumns float64
+	colW       float64
+	colGap     float64
+	colBaseX   float64
+	colIdx     int
 	// Line numbering state: counter advances per visible body line; reset
 	// to LineNumbering.Start at each section.
 	lineNumCounter int
@@ -331,6 +334,10 @@ type renderer struct {
 	// pendingMarker, if non-nil, is drawn at the first line's baseline
 	// during layoutLine.flush() — used for hanging list markers.
 	pendingMarker *pendingMarker
+	// firstLineHangPt, when > 0, outdents the first physical line of the
+	// active paragraph by that many points (Word's w:ind w:hanging). Cleared
+	// after the first flush so subsequent lines wrap at the normal margin.
+	firstLineHangPt float64
 	// activeTabs is the active paragraph's tab stops, used by layoutLine
 	// to snap atomTab atoms to the next stop.
 	activeTabs []docx.TabStop

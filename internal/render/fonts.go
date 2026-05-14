@@ -10,6 +10,7 @@ const (
 	defaultFamily  = "doc"
 	boldFamily     = "doc-b"
 	italicFamily   = "doc-i"
+	headingFamily  = "doc-h"
 	fallbackFamily = "doc-fb"
 )
 
@@ -28,6 +29,11 @@ func (r *renderer) registerFonts() error {
 			r.fonts[italicFamily] = true
 		}
 	}
+	if r.opts.FontHeading != "" {
+		if err := r.pdf.AddTTFFont(headingFamily, r.opts.FontHeading); err == nil {
+			r.fonts[headingFamily] = true
+		}
+	}
 	if r.opts.FontFallback != "" {
 		if err := r.pdf.AddTTFFont(fallbackFamily, r.opts.FontFallback); err == nil {
 			r.fonts[fallbackFamily] = true
@@ -36,9 +42,26 @@ func (r *renderer) registerFonts() error {
 	return nil
 }
 
+// isMajorThemeRole reports whether the role names a major (i.e. heading)
+// theme font slot. Major roles map to FontHeading when available; minor
+// roles always fall through to the default body font.
+func isMajorThemeRole(role string) bool {
+	switch role {
+	case "majorAscii", "majorEastAsia":
+		return true
+	}
+	return false
+}
+
 // selectFont picks the registered family that should render `p`, honoring
-// bold/italic variants when available.
+// bold/italic variants when available. A run whose theme font role is
+// "major*" (heading) routes to the heading family if FontHeading was
+// registered; otherwise it falls through to the regular face — keeping
+// behavior unchanged for callers that don't opt into a heading font.
 func (r *renderer) selectFont(p docx.RunProps) string {
+	if isMajorThemeRole(p.ThemeFontRole) && r.fonts[headingFamily] {
+		return headingFamily
+	}
 	switch {
 	case p.Bold && r.fonts[boldFamily]:
 		return boldFamily
@@ -51,6 +74,12 @@ func (r *renderer) selectFont(p docx.RunProps) string {
 // applyFontFamily activates a specific registered family at the run's size.
 // Atoms carry an explicit family when CJK fallback applies, so this lets us
 // switch fonts mid-line without consulting selectFont again.
+//
+// Also installs the run's effective character spacing (w:spacing → letter
+// spacing, plus w:w → approximate horizontal scale). Done here so both
+// MeasureTextWidth and the subsequent Cell draw see the same value — they
+// share the gopdf "current" CharSpacing state, so the measured atom width
+// matches what the renderer eventually paints.
 func (r *renderer) applyFontFamily(p docx.RunProps, family string) error {
 	if family == "" {
 		family = r.selectFont(p)
@@ -65,6 +94,7 @@ func (r *renderer) applyFontFamily(p docx.RunProps, family string) error {
 	if err := r.pdf.SetFont(family, "", size); err != nil {
 		return err
 	}
+	_ = r.pdf.SetCharSpacing(charSpacingFor(p, size))
 	color := p.Color
 	if color == "" && p.ThemeColor != "" {
 		if hex, ok := r.doc.Theme.Colors[p.ThemeColor]; ok {
@@ -78,6 +108,20 @@ func (r *renderer) applyFontFamily(p docx.RunProps, family string) error {
 		r.pdf.SetTextColor(0, 0, 0)
 	}
 	return nil
+}
+
+// charSpacingFor returns the effective inter-character spacing in points
+// for a run. LetterSpacingPt (w:spacing) adds directly; CharacterScale
+// (w:w, 1.0 = 100%) is approximated by spreading the per-glyph delta
+// across the run — true Tz horizontal scaling isn't available in gopdf.
+// Glyph half-em is a rough enough proxy for "advance per char" without
+// pulling font metrics; result reads as condensed/expanded text.
+func charSpacingFor(p docx.RunProps, fontSize float64) float64 {
+	spacing := p.LetterSpacingPt
+	if p.CharacterScale > 0 && p.CharacterScale != 1.0 {
+		spacing += (p.CharacterScale - 1) * fontSize * 0.5
+	}
+	return spacing
 }
 
 // applyLumModOff approximates Word's HSL luminance adjustments. lumMod

@@ -24,13 +24,6 @@ func parseHexColor(hex string) (uint8, uint8, uint8) {
 	return uint8(r), uint8(g), uint8(b)
 }
 
-func boolFloat(b bool) float64 {
-	if b {
-		return 1
-	}
-	return 0
-}
-
 // FileExists is a tiny helper kept here so the CLI can validate paths
 // without pulling os into main.
 func FileExists(p string) bool {
