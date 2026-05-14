@@ -242,7 +242,13 @@ func (r *renderer) runsToAtoms(runs []docx.Run) []atom {
 				_ = r.applyFontFamily(run.Props, r.selectFont(run.Props))
 				w, _ := r.pdf.MeasureTextWidth(" ")
 				out = append(out, atom{kind: atomSpace, text: " ", props: run.Props, width: w})
-			case isCJK(rn):
+			case isCJK(rn) || isSymbolGlyph(rn):
+				// CJK and symbol-block runes share a code path: each
+				// becomes its own atom. CJK because we need
+				// per-character line breaks (no inter-word spaces);
+				// symbols because their natural font may differ from
+				// the surrounding Latin (e.g. ✓ routes to fallback
+				// while ASCII stays on the regular face).
 				flushBuf()
 				fam := r.chooseFamily(rn, run.Props)
 				_ = r.applyFontFamily(run.Props, fam)

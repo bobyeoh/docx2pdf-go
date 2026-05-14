@@ -130,11 +130,17 @@ func RenderWriter(doc *docx.Document, w io.Writer, opts Options) error {
 			opts.FontRegular = findSystemFont() // never empty: falls back to embedded
 		}
 	}
-	// Symmetric env-var fallback for the CJK fallback font. Optional —
-	// missing it just means CJK glyphs use the regular face (and likely
-	// render as boxes for runes the regular face doesn't cover).
+	// Symmetric env-var fallback for the CJK / symbol fallback font.
+	// Resolution: explicit Options.FontFallback → $DOCX2PDF_FONT_CJK →
+	// system-CJK auto-detection (Hiragino on macOS, WQY on Linux).
+	// No final embedded fallback because the Go font is Latin only —
+	// it wouldn't actually cover the glyphs callers need a fallback
+	// FOR (CJK + Dingbats + arrows + etc.).
 	if opts.FontFallback == "" {
 		opts.FontFallback = resolveFontFromEnv(envFontFallback)
+	}
+	if opts.FontFallback == "" {
+		opts.FontFallback = findSystemCJKFont()
 	}
 	if opts.DefaultFontSize == 0 {
 		opts.DefaultFontSize = 11

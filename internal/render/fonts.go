@@ -314,10 +314,42 @@ func isCJK(r rune) bool {
 }
 
 // chooseFamily returns the registered family that should render this rune,
-// taking CJK fallback into account.
+// taking CJK fallback into account. Symbol-block runes (Dingbats,
+// Misc Symbols, Geometric Shapes, arrows, math operators) also route
+// to the fallback font when registered — Latin TTFs frequently omit
+// these (notably Arial on macOS lacks U+2713 CHECK MARK), and any
+// real CJK fallback covers them.
 func (r *renderer) chooseFamily(rn rune, p docx.RunProps) string {
-	if isCJK(rn) && r.fonts[fallbackFamily] {
+	if r.fonts[fallbackFamily] && (isCJK(rn) || isSymbolGlyph(rn)) {
 		return fallbackFamily
 	}
 	return r.selectFont(p)
+}
+
+// isSymbolGlyph reports whether a rune sits in one of the Unicode
+// blocks that Latin-only TTF fonts commonly omit but most CJK fonts
+// cover: Arrows, Math Operators, Miscellaneous Technical, Box Drawing,
+// Geometric Shapes, Miscellaneous Symbols, and Dingbats. Routing these
+// to the fallback face avoids "missing checkmark" / "missing arrow"
+// rendering when the regular font doesn't cover them.
+func isSymbolGlyph(r rune) bool {
+	switch {
+	case r >= 0x2190 && r <= 0x21FF: // Arrows
+		return true
+	case r >= 0x2200 && r <= 0x22FF: // Mathematical Operators
+		return true
+	case r >= 0x2300 && r <= 0x23FF: // Miscellaneous Technical
+		return true
+	case r >= 0x2500 && r <= 0x257F: // Box Drawing
+		return true
+	case r >= 0x2580 && r <= 0x259F: // Block Elements
+		return true
+	case r >= 0x25A0 && r <= 0x25FF: // Geometric Shapes
+		return true
+	case r >= 0x2600 && r <= 0x26FF: // Miscellaneous Symbols
+		return true
+	case r >= 0x2700 && r <= 0x27BF: // Dingbats — includes ✓ ✗ ✘ ✦
+		return true
+	}
+	return false
 }

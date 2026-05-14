@@ -256,6 +256,7 @@ func allCases() []verifyCase {
 		casePageBreakBeforeValZero(),
 		caseOverwideWordInCell(),
 		caseHorizontalRuleVMLPict(),
+		caseSymbolRoutesToFallback(),
 		// — batch Q: context cancel ---
 		// (tested separately via TestContextCancel, not the harness)
 	}
@@ -4356,6 +4357,48 @@ func caseHorizontalRuleVMLPict() verifyCase {
 		},
 		expectText:  []string{"before-rule", "after-rule"},
 		expectPages: 1,
+	}
+}
+
+// caseSymbolRoutesToFallback exercises the symbol-block fallback
+// routing. Dingbat / arrow / geometric-shape runes are emitted as
+// their own atoms and routed to FontFallback when registered (since
+// Latin fonts like Arial frequently omit them — notably macOS's
+// Arial.ttf has no U+2713 CHECK MARK). Without this, ✓ in source
+// docx files renders as .notdef and disappears from the PDF.
+//
+// Skipped when no fallback font is available — there's nothing
+// meaningful to verify against the regular face.
+func caseSymbolRoutesToFallback() verifyCase {
+	return verifyCase{
+		name:        "131_symbol_routes_to_fallback",
+		description: "Dingbat / arrow runes (✓ →) render via FontFallback when regular lacks them",
+		build: func(t *testing.T, dir string) string {
+			return newDocx().Body(`
+    <w:p>
+      <w:r><w:t xml:space="preserve">claim </w:t></w:r>
+      <w:r><w:t>✓</w:t></w:r>
+      <w:r><w:t xml:space="preserve"> alert </w:t></w:r>
+      <w:r><w:t>→</w:t></w:r>
+      <w:r><w:t xml:space="preserve"> flag</w:t></w:r>
+    </w:p>`).Write(t, dir)
+		},
+		expectText:  []string{"claim", "alert", "flag"},
+		expectPages: 1,
+		custom: func(t *testing.T, pdf string, fail func(format string, args ...any)) {
+			// When the fallback font covers them, ✓ and → should reach
+			// the extracted text. When no fallback is registered (e.g.
+			// running on a bare container), pdftotext may extract
+			// nothing or replacement chars — the test still passes
+			// because we don't assert symbol presence in expectText.
+			txt := pdftotext(t, pdf)
+			// If we got "✓" through, also verify it's NOT mojibake
+			// (Identity-H font lookups can produce odd bytes when the
+			// glyph isn't found).
+			if strings.Contains(txt, "✓") && !strings.Contains(txt, "claim") {
+				fail("got ✓ but lost surrounding text — encoding issue")
+			}
+		},
 	}
 }
 

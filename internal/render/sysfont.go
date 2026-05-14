@@ -80,6 +80,57 @@ func findSystemFont() string {
 	return embeddedFontSentinel
 }
 
+// systemCJKFontCandidates returns paths to TTF/TTC fonts that cover
+// CJK glyph blocks AND the common symbol/dingbat ranges (✓ ✗ → etc.)
+// that Latin fonts often omit. Used as the auto-fallback when
+// Options.FontFallback is empty.
+//
+// Priority order favors TrueType-outline fonts (which gopdf can render
+// directly). CFF/OpenType-outline fonts like PingFang, Noto CJK, and
+// Hiragino are listed last and only work if the runtime's TTC face-0
+// extractor finds a TrueType face in the collection.
+func systemCJKFontCandidates() []string {
+	return []string{
+		// macOS — Arial Unicode is TrueType and covers basically every
+		// BMP glyph including CJK + Dingbats. 23 MB but already on
+		// every macOS install.
+		"/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+		"/Library/Fonts/Arial Unicode.ttf",
+		"/System/Library/Fonts/Supplemental/AppleGothic.ttf",
+		"/System/Library/Fonts/Supplemental/AppleMyungjo.ttf",
+
+		// Linux — WQY Zen Hei is TrueType, the rest are CFF and likely
+		// to fail in gopdf even after TTC extraction.
+		"/usr/share/fonts/wqy-zenhei/wqy-zenhei.ttc",
+		"/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+
+		// Windows — msyh is TrueType
+		`C:\Windows\Fonts\msyh.ttc`,
+		`C:\Windows\Fonts\msgothic.ttc`,
+		`C:\Windows\Fonts\malgun.ttf`,
+
+		// CFF-outline fallbacks (low priority; only work if the TTC
+		// has a TrueType face somewhere we can extract).
+		"/System/Library/Fonts/PingFang.ttc",
+		"/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+		"/usr/share/fonts/noto/NotoSansCJK-Regular.ttc",
+	}
+}
+
+// findSystemCJKFont returns the first existing path from
+// systemCJKFontCandidates, or "" if none of them exist. Unlike
+// findSystemFont this does NOT fall back to the embedded Go font —
+// the Go font is Latin-only and would not actually serve as a CJK
+// fallback. Callers should treat "" as "no fallback available".
+func findSystemCJKFont() string {
+	for _, p := range systemCJKFontCandidates() {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
+}
+
 // resolveFontFromEnv reads the named environment variable; returns the
 // path only when the file actually exists. A stale env var pointing at
 // a missing file is treated as unset rather than letting AddTTFFont
