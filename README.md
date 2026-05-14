@@ -19,10 +19,15 @@ err := docx2pdf.Convert("report.docx", "report.pdf", docx2pdf.Options{})
 // Or be explicit (recommended for reproducible cross-machine output):
 err = docx2pdf.Convert("report.docx", "report.pdf", docx2pdf.Options{
     FontRegular:  "/usr/share/fonts/noto/NotoSans-Regular.ttf",
-    FontFallback: "/usr/share/fonts/noto/NotoSansCJK-Regular.ttc", // CJK
+    FontFallback: "/usr/share/fonts/wqy/wqy-zenhei.ttc", // CJK (TrueType)
     PageNumbers:  true,
 })
 ```
+
+> ℹ️ **CJK fallback note**: pick a **TrueType** CJK font (e.g. WenQuanYi
+> Zen Hei, Source Han Sans's TTF distribution, SimSun). gopdf can't
+> render CFF/PostScript outlines, so Noto Sans CJK's `.ttc` is rejected
+> with a clear error. See the [FAQ](#faq).
 
 ---
 
@@ -37,9 +42,9 @@ Pure-Go `.docx` → PDF is harder than it looks. Real-world options today:
 | **Pandoc + LaTeX** | Heavy toolchain, fragile layout for complex Office docs |
 | Hand-roll it | Months of XML wrangling, font metrics, table layout… |
 
-**docx2pdf-go** sits in the gap: a focused, MIT-licensed, pure-Go library that
-covers the 90% of WordprocessingML real documents actually use, without
-external runtimes.
+**docx2pdf-go** sits in the gap: a focused, MIT-licensed, pure-Go library
+that covers the 90 % of WordprocessingML that real documents actually
+use, without external runtimes.
 
 ### What you get
 
@@ -47,8 +52,9 @@ external runtimes.
   with no fonts installed — a 150 KB Latin face (Go fonts, MIT) is
   embedded as a last-resort fallback so the binary always has
   something to draw with.
-- **~70 MB official Docker image** with Noto Sans + WenQuanYi Zen Hei
-  baked in for Latin + CJK fallback, no Word installation needed.
+- **Trivial to containerize** — multi-stage build into `distroless`
+  yields a ~5 MB image; add a TTF/TTC for CJK if needed. Recipe in
+  the Docker section below.
 - **Streaming `io.Reader` → `io.Writer` API** for HTTP handlers and
   in-memory pipelines.
 - **CLI for batch processing** — point it at a directory tree, get a
@@ -117,44 +123,111 @@ return docx2pdf.Render(doc, "out.pdf", docx2pdf.Options{})
 
 ### As a CLI
 
-```bash
-# Simplest — system font auto-detected.
-docx2pdf -in input.docx -out output.pdf
+#### Install
 
-# Batch — walks a directory tree, mirrors structure to -out.
-docx2pdf -in indir/ -out outdir/ -recursive -keep-going -page-numbers
+```bash
+# From source (Go 1.26+). Drops a single static binary into $GOBIN /
+# $GOPATH/bin — make sure that's on your $PATH.
+go install github.com/bobyeoh/docx2pdf-go/cmd/docx2pdf@latest
+
+# Or build locally from a checkout — useful for cross-compiling.
+git clone https://github.com/bobyeoh/docx2pdf-go.git
+cd docx2pdf-go
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o docx2pdf ./cmd/docx2pdf
 ```
 
-Run `docx2pdf -help` for the full flag list (font overrides, parallel
-workers, lenient mode, author override, etc.).
+The binary is ~3.5 MB, statically linked, and embeds a Latin fallback
+font so it works on any machine — no system fonts required.
+
+#### Convert a single file
+
+```bash
+# System font auto-detected (Arial / Helvetica / DejaVu / Liberation / Noto).
+docx2pdf -in report.docx -out report.pdf
+
+# Explicit font (recommended for cross-machine reproducibility).
+docx2pdf -in report.docx -out report.pdf \
+    -font /usr/share/fonts/noto/NotoSans-Regular.ttf \
+    -font-fallback /usr/share/fonts/wqy/wqy-zenhei.ttc
+
+# Add page numbers ("3 / 12" at the bottom of every page).
+docx2pdf -in report.docx -out report.pdf -page-numbers
+```
+
+#### Pipe via stdin / stdout
+
+`-in -` reads the docx from stdin; `-out -` writes the PDF to stdout.
+Useful for HTTP gateways, shell pipelines, and serverless functions
+that don't want temp files:
+
+```bash
+# stdin → file
+cat report.docx | docx2pdf -in - -out report.pdf
+
+# file → stdout (pipe straight to a viewer or another tool)
+docx2pdf -in report.docx -out - | pdftotext - -
+
+# stdin → stdout (full pipeline, no disk hit)
+curl -s https://example.com/report.docx | docx2pdf -in - -out - > report.pdf
+```
+
+#### Batch convert a directory
+
+```bash
+# Recurse the input tree, mirror its structure into the output tree.
+# -keep-going won't abort the whole run on one bad file (exit code
+# is still non-zero so CI sees the failure).
+docx2pdf -in ./input -out ./output -recursive -keep-going
+
+# 8 parallel workers — handy for hundreds of files. The renderer is
+# CPU-bound (XML parse + PDF layout), so workers ≈ NumCPU is usually
+# right.
+docx2pdf -in ./input -out ./output -recursive -workers 8
+```
+
+#### All flags
+
+| Flag | Meaning |
+|---|---|
+| `-in PATH \| -` | Input `.docx`, directory, or `-` for stdin (required) |
+| `-out PATH \| -` | Output `.pdf`, directory, or `-` for stdout (required) |
+| `-font PATH` | Regular TTF; empty → auto-detect a system font |
+| `-font-bold PATH` | Real bold face (otherwise faux-bolded by double-stroke) |
+| `-font-italic PATH` | Real italic face |
+| `-font-heading PATH` | Heading-role font (e.g. Cambria) for theme-major runs |
+| `-font-fallback PATH` | CJK / symbol fallback (TrueType only) |
+| `-size N` | Default font size in points (default 11) |
+| `-page-numbers` | Draw "X / N" at the bottom of every page |
+| `-author NAME` | Override `AUTHOR` field + PDF metadata `Author` |
+| `-recursive` | In batch mode, descend into subdirectories |
+| `-workers N` | Parallel batch workers (default 1) |
+| `-keep-going` | Don't abort the batch on per-file errors |
+| `-lenient` | Skip broken paragraphs/tables, log and continue |
+| `-v` | Verbose logging |
+
+Run `docx2pdf -help` to see them in your terminal with current defaults.
+
+#### Environment variables
+
+Two env vars are consulted when the matching flag is not given —
+convenient in containers where fonts are baked into the image:
+
+| Variable | Equivalent flag |
+|---|---|
+| `DOCX2PDF_FONT` | `-font` |
+| `DOCX2PDF_FONT_CJK` | `-font-fallback` |
 
 ### Docker
 
-```bash
-# Simplest — fonts auto-detected from $DOCX2PDF_FONT and
-# $DOCX2PDF_FONT_CJK baked into the image.
-docker run --rm -v "$PWD":/work bobyeoh/docx2pdf-go \
-    -in /work/in.docx -out /work/out.pdf -page-numbers
-```
+No pre-built image is published — pick the recipe that matches your
+needs.
 
-The official image (~70 MB) ships **Noto Sans** for Latin text and
-**WenQuanYi Zen Hei** for CJK fallback. Noto Sans CJK is *not*
-bundled because it uses CFF/PostScript outlines (`.ttc` with `OTTO`
-faces) which gopdf's TrueType-only parser can't render; WQY Zen Hei
-is a TrueType TTC that the runtime extracts face 0 from automatically.
+#### Minimal (~5 MB, Latin only)
 
-The env vars `DOCX2PDF_FONT` and `DOCX2PDF_FONT_CJK` are honored by
-the binary when no `-font` / `-font-fallback` flag is given, so the
-container works out of the box.
-
-#### Running in *any* container — including `scratch` / `distroless`
-
-The binary embeds a small Latin font as a last-resort fallback, so
-even minimal images with no fonts at all produce a valid PDF for
-Latin-only documents:
+The binary embeds a small Latin fallback font, so a `distroless`
+image with no system fonts produces a valid PDF for Latin documents:
 
 ```dockerfile
-# Multi-stage build into distroless: total size ~5 MB.
 FROM golang:alpine AS build
 WORKDIR /src
 COPY . .
@@ -167,17 +240,37 @@ ENTRYPOINT ["/docx2pdf"]
 ```
 
 ```bash
-docker run --rm -v "$PWD":/work my-image \
+docker build -t docx2pdf .
+docker run --rm -v "$PWD":/work docx2pdf \
     -in /work/in.docx -out /work/out.pdf  # no -font needed
 ```
 
-CJK content in a fontless image still needs a CJK TTF — mount it and
-point `$DOCX2PDF_FONT_CJK` at it:
+#### Batteries-included (~70 MB, Latin + CJK)
+
+The repo ships a [`Dockerfile`](Dockerfile) that bakes Noto Sans
+(Latin) plus WenQuanYi Zen Hei (CJK fallback) and sets
+`DOCX2PDF_FONT` / `DOCX2PDF_FONT_CJK` so it works on any docx
+without flags:
+
+```bash
+docker build -t docx2pdf .
+docker run --rm -v "$PWD":/work docx2pdf \
+    -in /work/report.docx -out /work/report.pdf -page-numbers
+```
+
+> ℹ️ Avoid Noto Sans CJK — its `.ttc` uses CFF/PostScript outlines
+> which gopdf can't render. Use a TrueType CJK font (WQY Zen Hei,
+> Source Han Sans TTF distribution, SimSun). See the FAQ.
+
+#### Mounting a font at run time
+
+If you don't want to bake fonts into the image, mount them at run
+time instead:
 
 ```bash
 docker run --rm -v "$PWD":/work \
-    -e DOCX2PDF_FONT_CJK=/work/SimSun.ttf \
-    my-image -in /work/in.docx -out /work/out.pdf
+    -e DOCX2PDF_FONT_CJK=/work/wqy-zenhei.ttc \
+    docx2pdf -in /work/in.docx -out /work/out.pdf
 ```
 
 ---
@@ -321,6 +414,8 @@ internal/render/            ← PDF renderer (one file per concern):
                                 table.go      — drawTable, drawRow, borders
                                 image.go      — fit / crop / draw
                                 fonts.go      — font registration + CJK + RTL
+                                sysfont.go    — system-font auto-detection
+                                ttc.go        — TTC face-0 extraction
                                 fields.go     — w:fldChar / w:instrText
                                 util.go       — twips / hex helpers
 internal/convert/           ← thin orchestrator (parse → render)
@@ -338,10 +433,10 @@ consumers can still `type-assert` against `docx2pdf.Paragraph`,
 
 | Layer | Tests | Notes |
 |---|---|---|
-| Unit (parser + render) | 30+ | XML decoding, style resolution, list numbering, field codes, settings, VML, theme |
+| Unit (parser + render) | 50+ | XML decoding, style resolution, list numbering, field codes, settings, VML, theme, borders |
 | Unit (CLI) | 2 | Directory walking, extension handling |
 | Public API smoke | 3 | Library is importable from outside the module |
-| End-to-end | 127 | `docx → PDF → pdftotext + pdfinfo + PNG` per case |
+| End-to-end | 137 | `docx → PDF → pdftotext + pdfinfo + PNG` per case |
 | Comprehensive integration | 1 | Single 30+ feature docx validated with pdftotext, bbox, PDF byte structure, and PNG pixel sampling |
 | Real-world corpus | 6 | Real Word docs from the docx4j project |
 | Crash resistance | 6 | Empty zip, malformed XML, circular `basedOn`, corrupt images, 500-deep nesting |
@@ -433,9 +528,9 @@ usually below "reader notices anything off". For complex layouts
 **Why doesn't Noto Sans CJK work as the fallback font?**
 gopdf only renders TrueType outlines. Noto Sans CJK uses
 CFF/PostScript outlines (the `.ttc` contains `OTTO`-tagged faces);
-gopdf rejects them. Use a TrueType CJK font like WenQuanYi Zen Hei
-(bundled in our Docker image) or Source Han Sans's TTF distribution.
-A clear error mentions this if you try.
+gopdf rejects them with a clear error. Use a TrueType CJK font like
+WenQuanYi Zen Hei (the repo's batteries-included `Dockerfile` uses
+it) or Source Han Sans's TTF distribution.
 
 **Can the AST be modified before rendering?**
 Yes — `Open` returns a `*Document` whose `Body` / `Sections` / `Styles`
