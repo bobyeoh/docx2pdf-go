@@ -185,8 +185,16 @@ func (r *renderer) resolveListMarker(li docx.ListInfo) (marker string, img image
 
 	indentPt = twipsToPt(lv.LeftTwips)
 	hangPt = twipsToPt(lv.HangingTwips)
+	// Defaults when the level definition omits indent metadata (some
+	// minimal numbering.xml files do): emulate Word's default of
+	// 720 twips body indent with a 360 twips hanging marker. Without
+	// this, marker and text would overlap at the paragraph's left
+	// margin since both end up at x = marL.
+	if indentPt == 0 {
+		indentPt = 36 // 720 twips = 0.5 inch
+	}
 	if hangPt < 2 {
-		hangPt = 6
+		hangPt = 18 // 360 twips = 0.25 inch — enough gap between marker and text
 	}
 
 	if lv.PicBulletID > 0 {

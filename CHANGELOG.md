@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added (later round)
+- **Comprehensive end-to-end test** (`TestComprehensiveScenario`)
+  builds a single docx exercising 30+ features (headings, alignment,
+  lists, tables with shading, images, footnotes, hyperlinks, SDT,
+  math, page break, header/footer, …) and validates the rendered
+  output with four complementary techniques: pdftotext, pdftotext
+  -bbox, PDF byte-structure scans, and PNG pixel sampling for
+  colored regions. Artifacts persisted under
+  `internal/verify/out/comprehensive/` for human inspection.
+
+### Fixed
+- **List markers no longer overlap the body text** when a numbering
+  level's `<w:lvl>` omits indent metadata. Both the body indent and
+  the hanging-marker distance now fall back to Word's defaults
+  (0.5 inch / 0.25 inch) instead of zero, so minimally-defined
+  numbering.xml files render cleanly.
+
+### Added (later round)
 - **Chart text (titles, axis labels, series names) is surfaced.** A
   `<w:drawing>` containing `<c:chart r:id="…">` references a separate
   chart part (`word/charts/chartN.xml`). The parser now loads that
