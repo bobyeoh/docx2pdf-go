@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added (later round)
+- **`mc:AlternateContent` (Markup Compatibility) is honored.** Word
+  wraps newer feature output in `<mc:Choice>` with a `<mc:Fallback>`
+  for older readers. Previously the whole wrapper fell into
+  `dec.Skip()`, losing both branches. We now prefer the first Choice
+  whose contents yield something renderable; if none does, we use
+  Fallback. Wired at all dispatch points: inside `w:r`, as a direct
+  paragraph child, and as a block-level sibling in body/cell/HF/note.
+  Regression cases #123 (Choice picked) and #124 (Fallback picked).
 - **Text-box content (`wps:txbx` / `w:txbxContent`) is preserved.** A
   Word drawing wrapping a shape with text — pull-quotes, callouts,
   sidebars — used to be skipped entirely. Now the visible text is pulled

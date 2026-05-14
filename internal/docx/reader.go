@@ -536,6 +536,12 @@ func parseNoteBody(dec *xml.Decoder, start xml.StartElement, pctx *parseDocConte
 					return nil, err
 				}
 				blocks = append(blocks, inner...)
+			case "AlternateContent":
+				inner, err := decodeBlockAltContent(dec, t, pctx)
+				if err != nil {
+					return nil, err
+				}
+				blocks = append(blocks, inner...)
 			default:
 				_ = dec.Skip()
 			}
@@ -586,6 +592,12 @@ func parseHeaderFooter(f *zip.File, doc *Document) ([]Block, error) {
 			blocks = append(blocks, t)
 		case "sdt":
 			inner, err := decodeBlockSdt(dec, se, pctx)
+			if err != nil {
+				return nil, err
+			}
+			blocks = append(blocks, inner...)
+		case "AlternateContent":
+			inner, err := decodeBlockAltContent(dec, se, pctx)
 			if err != nil {
 				return nil, err
 			}
@@ -1513,6 +1525,20 @@ func parseDocument(f *zip.File, pctx *parseDocContext) error {
 				pctx.curSection.Blocks = append(pctx.curSection.Blocks, p)
 				doc.Body = append(doc.Body, p)
 			}
+		case "AlternateContent":
+			// Markup Compatibility wrapper at body level. Same Choice >
+			// Fallback preference as in inline contexts.
+			inner, err := decodeBlockAltContent(dec, se, pctx)
+			if err != nil {
+				return err
+			}
+			for _, b := range inner {
+				pctx.curSection.Blocks = append(pctx.curSection.Blocks, b)
+				doc.Body = append(doc.Body, b)
+				if pp, ok := b.(Paragraph); ok && pp.endsSection {
+					pctx.finalizeSection()
+				}
+			}
 		case "sectPr":
 			// Top-level sectPr: properties of the final section.
 			if err := decodeSectPr(dec, se, pctx); err != nil {
@@ -1658,6 +1684,15 @@ func decodeParagraph(dec *xml.Decoder, start xml.StartElement, pctx *parseDocCon
 				if err := decodeFldSimple(dec, t, &p, paraRPr, pctx); err != nil {
 					return p, err
 				}
+			case "AlternateContent":
+				// MC wrapper as a direct paragraph child (less common
+				// than inside w:r). Treat its Choice/Fallback as
+				// providing run atoms that join this paragraph.
+				runs, err := decodeRunAltContent(dec, t, paraRPr, pctx.doc)
+				if err != nil {
+					return p, err
+				}
+				p.Runs = append(p.Runs, runs...)
 			case "commentRangeStart", "commentRangeEnd", "commentReference":
 				// Comments are out-of-flow; we skip the inline markers.
 				_ = dec.Skip()
@@ -2200,6 +2235,15 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 						Props:         rp,
 					})
 				}
+			case "AlternateContent":
+				// Markup Compatibility wrapper: prefer mc:Choice over
+				// mc:Fallback. Common pattern is "new shape via wps in
+				// Choice, legacy VML in Fallback" — we want the Choice.
+				runs, err := decodeRunAltContent(dec, t, rp, doc)
+				if err != nil {
+					return nil, err
+				}
+				atoms = append(atoms, runs...)
 			case "object":
 				// w:object wraps OLE/embedded content (Excel range, Visio,
 				// chart, equation, ...). We can't render the foreign payload,
@@ -2655,6 +2699,12 @@ func decodeCell(dec *xml.Decoder, start xml.StartElement, pctx *parseDocContext)
 				cell.Blocks = append(cell.Blocks, nt)
 			case "sdt":
 				inner, err := decodeBlockSdt(dec, t, pctx)
+				if err != nil {
+					return cell, err
+				}
+				cell.Blocks = append(cell.Blocks, inner...)
+			case "AlternateContent":
+				inner, err := decodeBlockAltContent(dec, t, pctx)
 				if err != nil {
 					return cell, err
 				}

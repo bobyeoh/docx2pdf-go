@@ -248,6 +248,8 @@ func allCases() []verifyCase {
 		caseFldSimplePage(),
 		caseRTLParagraph(),
 		caseTextBoxContent(),
+		caseAlternateContentChoice(),
+		caseAlternateContentFallback(),
 		// — batch Q: context cancel ---
 		// (tested separately via TestContextCancel, not the harness)
 	}
@@ -4014,6 +4016,97 @@ func caseTextBoxContent() verifyCase {
 		},
 		expectText:  []string{"before-box", "FIRST-BOX-LINE", "SECOND-BOX-LINE", "after-box"},
 		expectPages: 1,
+	}
+}
+
+// caseAlternateContentChoice: mc:AlternateContent wrapping a text box in
+// mc:Choice (modern shape) and a VML pict in mc:Fallback. We prefer the
+// Choice — its text-box content should reach the PDF.
+func caseAlternateContentChoice() verifyCase {
+	return verifyCase{
+		name:        "123_altcontent_choice",
+		description: "mc:AlternateContent prefers Choice; its text-box content is emitted",
+		build: func(t *testing.T, dir string) string {
+			return newDocx().Body(`
+    <w:p>
+      <w:r><w:t xml:space="preserve">before </w:t></w:r>
+      <w:r>
+        <mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">
+          <mc:Choice Requires="wps">
+            <w:drawing>
+              <wp:anchor xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">
+                <a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+                  <a:graphicData>
+                    <wps:wsp xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">
+                      <wps:txbx>
+                        <w:txbxContent>
+                          <w:p><w:r><w:t>CHOICE-BOX-TEXT</w:t></w:r></w:p>
+                        </w:txbxContent>
+                      </wps:txbx>
+                    </wps:wsp>
+                  </a:graphicData>
+                </a:graphic>
+              </wp:anchor>
+            </w:drawing>
+          </mc:Choice>
+          <mc:Fallback>
+            <w:pict><v:shape xmlns:v="urn:schemas-microsoft-com:vml" style="width:50pt;height:50pt"/></w:pict>
+          </mc:Fallback>
+        </mc:AlternateContent>
+      </w:r>
+      <w:r><w:t xml:space="preserve"> after</w:t></w:r>
+    </w:p>`).Write(t, dir)
+		},
+		expectText:  []string{"before", "CHOICE-BOX-TEXT", "after"},
+		expectPages: 1,
+	}
+}
+
+// caseAlternateContentFallback: mc:Choice yields nothing renderable; we
+// drop to mc:Fallback and the VML image inside renders. We assert the
+// PDF contains an /Image XObject.
+func caseAlternateContentFallback() verifyCase {
+	img := makeSolidPNG(30, 30, color.RGBA{R: 200, G: 100, B: 30, A: 255})
+	return verifyCase{
+		name:        "124_altcontent_fallback",
+		description: "When mc:Choice produces no content, mc:Fallback is used",
+		build: func(t *testing.T, dir string) string {
+			return newDocx().
+				Body(`
+    <w:p>
+      <w:r>
+        <mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">
+          <mc:Choice Requires="unknown-namespace">
+            <unknownElement/>
+          </mc:Choice>
+          <mc:Fallback>
+            <w:pict>
+              <v:shape xmlns:v="urn:schemas-microsoft-com:vml" style="width:30pt;height:30pt">
+                <v:imagedata r:id="rImg"/>
+              </v:shape>
+            </w:pict>
+          </mc:Fallback>
+        </mc:AlternateContent>
+      </w:r>
+    </w:p>`).
+				Media("image1.png", img).
+				Rels(`<?xml version="1.0"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rImg" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image1.png"/>
+</Relationships>`).
+				Write(t, dir)
+		},
+		expectPages: 1,
+		custom: func(t *testing.T, pdf string, fail func(format string, args ...any)) {
+			data, err := os.ReadFile(pdf)
+			if err != nil {
+				fail("read pdf: %v", err)
+				return
+			}
+			if !bytes.Contains(data, []byte("/Image")) {
+				fail("no /Image XObject — Fallback VML image did not render")
+			}
+		},
 	}
 }
 
