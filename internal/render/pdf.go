@@ -50,8 +50,11 @@ type Options struct {
 	// directly. Public users get cancellation via convert.ConvertContext.
 	ctx context.Context
 
-	// FontRegular is the path to the TTF used for normal text. Required
-	// because gopdf does not ship a default font.
+	// FontRegular is the path to the TTF used for normal text. When
+	// empty, a list of common system-font locations (Arial / Helvetica
+	// on macOS, DejaVu / Liberation / Noto on Linux) is searched and
+	// the first one that exists wins. The error from RenderWriter
+	// lists the paths tried when nothing is found.
 	FontRegular string
 	FontBold    string // optional; falls back to FontRegular
 	FontItalic  string // optional
@@ -110,7 +113,16 @@ func Render(doc *docx.Document, outPath string, opts Options) error {
 // RenderWriter is the streaming variant — writes the produced PDF to w.
 func RenderWriter(doc *docx.Document, w io.Writer, opts Options) error {
 	if opts.FontRegular == "" {
-		return fmt.Errorf("render: FontRegular is required (path to a TTF file)")
+		// No font specified — try a list of common system locations.
+		// Lets the library "just work" on a default install where the
+		// caller hasn't bothered to vend a TTF.
+		opts.FontRegular = findSystemFont()
+		if opts.FontRegular == "" {
+			return fmt.Errorf(
+				"render: FontRegular not specified and no system font found; "+
+					"set Options.FontRegular to a TTF/TTC path. Tried: %s",
+				formatFontCandidates())
+		}
 	}
 	if opts.DefaultFontSize == 0 {
 		opts.DefaultFontSize = 11

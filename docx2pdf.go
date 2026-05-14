@@ -10,7 +10,12 @@
 //   - Open + Render                     — parse once, render N times, or
 //     inspect/modify the AST in between
 //
-// Minimal example:
+// Minimal example — relies on the system font auto-detection that
+// kicks in when Options.FontRegular is empty:
+//
+//	err := docx2pdf.Convert("in.docx", "out.pdf", docx2pdf.Options{})
+//
+// Explicit fonts (recommended for reproducible cross-machine output):
 //
 //	err := docx2pdf.Convert("in.docx", "out.pdf", docx2pdf.Options{
 //	    FontRegular:  "/path/to/regular.ttf",
@@ -41,7 +46,10 @@ import (
 )
 
 // Options controls font selection, page numbering, and verbose tracing.
-// The zero value is invalid — FontRegular must be set to a TTF/TTC path.
+// The zero value works on hosts that have a common Latin TTF in one
+// of the standard system-font locations (Arial / Helvetica on macOS,
+// DejaVu / Liberation / Noto on Linux). Set FontRegular explicitly
+// for reproducible cross-machine behavior.
 type Options = convert.Options
 
 // Document is the parsed in-memory representation of a .docx file. Callers

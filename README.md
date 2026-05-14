@@ -7,7 +7,12 @@
 ```go
 import docx2pdf "github.com/bobyeoh/docx2pdf-go"
 
-err := docx2pdf.Convert("report.docx", "report.pdf", docx2pdf.Options{
+// Simplest call — picks up a common system font automatically
+// (Arial / Helvetica on macOS, DejaVu / Liberation / Noto on Linux).
+err := docx2pdf.Convert("report.docx", "report.pdf", docx2pdf.Options{})
+
+// Or be explicit (recommended for reproducible cross-machine output):
+err = docx2pdf.Convert("report.docx", "report.pdf", docx2pdf.Options{
     FontRegular:  "/usr/share/fonts/noto/NotoSans-Regular.ttf",
     FontFallback: "/usr/share/fonts/noto/NotoSansCJK-Regular.ttc", // CJK
     PageNumbers:  true,
@@ -63,10 +68,9 @@ import (
     docx2pdf "github.com/bobyeoh/docx2pdf-go"
 )
 
-// 1) File paths — the simplest case.
-err := docx2pdf.Convert("in.docx", "out.pdf", docx2pdf.Options{
-    FontRegular: "/path/to/Regular.ttf",
-})
+// 1) File paths — the simplest case. Empty Options auto-detects a
+//    system font; pass FontRegular for reproducible output.
+err := docx2pdf.Convert("in.docx", "out.pdf", docx2pdf.Options{})
 
 // 2) Streaming — perfect for HTTP handlers.
 func handle(w http.ResponseWriter, r *http.Request) {
@@ -92,7 +96,11 @@ _ = docx2pdf.Render(doc, "out.pdf", docx2pdf.Options{FontRegular: fontPath})
 ### As a CLI
 
 ```bash
-# Single file
+# Simplest form — system font is auto-detected (Arial on macOS,
+# DejaVu / Liberation / Noto on Linux).
+docx2pdf -in input.docx -out output.pdf
+
+# Explicit font (recommended for reproducibility):
 docx2pdf -in input.docx -out output.pdf -font Regular.ttf
 
 # Batch — walks a directory tree, mirrors structure to -out

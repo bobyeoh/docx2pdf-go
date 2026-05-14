@@ -31,7 +31,7 @@ import (
 func main() {
 	in := flag.String("in", "", "input .docx path OR directory OR '-' for stdin (required)")
 	out := flag.String("out", "", "output .pdf path OR directory OR '-' for stdout (required)")
-	font := flag.String("font", "", "path to regular TTF font (required)")
+	font := flag.String("font", "", "path to regular TTF font; when empty, a common system font is auto-detected")
 	fontBold := flag.String("font-bold", "", "path to bold TTF font (optional)")
 	fontItalic := flag.String("font-italic", "", "path to italic TTF font (optional)")
 	fontHeading := flag.String("font-heading", "", "path to TTF used for theme-major (heading) runs; e.g. Cambria (optional)")
@@ -46,10 +46,12 @@ func main() {
 	verbose := flag.Bool("v", false, "verbose logging")
 	flag.Parse()
 
-	if *in == "" || *out == "" || *font == "" {
+	if *in == "" || *out == "" {
 		flag.Usage()
 		os.Exit(2)
 	}
+	// -font may be omitted: the renderer's auto-detection will pick a
+	// system font and surface a clear error if none is available.
 
 	opts := convert.Options{
 		FontRegular:     *font,
