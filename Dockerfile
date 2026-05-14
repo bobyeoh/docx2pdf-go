@@ -15,7 +15,7 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/docx2pdf ./cmd/doc
 #     extracts face 0 transparently — see internal/render/ttc.go.
 # Everything else is pure-Go, CGO_ENABLED=0, so fonts are the only data
 # files we need.
-FROM alpine:3.20
+FROM alpine:3.23
 RUN apk add --no-cache font-noto font-wqy-zenhei ca-certificates
 COPY --from=build /out/docx2pdf /usr/local/bin/docx2pdf
 # These env vars are consumed by the binary when Options.FontRegular /
