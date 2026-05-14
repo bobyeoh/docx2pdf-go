@@ -74,31 +74,47 @@ func (r *renderer) drawParagraph(p docx.Paragraph) error {
 	// Lists get an extra left indent that applies to every line; the marker
 	// is hung to the left of that indent via pendingMarker so flush() draws
 	// it at the first line's baseline.
+	//
+	// Word semantics: paragraph-level w:ind overrides numbering.xml indent
+	// for the same list item rather than stacking. Marker position MUST be
+	// computed against the EFFECTIVE body indent (paragraph override if
+	// any, else the lvl's value) — using the lvl's value when the
+	// paragraph overrode w:left makes the marker overlap the body text
+	// when the paragraph chose a smaller indent.
+	var listMarkerText string
+	var listMarkerImg image.Image
+	var lvlHangPt float64
 	listIndent := 0.0
 	if p.List != nil {
 		markerText, markerImg, indentPt, hangPt := r.resolveListMarker(*p.List)
 		listIndent = indentPt
-		if markerText != "" || markerImg != nil {
-			markerX := r.marL + indentPt - hangPt
-			if markerX < r.marL {
-				markerX = r.marL
-			}
-			r.pendingMarker = &pendingMarker{text: markerText, image: markerImg, x: markerX}
-		}
+		listMarkerText = markerText
+		listMarkerImg = markerImg
+		lvlHangPt = hangPt
 	}
 
-	if len(p.Runs) == 0 && r.pendingMarker == nil {
+	if len(p.Runs) == 0 && p.List == nil {
 		size := r.opts.DefaultFontSize
 		r.ensureRoom(size * 1.2)
 		r.cursorY += size * 1.2
 		return nil
 	}
 
-	// Word semantics: paragraph-level w:ind overrides numbering.xml indent
-	// for the same list item rather than stacking.
+	// Effective body indent: paragraph override beats lvl value.
 	leftIndent := listIndent
 	if p.IndentLeftPt > 0 {
 		leftIndent = p.IndentLeftPt
+	}
+
+	// Now place the marker. markerX sits leftIndent − hangPt to the left
+	// of the original margin, which is what Word does even when the
+	// paragraph overrides w:left without touching w:hanging.
+	if p.List != nil && (listMarkerText != "" || listMarkerImg != nil) {
+		markerX := r.marL + leftIndent - lvlHangPt
+		if markerX < r.marL {
+			markerX = r.marL
+		}
+		r.pendingMarker = &pendingMarker{text: listMarkerText, image: listMarkerImg, x: markerX}
 	}
 
 	savedColIdx := r.colIdx

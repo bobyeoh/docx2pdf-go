@@ -258,6 +258,7 @@ func allCases() []verifyCase {
 		caseHorizontalRuleVMLPict(),
 		caseSymbolRoutesToFallback(),
 		caseTableHeaderRepeatsAtTopOfPage(),
+		caseListMarkerWithParaIndentOverride(),
 		// — batch Q: context cancel ---
 		// (tested separately via TestContextCancel, not the harness)
 	}
@@ -4461,6 +4462,60 @@ func caseTableHeaderRepeatsAtTopOfPage() verifyCase {
 					fail("page %d: header (idx %d) appears AFTER first body row (idx %d)",
 						p, headerIdx, firstBodyIdx)
 				}
+			}
+		},
+	}
+}
+
+// caseListMarkerWithParaIndentOverride covers list paragraphs where the
+// numbering.xml level defines a w:hanging but the paragraph itself
+// overrides w:ind w:left without touching w:hanging. The marker must
+// be positioned against the EFFECTIVE body indent (paragraph's left)
+// minus the lvl's hanging — not the lvl's left. Otherwise the marker
+// lands on top of the body's first letter ("1Holding" instead of
+// "1.  Holding"). Surfaced by an HSBC KYC form.
+func caseListMarkerWithParaIndentOverride() verifyCase {
+	return verifyCase{
+		name:        "133_list_marker_indent_override",
+		description: "Paragraph-level w:ind w:left override does not collide list marker with body text",
+		build: func(t *testing.T, dir string) string {
+			numbering := `<?xml version="1.0"?>
+<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:abstractNum w:abstractNumId="0">
+    <w:lvl w:ilvl="0">
+      <w:start w:val="1"/>
+      <w:numFmt w:val="decimal"/>
+      <w:lvlText w:val="%1."/>
+      <w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr>
+    </w:lvl>
+  </w:abstractNum>
+  <w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>
+</w:numbering>`
+			body := `
+    <w:p>
+      <w:pPr>
+        <w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr>
+        <w:ind w:left="426"/>
+      </w:pPr>
+      <w:r><w:rPr><w:b/></w:rPr><w:t>HEADING-MARKER-FIRST</w:t></w:r>
+    </w:p>`
+			return newDocx().Body(body).Numbering(numbering).Write(t, dir)
+		},
+		expectText:  []string{"HEADING-MARKER-FIRST"},
+		expectPages: 1,
+		custom: func(t *testing.T, pdf string, fail func(format string, args ...any)) {
+			// Concrete check: bbox of the "1." marker must end BEFORE
+			// the body text's xMin starts (no horizontal overlap).
+			out, _ := combinedOutput("pdftotext", "-bbox", pdf, "-")
+			txt := string(out)
+			_, markerMax, mOK := bboxRange(txt, "1.")
+			bodyMin, _, bOK := bboxRange(txt, "HEADING-MARKER-FIRST")
+			if !mOK || !bOK {
+				fail("missing bbox: marker=%v body=%v", mOK, bOK)
+				return
+			}
+			if markerMax > bodyMin {
+				fail("marker xMax=%.1f overlaps body xMin=%.1f", markerMax, bodyMin)
 			}
 		},
 	}
