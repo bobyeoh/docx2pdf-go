@@ -530,6 +530,12 @@ func parseNoteBody(dec *xml.Decoder, start xml.StartElement, pctx *parseDocConte
 					return nil, err
 				}
 				blocks = append(blocks, tbl)
+			case "sdt":
+				inner, err := decodeBlockSdt(dec, t, pctx)
+				if err != nil {
+					return nil, err
+				}
+				blocks = append(blocks, inner...)
 			default:
 				_ = dec.Skip()
 			}
@@ -578,6 +584,12 @@ func parseHeaderFooter(f *zip.File, doc *Document) ([]Block, error) {
 				return nil, err
 			}
 			blocks = append(blocks, t)
+		case "sdt":
+			inner, err := decodeBlockSdt(dec, se, pctx)
+			if err != nil {
+				return nil, err
+			}
+			blocks = append(blocks, inner...)
 		}
 	}
 	return blocks, nil
@@ -1470,6 +1482,21 @@ func parseDocument(f *zip.File, pctx *parseDocContext) error {
 			}
 			pctx.curSection.Blocks = append(pctx.curSection.Blocks, t)
 			doc.Body = append(doc.Body, t)
+		case "sdt":
+			// Block-level content control — transparent wrapper. Each
+			// contained block joins the current section's flow as if it
+			// were written directly in the body.
+			inner, err := decodeBlockSdt(dec, se, pctx)
+			if err != nil {
+				return err
+			}
+			for _, b := range inner {
+				pctx.curSection.Blocks = append(pctx.curSection.Blocks, b)
+				doc.Body = append(doc.Body, b)
+				if pp, ok := b.(Paragraph); ok && pp.endsSection {
+					pctx.finalizeSection()
+				}
+			}
 		case "sectPr":
 			// Top-level sectPr: properties of the final section.
 			if err := decodeSectPr(dec, se, pctx); err != nil {
@@ -1589,6 +1616,13 @@ func decodeParagraph(dec *xml.Decoder, start xml.StartElement, pctx *parseDocCon
 				if err := decodeWrapper(dec, t, &p, paraRPr, pctx, false); err != nil {
 					return p, err
 				}
+			case "sdt":
+				// Inline content control: the actual runs live one level
+				// deeper, inside <w:sdtContent>. decodeInlineSdt unwraps
+				// that and hands the children to decodeWrapper.
+				if err := decodeInlineSdt(dec, t, &p, paraRPr, pctx, false); err != nil {
+					return p, err
+				}
 			case "commentRangeStart", "commentRangeEnd", "commentReference":
 				// Comments are out-of-flow; we skip the inline markers.
 				_ = dec.Skip()
@@ -1658,6 +1692,12 @@ func decodeWrapper(dec *xml.Decoder, start xml.StartElement, p *Paragraph, paraR
 				// flag (Word's "accept all" semantics).
 				childDrop := drop || t.Name.Local == "del" || t.Name.Local == "moveFrom"
 				if err := decodeWrapper(dec, t, p, paraRPr, pctx, childDrop); err != nil {
+					return err
+				}
+			case "sdt":
+				// Inline SDT nested inside another wrapper (e.g. a tracked
+				// insertion of a content control). Same transparency rule.
+				if err := decodeInlineSdt(dec, t, p, paraRPr, pctx, drop); err != nil {
 					return err
 				}
 			case "bookmarkStart":
@@ -2500,6 +2540,12 @@ func decodeCell(dec *xml.Decoder, start xml.StartElement, pctx *parseDocContext)
 					return cell, err
 				}
 				cell.Blocks = append(cell.Blocks, nt)
+			case "sdt":
+				inner, err := decodeBlockSdt(dec, t, pctx)
+				if err != nil {
+					return cell, err
+				}
+				cell.Blocks = append(cell.Blocks, inner...)
 			default:
 				_ = dec.Skip()
 			}

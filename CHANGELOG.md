@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added (later round)
+- **`w:sdt` (content controls / structured document tags) are transparent.**
+  Both inline (within a paragraph) and block-level SDTs (in body, table
+  cells, headers/footers, notes) are recognized: `w:sdtPr` / `w:sdtEndPr`
+  are ignored and `w:sdtContent`'s children join the surrounding flow.
+  Nested SDTs flatten. Common Word-template form fields and placeholder
+  text now survive the parser. Regression cases #115 (inline), #116
+  (block), #117 (block in cell).
 - **`w:framePr`-positioned paragraphs render at their anchored location**
   rather than falling through to inline flow. Resolves `hAnchor` / `vAnchor`
   (margin / page / text) plus `xAlign` / `yAlign` / `w:x` / `w:y` to absolute

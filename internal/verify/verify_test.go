@@ -240,6 +240,9 @@ func allCases() []verifyCase {
 		caseSettingsDefaultTabStop(),
 		caseVMLImage(),
 		caseFramePrPositioned(),
+		caseInlineSdt(),
+		caseBlockSdt(),
+		caseSdtInTableCell(),
 		// — batch Q: context cancel ---
 		// (tested separately via TestContextCancel, not the harness)
 	}
@@ -3707,6 +3710,78 @@ func bboxYMin(bboxXML, label string) (float64, bool) {
 		return 0, false
 	}
 	return v, true
+}
+
+// caseInlineSdt: inline content control. <w:sdt><w:sdtContent><w:r>…</w:r>
+// </w:sdtContent></w:sdt> sits in a paragraph; the contained run text must
+// survive the wrapper.
+func caseInlineSdt() verifyCase {
+	return verifyCase{
+		name:        "115_inline_sdt",
+		description: "Inline w:sdt is transparent — its run content reaches the PDF",
+		build: func(t *testing.T, dir string) string {
+			return newDocx().Body(`
+    <w:p>
+      <w:r><w:t xml:space="preserve">before </w:t></w:r>
+      <w:sdt>
+        <w:sdtPr><w:id w:val="1"/><w:placeholder><w:docPart w:val="DefaultPlaceholder"/></w:placeholder></w:sdtPr>
+        <w:sdtContent>
+          <w:r><w:t>INLINE-SDT-TEXT</w:t></w:r>
+        </w:sdtContent>
+      </w:sdt>
+      <w:r><w:t xml:space="preserve"> after</w:t></w:r>
+    </w:p>`).Write(t, dir)
+		},
+		expectText:  []string{"before", "INLINE-SDT-TEXT", "after"},
+		expectPages: 1,
+	}
+}
+
+// caseBlockSdt: block-level content control wrapping a whole paragraph.
+// Common in templates ("[Click here to enter text]" placeholders).
+func caseBlockSdt() verifyCase {
+	return verifyCase{
+		name:        "116_block_sdt",
+		description: "Block-level w:sdt is transparent — wrapped paragraphs reach the body flow",
+		build: func(t *testing.T, dir string) string {
+			return newDocx().Body(`
+    <w:p><w:r><w:t>first</w:t></w:r></w:p>
+    <w:sdt>
+      <w:sdtPr><w:id w:val="2"/></w:sdtPr>
+      <w:sdtContent>
+        <w:p><w:r><w:t>SDT-WRAPPED-PARAGRAPH</w:t></w:r></w:p>
+      </w:sdtContent>
+    </w:sdt>
+    <w:p><w:r><w:t>last</w:t></w:r></w:p>`).Write(t, dir)
+		},
+		expectText:  []string{"first", "SDT-WRAPPED-PARAGRAPH", "last"},
+		expectPages: 1,
+	}
+}
+
+// caseSdtInTableCell: block-level SDT inside a table cell. Verifies the
+// table-cell dispatch path also recognizes w:sdt.
+func caseSdtInTableCell() verifyCase {
+	return verifyCase{
+		name:        "117_sdt_in_table_cell",
+		description: "Block w:sdt inside a table cell still reaches the cell's blocks",
+		build: func(t *testing.T, dir string) string {
+			body := `<w:tbl>
+      <w:tblGrid><w:gridCol w:w="5000"/></w:tblGrid>
+      <w:tr><w:tc>
+        <w:sdt>
+          <w:sdtPr><w:id w:val="3"/></w:sdtPr>
+          <w:sdtContent>
+            <w:p><w:r><w:t>CELL-SDT-TEXT</w:t></w:r></w:p>
+          </w:sdtContent>
+        </w:sdt>
+      </w:tc></w:tr>
+    </w:tbl>`
+			return newDocx().Body(body).Write(t, dir)
+		},
+		expectText:  []string{"CELL-SDT-TEXT"},
+		expectPages: 1,
+	}
 }
 
 // writeReport renders an HTML index showing every case's pages with badges.
