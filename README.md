@@ -147,15 +147,21 @@ The image already includes Noto Sans + Noto CJK at the paths above
 | Math equations (`m:oMath` / `m:oMathPara`) — text extracted as italic, structure lost | ⚠️ |
 | Charts (`c:chart`) — title, axis labels, series names extracted as `[Chart: …]` text; data graphic not drawn | ⚠️ |
 | Multi-column layout (`w:cols`) | ✅ |
-| Floating frames (`w:framePr` placement) — anchored at the right page position | ⚠️ — positioned correctly; body text does NOT wrap around |
-| Text wrap around floating images | ❌ — anchor falls back to inline |
-| SmartArt / shapes / charts / equations | ❌ |
-| Form controls, comments, revision tracking | ❌ |
+| Tracked changes (`w:ins` / `w:del` / `w:moveFrom` / `w:moveTo`) — accept-all mode | ✅ |
+| Markup compatibility wrapper (`mc:AlternateContent`) — Choice over Fallback | ✅ |
+| Embedded text boxes (`wps:txbx`) — content extracted as inline italic; box geometry not preserved | ⚠️ |
+| Floating frames (`w:framePr` placement) — anchored at the right page position; body text does NOT wrap around | ⚠️ |
 | RTL scripts (Hebrew / Arabic) — word order reversed, right-aligned; no full UAX#9 bidi for mixed-direction lines | ⚠️ |
+| Text wrap around floating images (`wp:anchor` with wrap geometry) | ❌ — anchor falls back to inline |
+| SmartArt diagrams | ❌ |
+| Form controls' interactive behavior (`w:sdt` is transparent, but inputs aren't interactive in the PDF) | ❌ |
+| Arabic letter shaping (initial/medial/final connected forms) | ❌ |
+| Embedded fonts (`w:embedRegular`) | ❌ |
 
-If your document is in the "❌" or "⚠️" rows and you need it to render
-properly, **don't use this library** — fall back to a LibreOffice-backed
-service or document a known limitation.
+If your document hinges on the "❌" rows and you need pixel-perfect
+rendering, **fall back to a LibreOffice-backed service**. The "⚠️" rows
+preserve content but lose some structural fidelity; check whether that's
+acceptable for your use case.
 
 ---
 
@@ -196,10 +202,11 @@ internal/render/            ← PDF renderer (one file per concern):
                                 pdf.go        — entry points + state
                                 page.go       — H/F, page breaks, footnotes
                                 paragraph.go  — paragraph + list markers
+                                frame.go      — positioned (w:framePr) frames
                                 text.go       — atom model + line layout
                                 table.go      — drawTable, drawRow, borders
                                 image.go      — fit / crop / draw
-                                fonts.go      — font registration + CJK
+                                fonts.go      — font registration + CJK + RTL
                                 fields.go     — w:fldChar / w:instrText
                                 util.go       — twips / hex helpers
 internal/convert/           ← thin orchestrator (parse → render)
@@ -217,13 +224,14 @@ consumers can still `type-assert` against `docx2pdf.Paragraph`,
 
 | Layer | Tests | Notes |
 |---|---|---|
-| Unit (parser) | 14 | XML decoding, style resolution, list numbering, fields, sections |
+| Unit (parser + render) | 30+ | XML decoding, style resolution, list numbering, field codes, settings, VML, theme |
 | Unit (CLI) | 2 | Directory walking, extension handling |
 | Public API smoke | 3 | Library is importable from outside the module |
-| End-to-end | 57 | `docx → PDF → pdftotext + pdfinfo + PNG` per case |
+| End-to-end | 127 | `docx → PDF → pdftotext + pdfinfo + PNG` per case |
+| Comprehensive integration | 1 | Single 30+ feature docx validated with pdftotext, bbox, PDF byte structure, and PNG pixel sampling |
 | Real-world corpus | 6 | Real Word docs from the docx4j project |
 | Crash resistance | 6 | Empty zip, malformed XML, circular `basedOn`, corrupt images, 500-deep nesting |
-| Golden image diff | 57 | Opt-in (`GOLDEN=1`); detects visual regressions via mean L1 pixel distance |
+| Golden image diff | all cases | Opt-in (`GOLDEN=1`); detects visual regressions via mean L1 pixel distance |
 | Fuzz | 2 | `FuzzDocxOpen` + `FuzzInMemoryDocx`, run via `-fuzz` flag |
 | Benchmarks | 4 | Parser + full pipeline at small/large scale |
 
@@ -233,7 +241,7 @@ substrings and page geometry (via `pdfinfo`), and saves PNG snapshots for
 visual review (rendered with `pdftoppm`).
 
 ```bash
-# All deterministic tests (~8 s)
+# All deterministic tests (~17 s with the comprehensive case)
 go test ./...
 
 # All tests including golden image diff
@@ -243,14 +251,16 @@ GOLDEN=1 go test ./...
 go test ./... -race           # race-clean
 go test ./internal/verify/... -bench=. -benchtime=2s
 
-# Coverage (~86 %)
-go test -coverpkg=./... -coverprofile=cover.out ./internal/verify/...
+# Coverage (~78 % total, ~76 % in the verify package — exercises body
+# render via the full pipeline)
+go test -coverpkg=./... -coverprofile=cover.out ./...
 go tool cover -html=cover.out
 ```
 
-The verify suite has already caught real bugs that other tests missed —
-`w:br w:type="page"` not actually breaking pages, JPEG images failing the
-PNG re-encode path. Both fixed before this README was written.
+The verify suite has caught real bugs other tests missed — `w:br` page
+breaks not advancing pages, JPEG images failing the PNG re-encode path,
+footnotes being enqueued twice inside table cells, list markers
+overlapping their text when numbering.xml omitted indent.
 
 ---
 
@@ -276,10 +286,10 @@ docx2pdf-go aims to be **good enough for content-driven documents**: reports,
 contracts, generated paperwork, internal tooling. It is **not** trying to
 become a pixel-perfect Word replacement.
 
-If you need: complex DTP, equation rendering, SmartArt, footnote layout,
-RTL bidi, full font shaping — use LibreOffice as a backend. This library
-exists for everyone who would rather not ship a 500 MB office suite next
-to their Go service.
+If you need complex DTP, real shape layout, SmartArt diagrams, full bidi
+shaping, or embedded-font support — use LibreOffice as a backend. This
+library exists for everyone who would rather not ship a 500 MB office
+suite next to their Go service.
 
 ---
 
@@ -288,12 +298,13 @@ to their Go service.
 Issues and PRs welcome. Highest-impact missing features (in roughly that
 order):
 
-1. Text wrap around floating images / frames (`wp:anchor` with wrap geometry,
-   `w:framePr`)
-2. RTL layout for Hebrew / Arabic (bidi line breaker)
-3. Equations (`m:oMath`)
-4. Comments and revision tracking
-5. Form controls (`w:sdt` / structured document tags)
+1. Text wrap around floating images / frames — needs per-line shape
+   exclusion in the layout pass (`wp:anchor` with wrap geometry, `w:framePr`
+   currently positions but doesn't wrap)
+2. Full UAX#9 bidi for mixed-direction lines (Latin embedded in Arabic)
+3. Arabic letter shaping (initial / medial / final connected forms)
+4. SmartArt rendering
+5. Embedded fonts (`w:embedRegular`) loaded from the package
 
 ---
 

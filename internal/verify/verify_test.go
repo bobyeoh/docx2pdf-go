@@ -2756,13 +2756,6 @@ func caseMultiColumn() verifyCase {
 	}
 }
 
-func minIntForVerify(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 // --- batch S coverage ----------------------------------------------------
 
 func caseThemeColor() verifyCase {

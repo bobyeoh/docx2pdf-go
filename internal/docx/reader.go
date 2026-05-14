@@ -2214,8 +2214,10 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 				// U+00AD is a break opportunity that's invisible unless the
 				// line wraps at it. Implementing proper soft-hyphen wrap
 				// requires a more sophisticated line breaker; for now we
-				// emit the codepoint (most fonts render it 0-width).
-				atoms = append(atoms, Run{Text: "­", Props: rp})
+				// emit the codepoint (most fonts render it 0-width). The
+				// escape form is used so the source file doesn't carry a
+				// zero-width character that's invisible in editors.
+				atoms = append(atoms, Run{Text: "\u00ad", Props: rp})
 				_ = dec.Skip()
 			case "footnoteReference", "endnoteReference":
 				// Render as a superscript marker AND tag the run with the

@@ -111,8 +111,7 @@ func TestRunBackgroundRGB(t *testing.T) {
 }
 
 func TestIsCJK(t *testing.T) {
-	in := []rune("漢字abc日本語한국어")
-	for _, r := range in {
+	for _, r := range "漢字abc日本語한국어" {
 		got := isCJK(r)
 		isAscii := r < 0x80
 		if isAscii && got {
