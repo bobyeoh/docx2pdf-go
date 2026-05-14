@@ -1084,7 +1084,6 @@ func extractChartText(f *zip.File) (string, error) {
 	defer rc.Close()
 	dec := xml.NewDecoder(rc)
 	var sb []byte
-	var prevWasText bool
 	for {
 		tok, err := dec.Token()
 		if err == io.EOF {
@@ -1093,19 +1092,19 @@ func extractChartText(f *zip.File) (string, error) {
 		if err != nil {
 			return string(sb), err
 		}
-		switch t := tok.(type) {
-		case xml.CharData:
-			s := strings.TrimSpace(string(t))
+		if cd, ok := tok.(xml.CharData); ok {
+			s := strings.TrimSpace(string(cd))
 			if s == "" {
 				continue
 			}
-			if prevWasText {
+			// Insert a single space whenever the accumulator already has
+			// content. Chart text bursts come from many disjoint elements
+			// (title, axis labels, data labels, series names); without a
+			// separator they'd run together as "SalesQ1Q2…".
+			if len(sb) > 0 {
 				sb = append(sb, ' ')
 			}
 			sb = append(sb, s...)
-			prevWasText = true
-		case xml.StartElement, xml.EndElement:
-			prevWasText = false
 		}
 	}
 	return string(sb), nil
