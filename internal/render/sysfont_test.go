@@ -2,6 +2,7 @@ package render
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -97,5 +98,100 @@ func TestResolveFontFromEnv(t *testing.T) {
 	t.Setenv(name, tmp.Name())
 	if got := resolveFontFromEnv(name); got != tmp.Name() {
 		t.Errorf("existing env: got %q, want %q", got, tmp.Name())
+	}
+}
+
+// TestSystemCJKFontCandidates mirrors TestSystemFontCandidates: the list
+// must be non-empty and every entry must be an absolute path. This is a
+// regression guard against an accidental edit dropping all platforms'
+// CJK paths — without at least one valid entry, findSystemCJKFont
+// quietly returns "" and CJK documents render as boxes.
+func TestSystemCJKFontCandidates(t *testing.T) {
+	candidates := systemCJKFontCandidates()
+	if len(candidates) == 0 {
+		t.Fatal("systemCJKFontCandidates returned empty list")
+	}
+	for _, p := range candidates {
+		if !strings.HasPrefix(p, "/") && !(len(p) >= 3 && p[1] == ':') {
+			t.Errorf("candidate %q is not an absolute path", p)
+		}
+	}
+}
+
+// TestFindFontInDirs confirms the user-dir Latin scan picks up any
+// .ttf or .ttc file. We populate a temp dir with a couple of dummies —
+// findFontInDirs doesn't open the files, only inspects names, so empty
+// "fonts" are fine.
+func TestFindFontInDirs(t *testing.T) {
+	dir := t.TempDir()
+	// Drop a non-font and a font so we exercise the suffix filter.
+	if err := os.WriteFile(filepath.Join(dir, "readme.txt"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(dir, "MyFont.ttf")
+	if err := os.WriteFile(target, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := findFontInDirs([]string{dir})
+	if got != target {
+		t.Errorf("findFontInDirs = %q, want %q", got, target)
+	}
+
+	// Empty dir → "".
+	empty := t.TempDir()
+	if got := findFontInDirs([]string{empty}); got != "" {
+		t.Errorf("findFontInDirs(empty dir) = %q, want empty", got)
+	}
+
+	// Non-existent dir → "".
+	if got := findFontInDirs([]string{filepath.Join(dir, "no-such")}); got != "" {
+		t.Errorf("findFontInDirs(missing dir) = %q, want empty", got)
+	}
+}
+
+// TestFindCJKFontInDirs confirms the allowlist scan picks up known CJK
+// filenames and ignores unrelated TTFs. Important because the Latin
+// variant would happily pick "RandomFont.ttf" — that's safe for Latin
+// but would be a wrong CJK pick.
+func TestFindCJKFontInDirs(t *testing.T) {
+	dir := t.TempDir()
+	// A non-CJK TTF that should NOT be returned.
+	if err := os.WriteFile(filepath.Join(dir, "RandomFont.ttf"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A known CJK filename that SHOULD be returned. Case-insensitive
+	// match so we exercise the lowercase normalization too.
+	target := filepath.Join(dir, "WQY-Zenhei.ttc")
+	if err := os.WriteFile(target, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := findCJKFontInDirs([]string{dir})
+	if got != target {
+		t.Errorf("findCJKFontInDirs = %q, want %q", got, target)
+	}
+
+	// Dir with only the non-CJK font → "".
+	onlyLatin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(onlyLatin, "RandomFont.ttf"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := findCJKFontInDirs([]string{onlyLatin}); got != "" {
+		t.Errorf("findCJKFontInDirs(no CJK) = %q, want empty", got)
+	}
+}
+
+// TestUserFontDirs is mostly a smoke test: we can't assert what's
+// installed on the test host, but the function must never panic and
+// must only return existing directories.
+func TestUserFontDirs(t *testing.T) {
+	for _, d := range userFontDirs() {
+		fi, err := os.Stat(d)
+		if err != nil {
+			t.Errorf("userFontDirs returned %q which doesn't stat: %v", d, err)
+			continue
+		}
+		if !fi.IsDir() {
+			t.Errorf("userFontDirs returned %q which is not a directory", d)
+		}
 	}
 }
