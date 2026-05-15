@@ -211,6 +211,11 @@ func (r *renderer) runsToAtoms(runs []docx.Run) []atom {
 			}
 			_ = r.applyFontFamily(run.Props, bufFamily)
 			text := buf.String()
+			// Arabic shaping: substitute presentation forms for
+			// joinable letters based on neighbor context. Must run
+			// on logical-order text BEFORE the RTL rune reverse so
+			// joining decisions see the correct neighbors.
+			text = shapeArabic(text)
 			// UAX#9 atom-level: pick the embedding level from the
 			// atom's first-strong directional class + paragraph base.
 			// Odd levels are RTL — reverse the rune sequence here so
