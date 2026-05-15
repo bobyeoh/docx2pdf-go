@@ -24,6 +24,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/bobyeoh/docx2pdf-go/internal/docx"
@@ -189,8 +190,18 @@ func RenderWriter(doc *docx.Document, w io.Writer, opts Options) error {
 			author:      firstNonEmpty(opts.Author, doc.Properties.Author),
 			title:       doc.Properties.Title,
 			subject:     doc.Properties.Subject,
+			company:     doc.Properties.Company,
 			seqCounters: map[string]int{},
 			bookmarks:   doc.Bookmarks,
+			docProperties: map[string]string{
+				"Title":   doc.Properties.Title,
+				"Author":  doc.Properties.Author,
+				"Subject": doc.Properties.Subject,
+				"Company": doc.Properties.Company,
+				"Pages":   strconv.Itoa(doc.Properties.Pages),
+				"Words":   strconv.Itoa(doc.Properties.Words),
+				"Lines":   strconv.Itoa(doc.Properties.Lines),
+			},
 		},
 	}
 	if err := r.registerFonts(); err != nil {

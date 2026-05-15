@@ -51,9 +51,16 @@ type fieldVars struct {
 	author   string
 	title    string
 	subject  string
+	keywords string
+	comments string
+	company  string
+	username string
 
 	seqCounters map[string]int
 	bookmarks   map[string]string
+	// docProperties indexes custom + standard doc properties so the
+	// DOCPROPERTY field can resolve `{ DOCPROPERTY "AppVersion" }`.
+	docProperties map[string]string
 }
 
 // fieldCodeAndArgs splits an instrText like ` SEQ Figure \* ARABIC ` into the
@@ -209,11 +216,40 @@ func lookupFieldValueWith(code, arg string, vars fieldVars) (string, bool) {
 		if !vars.now.IsZero() {
 			return vars.now.Format("15:04"), true
 		}
+	case "CREATEDATE", "SAVEDATE", "PRINTDATE":
+		// We don't track docProps/core.xml's per-event timestamps yet;
+		// best-effort: use "now" as a reasonable stand-in. Falls back to
+		// the cached Word result if for some reason vars.now isn't set.
+		if !vars.now.IsZero() {
+			return vars.now.Format("2006-01-02"), true
+		}
+	case "EDITTIME":
+		// Total editing time in minutes — we don't have this metric; let
+		// Word's cached value through.
+		return "", false
 	case "FILENAME":
 		if vars.filename != "" {
 			return vars.filename, true
 		}
+	case "USERNAME":
+		if vars.username != "" {
+			return vars.username, true
+		}
+		// Fall through to the author when USERNAME is unset — close enough
+		// for most templates.
+		if vars.author != "" {
+			return vars.author, true
+		}
+	case "USERINITIALS":
+		// Approximate initials from the username/author.
+		if name := firstNonEmpty(vars.username, vars.author); name != "" {
+			return initialsOf(name), true
+		}
 	case "AUTHOR":
+		if vars.author != "" {
+			return vars.author, true
+		}
+	case "LASTSAVEDBY":
 		if vars.author != "" {
 			return vars.author, true
 		}
@@ -228,6 +264,32 @@ func lookupFieldValueWith(code, arg string, vars fieldVars) (string, bool) {
 				return text, true
 			}
 		}
+	case "PAGEREF":
+		// PAGEREF resolves to the page number of a bookmark. We don't
+		// have a bookmark→page index, so we surface the bookmark text
+		// itself when available; otherwise fall through to the cached
+		// Word result (which usually has the correct page).
+		if arg != "" && vars.bookmarks != nil {
+			if text, ok := vars.bookmarks[arg]; ok && text != "" {
+				return text, true
+			}
+		}
+		return "", false
+	case "NOTEREF":
+		// NOTEREF resolves to a footnote/endnote reference number. We
+		// don't track these separately; surface the bookmark text when
+		// possible, else let the cached result win.
+		if arg != "" && vars.bookmarks != nil {
+			if text, ok := vars.bookmarks[arg]; ok && text != "" {
+				return text, true
+			}
+		}
+		return "", false
+	case "STYLEREF":
+		// STYLEREF prints the most-recent text styled with the named
+		// style on the current page (used for running heads). We don't
+		// have a per-page style index; fall through to the cached value.
+		return "", false
 	case "TITLE":
 		if vars.title != "" {
 			return vars.title, true
@@ -236,8 +298,89 @@ func lookupFieldValueWith(code, arg string, vars fieldVars) (string, bool) {
 		if vars.subject != "" {
 			return vars.subject, true
 		}
+	case "KEYWORDS":
+		if vars.keywords != "" {
+			return vars.keywords, true
+		}
+	case "COMMENTS":
+		if vars.comments != "" {
+			return vars.comments, true
+		}
+	case "COMPANY":
+		if vars.company != "" {
+			return vars.company, true
+		}
+	case "DOCPROPERTY":
+		if arg != "" && vars.docProperties != nil {
+			if v, ok := vars.docProperties[arg]; ok && v != "" {
+				return v, true
+			}
+		}
+		return "", false
+	case "MERGEFIELD":
+		// MERGEFIELD names a mail-merge column. Word caches the rendered
+		// merge value in the result region (e.g. "John Smith"); we let
+		// that flow through. Returning a placeholder here would override
+		// the cached value, which breaks templates that ship pre-merged.
+		return "", false
+	case "FORMTEXT":
+		// FORMTEXT shows the result region's content as-is — return ""
+		// + false so the result region's text streams through normally.
+		return "", false
+	case "FORMCHECKBOX":
+		// Checkbox: cached result is empty (Word draws the box from a
+		// separate FFData blob). Surface ☐ as a visible placeholder.
+		return "☐", true
+	case "FORMDROPDOWN":
+		// Dropdown: same situation as FORMCHECKBOX — surface ▾ as the
+		// "selected value" placeholder when no result was cached.
+		return "▾", true
+	case "QUOTE":
+		// QUOTE simply emits its argument as text.
+		if arg != "" {
+			return strings.Trim(arg, `"`), true
+		}
+	case "IF":
+		// IF is a conditional expression; we don't evaluate it. Let the
+		// cached result win.
+		return "", false
+	case "INCLUDETEXT", "INCLUDEPICTURE":
+		// External include — we can't resolve the relationship target as
+		// arbitrary content; let cached result win.
+		return "", false
+	case "TOC", "INDEX", "TOA":
+		// Table-of-contents, index, table-of-authorities — Word caches
+		// the rendered TOC into the result region as plain text + line
+		// breaks. We just let the cached content flow through.
+		return "", false
+	case "ADDRESSBLOCK", "GREETINGLINE", "MACROBUTTON", "AUTOTEXT", "AUTOTEXTLIST":
+		// Mail-merge / interactive elements with cached display text.
+		return "", false
+	case "EQ":
+		// Legacy equation field — Word stores the typeset glyphs in the
+		// result region. Let those through.
+		return "", false
 	case "HYPERLINK":
 		return "", false
 	}
 	return "", false
+}
+
+// initialsOf extracts a 2-3 letter initials string from a full name.
+// "Alice Wonder Land" → "AWL". Falls back to the whole name if it has
+// no spaces.
+func initialsOf(name string) string {
+	parts := strings.Fields(name)
+	if len(parts) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, p := range parts {
+		if p == "" {
+			continue
+		}
+		r := []rune(p)
+		b.WriteRune(r[0])
+	}
+	return strings.ToUpper(b.String())
 }

@@ -79,16 +79,21 @@ func (r *renderer) stampPageDecorations(sections []docx.Section, sectionPageStar
 			displayPage = sec.PageNumber.Start + pageInSection - 1
 		}
 		r.fields = fieldVars{
-			page:        displayPage,
-			numPages:    n,
-			pageFmt:     sec.PageNumber.Fmt,
-			now:         savedFields.now,
-			filename:    savedFields.filename,
-			author:      savedFields.author,
-			title:       savedFields.title,
-			subject:     savedFields.subject,
-			seqCounters: savedFields.seqCounters,
-			bookmarks:   savedFields.bookmarks,
+			page:          displayPage,
+			numPages:      n,
+			pageFmt:       sec.PageNumber.Fmt,
+			now:           savedFields.now,
+			filename:      savedFields.filename,
+			author:        savedFields.author,
+			title:         savedFields.title,
+			subject:       savedFields.subject,
+			company:       savedFields.company,
+			keywords:      savedFields.keywords,
+			comments:      savedFields.comments,
+			username:      savedFields.username,
+			seqCounters:   savedFields.seqCounters,
+			bookmarks:     savedFields.bookmarks,
+			docProperties: savedFields.docProperties,
 		}
 
 		hdr := sec.HeaderBlocks
@@ -368,10 +373,20 @@ func (r *renderer) drawFootnotesAtBottom() {
 		r.noPageBreak = savedNoPageBreak
 	}()
 
-	r.pdf.SetLineWidth(0.5)
-	r.pdf.SetStrokeColor(120, 120, 120)
-	r.pdf.Line(r.marL, startY, r.marL+r.contentW*0.3, startY)
-	r.cursorY = startY + 2
+	// If the doc declared a custom <w:footnote w:type="separator"> body,
+	// draw that instead of our default thin rule. The custom separator is
+	// a list of paragraphs (usually one paragraph with a tab-stop and a
+	// thin line), so we render it via drawAt at the bottom-of-page anchor.
+	customSep := r.doc.FootnoteSeparators["separator"]
+	if len(customSep) > 0 {
+		_ = r.drawAt(customSep, r.marL, startY, r.contentW)
+		r.cursorY = startY + 8
+	} else {
+		r.pdf.SetLineWidth(0.5)
+		r.pdf.SetStrokeColor(120, 120, 120)
+		r.pdf.Line(r.marL, startY, r.marL+r.contentW*0.3, startY)
+		r.cursorY = startY + 2
+	}
 
 	logFn := r.opts.Logger
 	if logFn == nil && r.opts.Verbose {
