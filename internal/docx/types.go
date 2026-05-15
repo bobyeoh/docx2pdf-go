@@ -327,6 +327,12 @@ type Run struct {
 	// Explicit image size in points (from wp:extent in EMU). Zero means
 	// "use the image's native dimensions scaled to content width if too big."
 	ImageWidthPt, ImageHeightPt float64
+	// WrapMode mirrors wp:anchor/wp:wrap*: "" (inline) / "topAndBottom" /
+	// "square" / "tight" / "through" / "none". The reader.go decoder
+	// inserts soft breaks around topAndBottom images so they sit alone;
+	// other wrap modes are preserved as metadata for future layout work
+	// but currently render inline.
+	WrapMode string
 	// Image source-rect crop in PERCENT (a:srcRect attrs are 1/1000 of percent
 	// from each edge). E.g. CropTop=10000 = 10%. Zero = no crop on that side.
 	CropTopPct, CropBottomPct, CropLeftPct, CropRightPct float64

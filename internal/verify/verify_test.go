@@ -114,6 +114,7 @@ func allCases() []verifyCase {
 		// — images —
 		caseInlineImage(),
 		caseAnchoredImage(),
+		caseAnchorWrapTopAndBottom(),
 		caseJpegImage(),
 		caseTransparentImage(),
 		caseImageOnlyParagraph(),
@@ -770,6 +771,71 @@ func caseAnchoredImage() verifyCase {
 		},
 		expectText:  []string{"before anchor", "after anchor"},
 		expectPages: 1,
+	}
+}
+
+// caseAnchorWrapTopAndBottom covers wp:wrapTopAndBottom: surrounding
+// text must break above and below the image, not flow next to it.
+// The image+text inside the same paragraph would otherwise run on
+// one line under the previous best-effort inline placement.
+func caseAnchorWrapTopAndBottom() verifyCase {
+	red := makeSolidPNG(100, 60, color.RGBA{R: 200, G: 30, B: 30, A: 255})
+	return verifyCase{
+		name:        "17a_anchor_wrap_top_bottom",
+		description: "wp:wrapTopAndBottom forces line breaks around the anchored image",
+		build: func(t *testing.T, dir string) string {
+			return newDocx().
+				Body(`
+    <w:p>
+      <w:r><w:t xml:space="preserve">BEFORE-WRAP </w:t></w:r>
+      <w:r>
+        <w:drawing>
+          <wp:anchor xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">
+            <wp:extent cx="800000" cy="500000"/>
+            <wp:wrapTopAndBottom/>
+            <a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+              <a:graphicData>
+                <pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">
+                  <pic:blipFill><a:blip r:embed="rImg"/></pic:blipFill>
+                </pic:pic>
+              </a:graphicData>
+            </a:graphic>
+          </wp:anchor>
+        </w:drawing>
+      </w:r>
+      <w:r><w:t xml:space="preserve"> AFTER-WRAP</w:t></w:r>
+    </w:p>`).
+				Media("image1.png", red).
+				Rels(`<?xml version="1.0"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rImg" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image1.png"/>
+</Relationships>`).
+				Write(t, dir)
+		},
+		expectText:  []string{"BEFORE-WRAP", "AFTER-WRAP"},
+		expectPages: 1,
+		custom: func(t *testing.T, pdf string, fail func(format string, args ...any)) {
+			// pdftotext preserves line breaks; ensure the two text
+			// fragments are on different lines (image broke them).
+			txt := pdftotext(t, pdf)
+			lines := strings.Split(txt, "\n")
+			var bIdx, aIdx int = -1, -1
+			for i, line := range lines {
+				if strings.Contains(line, "BEFORE-WRAP") {
+					bIdx = i
+				}
+				if strings.Contains(line, "AFTER-WRAP") {
+					aIdx = i
+				}
+			}
+			if bIdx < 0 || aIdx < 0 {
+				fail("missing markers in:\n%s", txt)
+				return
+			}
+			if aIdx <= bIdx {
+				fail("expected AFTER-WRAP on a later line than BEFORE-WRAP, got %d and %d", bIdx, aIdx)
+			}
+		},
 	}
 }
 
