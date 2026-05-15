@@ -62,7 +62,7 @@ func Parse(r io.ReaderAt, size int64) (*Document, error) {
 		Footnotes:   map[string][]Block{},
 		Endnotes:    map[string][]Block{},
 		Comments:    map[string][]Block{},
-		Charts:      map[string]string{},
+		Charts:      map[string]ChartData{},
 		Bookmarks:   map[string]string{},
 		Theme: Theme{
 			Colors: map[string]string{},
@@ -174,19 +174,20 @@ func Parse(r io.ReaderAt, size int64) (*Document, error) {
 			}
 		case isChartRel(e.Type):
 			// Charts live in their own part (word/charts/chartN.xml).
-			// Best-effort: pull all CharData out of the chart subtree so
-			// titles, axis labels, and data labels survive. Geometry
-			// and the actual series glyphs are out of scope.
+			// parseChartPart pulls structured series/category data
+			// for bar/line/pie plots; FlatText falls back to the
+			// legacy text concatenation so callers extracting prose
+			// from the PDF still see the chart's text content.
 			full := "word/" + e.Target
 			zf, ok := files[full]
 			if !ok {
 				continue
 			}
-			txt, err := extractChartText(zf)
+			data, err := parseChartPart(zf)
 			if err != nil {
 				continue // tolerate malformed chart part
 			}
-			doc.Charts[rid] = txt
+			doc.Charts[rid] = data
 		}
 	}
 
@@ -2359,15 +2360,30 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 				// the reader sees what the chart said. If the chart part
 				// wasn't loadable we still emit a "[Chart]" placeholder.
 				if di.ChartRID != "" {
-					trp := rp
-					trp.Italic = true
-					txt := doc.Charts[di.ChartRID]
-					if txt == "" {
-						txt = "[Chart]"
+					data := doc.Charts[di.ChartRID]
+					if data.HasData() {
+						// Emit a chart-bearing run; renderer draws
+						// the data graphic via gopdf primitives.
+						atoms = append(atoms, Run{
+							ChartID:       di.ChartRID,
+							ImageWidthPt:  di.WPt,
+							ImageHeightPt: di.HPt,
+							Props:         rp,
+						})
 					} else {
-						txt = "[Chart: " + txt + "]"
+						// Unsupported chart type or empty data — keep
+						// the legacy "[Chart: …text]" placeholder so
+						// the chart's prose survives in pdftotext output.
+						trp := rp
+						trp.Italic = true
+						txt := data.FlatText
+						if txt == "" {
+							txt = "[Chart]"
+						} else {
+							txt = "[Chart: " + txt + "]"
+						}
+						atoms = append(atoms, Run{Text: txt, Props: trp})
 					}
-					atoms = append(atoms, Run{Text: txt, Props: trp})
 				}
 			case "pict":
 				// Legacy VML images: <w:pict><v:shape style="..."><v:imagedata r:id="..."/>
