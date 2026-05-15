@@ -37,6 +37,13 @@ type Document struct {
 	// the data graphic but we surface titles, axis labels, and data
 	// labels so the prose around the chart still makes sense.
 	Charts map[string]string
+	// Diagrams maps the dgm:relIds "r:dm" relationship id → flattened
+	// text extracted from the SmartArt data part
+	// (word/diagrams/dataN.xml). Each diagram surfaces as a list of
+	// node texts joined with " → " so the conceptual structure
+	// survives in the PDF text stream even though we don't render the
+	// graphical shapes.
+	Diagrams map[string]string
 	// Theme is the parsed contents of word/theme/theme1.xml — color scheme +
 	// font scheme — used to resolve w:themeColor / rFonts w:asciiTheme refs.
 	Theme Theme

@@ -253,6 +253,7 @@ func allCases() []verifyCase {
 		caseComments(),
 		caseHeadingOutline(),
 		caseChartTextExtraction(),
+		caseSmartArtTextExtraction(),
 		casePageBreakBeforeValZero(),
 		caseOverwideWordInCell(),
 		caseHorizontalRuleVMLPict(),
@@ -4278,6 +4279,79 @@ func caseChartTextExtraction() verifyCase {
 			"below",
 		},
 		expectPages: 1,
+	}
+}
+
+// caseSmartArtTextExtraction: a w:drawing carrying a dgm:relIds
+// reference to a SmartArt data part. Without parsing, every node
+// label is dropped. We assert each label survives in the produced
+// PDF.
+func caseSmartArtTextExtraction() verifyCase {
+	return verifyCase{
+		name:        "127b_smartart_text",
+		description: "SmartArt diagram node text (dgm:pt/dgm:t) is surfaced from the data part",
+		build: func(t *testing.T, dir string) string {
+			data := `<?xml version="1.0"?>
+<dgm:dataModel xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram"
+               xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <dgm:ptLst>
+    <dgm:pt modelId="1" type="doc"/>
+    <dgm:pt modelId="2">
+      <dgm:t><a:p><a:r><a:t>STAGE-ALPHA</a:t></a:r></a:p></dgm:t>
+    </dgm:pt>
+    <dgm:pt modelId="3">
+      <dgm:t><a:p><a:r><a:t>STAGE-BETA</a:t></a:r></a:p></dgm:t>
+    </dgm:pt>
+    <dgm:pt modelId="4">
+      <dgm:t><a:p><a:r><a:t>STAGE-GAMMA</a:t></a:r></a:p></dgm:t>
+    </dgm:pt>
+    <dgm:pt modelId="P1" type="pres">
+      <dgm:t><a:p><a:r><a:t>SKIP-ME-PRES</a:t></a:r></a:p></dgm:t>
+    </dgm:pt>
+  </dgm:ptLst>
+</dgm:dataModel>`
+			body := `
+    <w:p>
+      <w:r><w:t xml:space="preserve">Workflow: </w:t></w:r>
+      <w:r>
+        <w:drawing>
+          <wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">
+            <wp:extent cx="4000000" cy="2000000"/>
+            <a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+              <a:graphicData>
+                <dgm:relIds xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram" r:dm="rDiagram" r:lo="rLayout" r:qs="rQS" r:cs="rCS"/>
+              </a:graphicData>
+            </a:graphic>
+          </wp:inline>
+        </w:drawing>
+      </w:r>
+      <w:r><w:t xml:space="preserve"> end.</w:t></w:r>
+    </w:p>`
+			return newDocx().
+				RawBody(docHeader+body+docFooter).
+				Part("diagrams/data1.xml", data).
+				Rels(`<?xml version="1.0"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rDiagram" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData" Target="diagrams/data1.xml"/>
+</Relationships>`).
+				Write(t, dir)
+		},
+		expectText: []string{
+			"Workflow",
+			"STAGE-ALPHA",
+			"STAGE-BETA",
+			"STAGE-GAMMA",
+			"end",
+		},
+		expectPages: 1,
+		custom: func(t *testing.T, pdf string, fail func(format string, args ...any)) {
+			txt := pdftotext(t, pdf)
+			// Presentation scaffold nodes (type="pres") must not
+			// appear — they're algorithmic noise.
+			if strings.Contains(txt, "SKIP-ME-PRES") {
+				fail("presentation node leaked into PDF: %s", txt)
+			}
+		},
 	}
 }
 

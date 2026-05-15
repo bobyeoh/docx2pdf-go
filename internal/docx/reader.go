@@ -63,6 +63,7 @@ func Parse(r io.ReaderAt, size int64) (*Document, error) {
 		Endnotes:    map[string][]Block{},
 		Comments:    map[string][]Block{},
 		Charts:      map[string]string{},
+		Diagrams:    map[string]string{},
 		Bookmarks:   map[string]string{},
 		Theme: Theme{
 			Colors: map[string]string{},
@@ -187,6 +188,23 @@ func Parse(r io.ReaderAt, size int64) (*Document, error) {
 				continue // tolerate malformed chart part
 			}
 			doc.Charts[rid] = txt
+		case isDiagramDataRel(e.Type):
+			// SmartArt data part (word/diagrams/dataN.xml). We extract
+			// the per-node text (dgm:pt/dgm:t descendants) and join it
+			// with " → " so the diagram's conceptual ordering survives
+			// in the PDF text stream. The actual graphical layout is
+			// out of scope — would need to consume the layout/colors/
+			// quickStyle parts and run the diagram algorithm.
+			full := "word/" + e.Target
+			zf, ok := files[full]
+			if !ok {
+				continue
+			}
+			txt, err := extractDiagramText(zf)
+			if err != nil {
+				continue
+			}
+			doc.Diagrams[rid] = txt
 		}
 	}
 
@@ -1115,6 +1133,86 @@ func parseRels(f *zip.File, out map[string]relEntry) error {
 func isHeaderRel(t string) bool { return strings.HasSuffix(t, "/header") }
 func isFooterRel(t string) bool { return strings.HasSuffix(t, "/footer") }
 func isChartRel(t string) bool  { return strings.HasSuffix(t, "/chart") }
+
+// isDiagramDataRel matches the dgm:relIds "r:dm" relationship — the
+// SmartArt data part (word/diagrams/dataN.xml) carries the node text
+// graph. Layout and styles live in separate parts (lo/qs/cs) we don't
+// consume yet.
+func isDiagramDataRel(t string) bool {
+	return strings.HasSuffix(t, "/diagramData") || strings.HasSuffix(t, "/diagram/dataModel")
+}
+
+// extractDiagramText reads a SmartArt data part
+// (word/diagrams/dataN.xml). The data graph carries one <dgm:pt> per
+// node; each node's visible text lives in <dgm:t> descendants. We
+// collect them in document order and join with " → " so the diagram's
+// conceptual ordering survives even though we don't render the
+// graphical shapes.
+//
+// Presentation nodes (dgm:pt @type="pres") and parent/non-visible
+// nodes are filtered out — they're algorithmic scaffolding, not
+// user-authored content.
+func extractDiagramText(f *zip.File) (string, error) {
+	rc, err := openZipFile(f)
+	if err != nil {
+		return "", err
+	}
+	defer rc.Close()
+	dec := xml.NewDecoder(rc)
+	var nodes []string
+	var skipNode bool
+	var inT bool
+	var nodeBuf strings.Builder
+	finishNode := func() {
+		s := strings.TrimSpace(nodeBuf.String())
+		if s != "" && !skipNode {
+			nodes = append(nodes, s)
+		}
+		nodeBuf.Reset()
+		skipNode = false
+		inT = false
+	}
+	for {
+		tok, err := dec.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return strings.Join(nodes, " → "), err
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			switch t.Name.Local {
+			case "pt":
+				// New node — drop any previous unfinished content.
+				nodeBuf.Reset()
+				skipNode = false
+				inT = false
+				// Skip presentation scaffolding nodes.
+				if v := attr(t, "type"); v == "pres" || v == "parTrans" || v == "sibTrans" {
+					skipNode = true
+				}
+			case "t":
+				inT = true
+			}
+		case xml.EndElement:
+			switch t.Name.Local {
+			case "pt":
+				finishNode()
+			case "t":
+				inT = false
+				if nodeBuf.Len() > 0 {
+					nodeBuf.WriteByte(' ')
+				}
+			}
+		case xml.CharData:
+			if inT && !skipNode {
+				nodeBuf.Write(t)
+			}
+		}
+	}
+	return strings.Join(nodes, " → "), nil
+}
 
 // extractChartText reads a chart XML part (chartN.xml) and concatenates
 // all CharData found anywhere in the tree. Titles, axis labels, data
@@ -2369,6 +2467,22 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 					}
 					atoms = append(atoms, Run{Text: txt, Props: trp})
 				}
+				// SmartArt diagram reference: surface the node-text
+				// graph so the diagram's conceptual content survives
+				// in the PDF text stream. Visual layout requires
+				// running the diagram algorithm against the layout /
+				// quickStyle / colors parts — out of scope.
+				if di.DiagramRID != "" {
+					trp := rp
+					trp.Italic = true
+					txt := doc.Diagrams[di.DiagramRID]
+					if txt == "" {
+						txt = "[Diagram]"
+					} else {
+						txt = "[Diagram: " + txt + "]"
+					}
+					atoms = append(atoms, Run{Text: txt, Props: trp})
+				}
 			case "pict":
 				// Legacy VML images: <w:pict><v:shape style="..."><v:imagedata r:id="..."/>
 				// </v:shape></w:pict>. Older Word docs, Excel/Outlook pastes, and
@@ -2434,6 +2548,10 @@ type drawingInfo struct {
 	// <c:chart r:id="…">. The renderer looks up Document.Charts[ChartRID]
 	// to surface chart labels as plain text. Empty for non-chart drawings.
 	ChartRID string
+	// DiagramRID is set when the drawing references a SmartArt diagram
+	// via <dgm:relIds r:dm="…">. The renderer looks up
+	// Document.Diagrams[DiagramRID] for the flattened node text.
+	DiagramRID string
 }
 
 // emuPerPt is the OOXML "English Metric Unit" → PostScript point conversion.
@@ -2495,6 +2613,17 @@ func findDrawingInfo(dec *xml.Decoder, start xml.StartElement) (info drawingInfo
 				for _, a := range t.Attr {
 					if a.Name.Local == "id" {
 						info.ChartRID = a.Value
+						break
+					}
+				}
+			case "relIds":
+				// <dgm:relIds r:dm="…" r:lo="…" r:qs="…" r:cs="…"/>
+				// — SmartArt diagram reference. r:dm points to the
+				// data part (node text); other rIds are layout / style
+				// parts we don't consume.
+				for _, a := range t.Attr {
+					if a.Name.Local == "dm" {
+						info.DiagramRID = a.Value
 						break
 					}
 				}
