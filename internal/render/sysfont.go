@@ -355,3 +355,11 @@ func resolveFontFromEnv(name string) string {
 func formatFontCandidates() string {
 	return strings.Join(systemFontCandidates(), ", ")
 }
+
+// embeddedDocFontSentinel returns the sentinel string loadFont
+// recognizes for a doc-embedded font face. variant is "Regular" /
+// "Bold" / "Italic" / "BoldItalic". fontname is matched against the
+// (lower-cased) key in doc.EmbeddedFonts.
+func embeddedDocFontSentinel(fontname, variant string) string {
+	return "<embedded-doc:" + strings.ToLower(fontname) + ":" + variant + ">"
+}

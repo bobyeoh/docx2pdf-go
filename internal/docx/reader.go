@@ -99,6 +99,12 @@ func Parse(r io.ReaderAt, size int64) (*Document, error) {
 		_ = parseSettings(f, &doc.Settings)
 	}
 
+	// Embedded fonts (word/fontTable.xml + rels). Best-effort: failure
+	// just leaves doc.EmbeddedFonts nil and the renderer falls back to
+	// system fonts. Suppress to err == nil so a malformed font table
+	// can't keep the rest of the doc from rendering.
+	_ = parseFontTable(files, doc)
+
 	rels := map[string]relEntry{} // rId → relationship metadata
 	if f, ok := files["word/_rels/document.xml.rels"]; ok {
 		if err := parseRels(f, rels); err != nil {
