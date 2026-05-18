@@ -52,6 +52,23 @@ type Document struct {
 	Properties Properties
 	// Settings from word/settings.xml — doc-wide rendering knobs.
 	Settings Settings
+	// EmbeddedFonts maps the lower-cased w:font/@w:name to the bytes
+	// of each embedded face declared in word/fontTable.xml. Faces are
+	// optional — Regular is typically present, the others may be nil.
+	// ODTTF-obfuscated parts have been deobfuscated, so byte slices
+	// are ready to hand to a TTF parser.
+	EmbeddedFonts map[string]EmbeddedFontSet
+}
+
+// EmbeddedFontSet groups the four w:embed* faces of one w:font entry
+// in word/fontTable.xml. Any field may be nil if that variant isn't
+// embedded — Word typically embeds Regular at minimum and the other
+// three when "Embed only the characters used in the document" is off.
+type EmbeddedFontSet struct {
+	Regular    []byte
+	Bold       []byte
+	Italic     []byte
+	BoldItalic []byte
 }
 
 // Theme holds the bits of theme1.xml we read.

@@ -2,6 +2,7 @@ package render
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/bobyeoh/docx2pdf-go/internal/docx"
 )
@@ -13,6 +14,77 @@ const (
 	headingFamily  = "doc-h"
 	fallbackFamily = "doc-fb"
 )
+
+// applyEmbeddedDocFonts substitutes sentinel paths into the relevant
+// Options.Font* fields whenever the document ships a matching
+// w:embed{Regular,Bold,Italic,BoldItalic} in word/fontTable.xml. The
+// returned map populates renderer.embeddedFontData so loadFont can
+// resolve the sentinels back to bytes.
+//
+// Resolution rules (caller-set paths always win — embedded fonts only
+// fill empty slots):
+//
+//  1. The doc's body face (theme minorAscii > Defaults.FontFamily)
+//     supplies FontRegular / FontBold / FontItalic from its
+//     EmbeddedFontSet.
+//  2. The doc's heading face (theme majorAscii) supplies FontHeading.
+//
+// Per-variant: if the byte slice for that variant is nil (because the
+// fontTable didn't include it), the slot is left untouched — so e.g.
+// a font that only embeds Regular still gets system-font bold via the
+// usual resolution chain.
+func applyEmbeddedDocFonts(opts *Options, doc *docx.Document) map[string][]byte {
+	if doc == nil || len(doc.EmbeddedFonts) == 0 {
+		return nil
+	}
+	data := map[string][]byte{}
+
+	bind := func(slot *string, name, variant string, bytes []byte) {
+		if *slot != "" || len(bytes) == 0 || name == "" {
+			return
+		}
+		sentinel := embeddedDocFontSentinel(name, variant)
+		data[sentinel] = bytes
+		*slot = sentinel
+	}
+
+	bodyName := primaryFontName(doc, "minorAscii")
+	if set, ok := doc.EmbeddedFonts[strings.ToLower(bodyName)]; ok && bodyName != "" {
+		bind(&opts.FontRegular, bodyName, "Regular", set.Regular)
+		bind(&opts.FontBold, bodyName, "Bold", set.Bold)
+		bind(&opts.FontItalic, bodyName, "Italic", set.Italic)
+	}
+
+	headingName := primaryFontName(doc, "majorAscii")
+	if set, ok := doc.EmbeddedFonts[strings.ToLower(headingName)]; ok && headingName != "" {
+		bind(&opts.FontHeading, headingName, "Regular", set.Regular)
+	}
+
+	if len(data) == 0 {
+		return nil
+	}
+	return data
+}
+
+// primaryFontName returns the doc's preferred font name for the given
+// theme role ("minorAscii" for body text, "majorAscii" for headings).
+// Falls back to doc.Defaults.FontFamily when the theme is missing —
+// older docs without theme1.xml still declare a body font via the
+// docDefaults block.
+func primaryFontName(doc *docx.Document, themeRole string) string {
+	if doc == nil {
+		return ""
+	}
+	if doc.Theme.Fonts != nil {
+		if name := doc.Theme.Fonts[themeRole]; name != "" {
+			return name
+		}
+	}
+	if themeRole == "minorAscii" {
+		return doc.Defaults.FontFamily
+	}
+	return ""
+}
 
 func (r *renderer) registerFonts() error {
 	// FontRegular is required — its load error is fatal.
@@ -49,6 +121,11 @@ func (r *renderer) loadFont(family, path string) error {
 	}
 	if path == embeddedFontSentinel {
 		return r.pdf.AddTTFFontData(family, embeddedRegularFont)
+	}
+	// Doc-embedded font (word/fontTable.xml + word/fonts/*). The
+	// sentinel format is "<embedded-doc:<fontname>:<variant>>".
+	if data, ok := r.embeddedFontData[path]; ok {
+		return r.pdf.AddTTFFontData(family, data)
 	}
 	if looksLikeTTC(path) {
 		data, err := extractTTCFace0(path)
