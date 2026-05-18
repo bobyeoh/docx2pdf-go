@@ -46,6 +46,16 @@ type fieldVars struct {
 	page     int
 	numPages int
 	pageFmt  string
+	// numSectionPages is the page count for the section the current page
+	// belongs to. Surfaced by the SECTIONPAGES field. Zero when unknown.
+	numSectionPages int
+	// section is the 1-based section number, surfaced by the SECTION field.
+	section int
+	// decimalSymbol / listSeparator come from settings.xml. Empty means
+	// fall back to "." / "," respectively (US default). Used by numeric
+	// pictures so European-locale templates render with the right glyphs.
+	decimalSymbol string
+	listSeparator string
 
 	now      time.Time
 	filename string
@@ -72,6 +82,11 @@ type fieldVars struct {
 	// PAGEREF for cross-references that fall after the body has been
 	// laid out (i.e., during page-decoration stamping).
 	bookmarkPages map[string]int
+	// bookmarkParaNums maps bookmark name → its enclosing paragraph's
+	// formatted list marker (e.g. "1.2.3"). Populated when bookmarks
+	// land inside a numbered paragraph. Used by REF's \r / \w / \p
+	// switches for paragraph-number cross-references.
+	bookmarkParaNums map[string]string
 	// docProperties indexes custom + standard doc properties so the
 	// DOCPROPERTY field can resolve `{ DOCPROPERTY "AppVersion" }`.
 	docProperties map[string]string
@@ -93,8 +108,17 @@ type fieldVars struct {
 	styleParagraphs map[string][]string
 	// footnoteRefs maps bookmark name → footnote ID. Used by NOTEREF.
 	footnoteRefs map[string]string
-	// mergeData supplies MERGEFIELD values.
+	// mergeData supplies MERGEFIELD values for the implicit (single-record)
+	// merge mode. When mergeRecords is non-empty, mergeData is ignored;
+	// the active record drives lookup instead.
 	mergeData map[string]string
+	// mergeRecords is the ordered list of records for catalog-mode merge.
+	// nil/empty falls back to mergeData.
+	mergeRecords []map[string]string
+	// mergeState is the shared cursor that NEXT/NEXTIF/SKIPIF advance.
+	// Pointer-shared so the value-copied fieldVars all see the same
+	// iteration position.
+	mergeState *mergeIterState
 	// glossary maps the docPart names from word/glossary/document.xml to
 	// their plain-text payload. AUTOTEXT / GLOSSARY fields resolve their
 	// first argument against this table.
@@ -139,15 +163,19 @@ func parseTCInstr(instrFull string) (tocEntry, bool) {
 		return tocEntry{}, false
 	}
 	level := 1
+	seq := ""
 	parts := strings.Fields(s)
 	for i := 0; i < len(parts)-1; i++ {
-		if parts[i] == `\l` {
+		switch parts[i] {
+		case `\l`:
 			if n, err := strconv.Atoi(strings.Trim(parts[i+1], `"`)); err == nil && n >= 1 && n <= 9 {
 				level = n
 			}
+		case `\f`:
+			seq = strings.Trim(parts[i+1], `"`)
 		}
 	}
-	return tocEntry{Level: level, Text: title}, true
+	return tocEntry{Level: level, Text: title, Seq: seq}, true
 }
 
 // parseXEInstr extracts the visible title from an XE field instruction.
@@ -170,6 +198,14 @@ func parseXEInstr(instrFull string) string {
 	return strings.TrimSpace(s[:end])
 }
 
+// mergeIterState is shared mutable state for catalog mail-merge: NEXT
+// directives advance Idx; MERGEFIELDs look up MergeRecords[Idx]. A pointer
+// to one instance lives on every fieldVars copy so the cursor survives
+// the value-copy through resolution layers.
+type mergeIterState struct {
+	Idx int
+}
+
 // tableContext locates the cell currently being drawn so FORMULA fields
 // can reach into sibling cells. Row/Col are post-gridSpan logical coords.
 type tableContext struct {
@@ -182,6 +218,202 @@ type tableContext struct {
 type tocEntry struct {
 	Level int
 	Text  string
+	// Style is the paragraph style ID that produced this entry (e.g.
+	// "Heading1", "ChapterTitle"). Used by the TOC `\t` switch to filter
+	// entries by an author-named style list. Empty for entries coming from
+	// explicit TC fields unless `\f` SEQ context attached one.
+	Style string
+	// Seq is the SEQ identifier carried by a `\f` TC entry. Used by the
+	// TOC `\f` switch to limit entries to a single SEQ stream.
+	Seq string
+	// PageNum, if non-zero, is the 1-based page where this entry's anchor
+	// landed. Filled by the bookmark pre-pass; consumed by formatTOC.
+	PageNum int
+	// Bookmark, when non-empty, is the bookmark name (e.g. "_Toc12345")
+	// that pins this entry's location. Used to resolve PageNum on the
+	// second pass.
+	Bookmark string
+}
+
+// tocSwitches captures the parsed switches from a TOC field instruction.
+// All fields are optional — zero value means "default behavior" matching
+// Word's `{ TOC }` with no switches.
+type tocSwitches struct {
+	// MinLvl/MaxLvl from `\o "1-3"`. 0 = use default (1..9).
+	MinLvl, MaxLvl int
+	// StyleMap from `\t "Heading 1,1,Heading 2,2"` — case-insensitive
+	// style ID → outline level. Empty when `\t` not used.
+	StyleMap map[string]int
+	// UseStyleMap is true when `\t` was specified (even if empty).
+	UseStyleMap bool
+	// UseOutline is true when `\u` was specified — collect by w:outlineLvl
+	// instead of by style.
+	UseOutline bool
+	// HidePageNums true when `\n` was specified with no level range, or
+	// HideLvls populated when `\n 2-3` etc.
+	HidePageNums bool
+	HideMinLvl   int
+	HideMaxLvl   int
+	// Hyperlinks true when `\h` is present — emit clickable links.
+	Hyperlinks bool
+	// HideInWeb true when `\z`.
+	HideInWeb bool
+	// SeqName from `\f SEQID` — limit TC entries to this SEQ stream.
+	SeqName string
+	// Separator from `\d "char"` — between entry text and page number.
+	// Empty falls back to dot leader.
+	Separator string
+	// Bookmark from `\b name` — restrict scope to a bookmark range.
+	Bookmark string
+	// Caption from `\c "label"` — generate a "table of figures" style TOC.
+	Caption string
+	// TabLeader from `\p "char"` — Word's `\p` overrides the default
+	// dot leader. Same meaning as the per-style TOCStyle leader.
+	TabLeader string
+}
+
+// parseTOCSwitches scans a TOC field instruction and returns the
+// recognized switches. Unknown switches are ignored (Word's behavior).
+// Examples:
+//
+//	{ TOC \o "1-3" \h \z \u }
+//	{ TOC \t "MyHead,1,MyHead2,2" \n \p "—" }
+func parseTOCSwitches(instr string) tocSwitches {
+	var sw tocSwitches
+	s := strings.TrimSpace(instr)
+	// Drop leading "TOC" keyword.
+	if up := strings.ToUpper(s); strings.HasPrefix(up, "TOC") {
+		s = strings.TrimSpace(s[3:])
+	}
+	// Walk the instruction one switch at a time. A switch is "\X" optionally
+	// followed by an argument (quoted or whitespace-delimited).
+	for len(s) > 0 {
+		i := strings.Index(s, `\`)
+		if i < 0 {
+			break
+		}
+		// Step past the backslash.
+		s = s[i+1:]
+		if len(s) == 0 {
+			break
+		}
+		flag := s[0]
+		s = strings.TrimLeft(s[1:], " \t")
+		// Pull the optional argument: quoted "...", or up to whitespace,
+		// or up to the next backslash.
+		var arg string
+		switch {
+		case strings.HasPrefix(s, `"`):
+			if end := strings.Index(s[1:], `"`); end >= 0 {
+				arg = s[1 : 1+end]
+				s = s[2+end:]
+			} else {
+				arg = s[1:]
+				s = ""
+			}
+		case len(s) > 0 && s[0] != '\\':
+			end := len(s)
+			for j, r := range s {
+				if r == ' ' || r == '\t' || r == '\\' {
+					end = j
+					break
+				}
+			}
+			arg = s[:end]
+			s = s[end:]
+		}
+		s = strings.TrimLeft(s, " \t")
+		switch flag {
+		case 'o', 'O':
+			lo, hi := parseLvlRange(arg, 1, 9)
+			sw.MinLvl, sw.MaxLvl = lo, hi
+		case 't', 'T':
+			sw.StyleMap = parseTOCStyleList(arg)
+			sw.UseStyleMap = true
+		case 'u', 'U':
+			sw.UseOutline = true
+		case 'n', 'N':
+			if arg == "" {
+				sw.HidePageNums = true
+			} else {
+				sw.HideMinLvl, sw.HideMaxLvl = parseLvlRange(arg, 1, 9)
+				if sw.HideMaxLvl == 0 {
+					sw.HidePageNums = true
+				}
+			}
+		case 'h', 'H':
+			sw.Hyperlinks = true
+		case 'z', 'Z':
+			sw.HideInWeb = true
+		case 'f', 'F':
+			sw.SeqName = strings.TrimSpace(arg)
+		case 'd', 'D':
+			sw.Separator = arg
+		case 'b', 'B':
+			sw.Bookmark = strings.TrimSpace(arg)
+		case 'c', 'C':
+			sw.Caption = strings.TrimSpace(arg)
+		case 'p', 'P':
+			sw.TabLeader = arg
+		}
+	}
+	return sw
+}
+
+// parseLvlRange handles "1-3", "3", "1- 9", or "". Returns (0,0) when
+// the input cannot be parsed.
+func parseLvlRange(arg string, lo, hi int) (int, int) {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return 0, 0
+	}
+	if dash := strings.Index(arg, "-"); dash >= 0 {
+		left := strings.TrimSpace(arg[:dash])
+		right := strings.TrimSpace(arg[dash+1:])
+		l, err1 := strconv.Atoi(left)
+		r, err2 := strconv.Atoi(right)
+		if err1 != nil {
+			l = lo
+		}
+		if err2 != nil {
+			r = hi
+		}
+		if l < 1 || r < l {
+			return 0, 0
+		}
+		return l, r
+	}
+	if n, err := strconv.Atoi(arg); err == nil && n >= 1 && n <= 9 {
+		return n, n
+	}
+	return 0, 0
+}
+
+// parseTOCStyleList parses "Heading 1,1,Heading 2,2,App,5" into a map
+// of lower-cased style → level. Order is insertion-tolerant — Word also
+// accepts no level (defaulting to 1) and just a bare list of names.
+func parseTOCStyleList(arg string) map[string]int {
+	out := map[string]int{}
+	if arg == "" {
+		return out
+	}
+	parts := strings.Split(arg, ",")
+	for i := 0; i < len(parts); i++ {
+		name := strings.TrimSpace(parts[i])
+		if name == "" {
+			continue
+		}
+		level := 1
+		if i+1 < len(parts) {
+			if n, err := strconv.Atoi(strings.TrimSpace(parts[i+1])); err == nil && n >= 1 && n <= 9 {
+				level = n
+				i++ // consume the level token
+			}
+		}
+		key := strings.ToLower(strings.ReplaceAll(name, " ", ""))
+		out[key] = level
+	}
+	return out
 }
 
 // needsForwardPageRefPass reports whether the document contains any PAGEREF
@@ -303,6 +535,12 @@ func flattenFields(runs []docx.Run, vars fieldVars) []docx.Run {
 		linkURL     string
 		linkAnchor  string
 		suppress    bool
+		// lockResult is set when the field instruction carries `\!` —
+		// "lock result". The cached glyphs pass through verbatim; we
+		// skip recomputation. Word uses this for content that should
+		// never auto-update (frozen page numbers in printable forms,
+		// stamped dates).
+		lockResult bool
 		formField   *docx.FormFieldInfo
 	}
 	var stack []*frame
@@ -323,6 +561,11 @@ func flattenFields(runs []docx.Run, vars fieldVars) []docx.Run {
 				f.instrFull = f.instr.String()
 				f.code, f.arg = fieldCodeAndArgs(f.instrFull)
 				f.inResult = true
+				// \! locks the cached result — skip field recomputation
+				// and let the result region's runs flow through verbatim.
+				if hasFlagSwitch(f.instrFull, "!") {
+					f.lockResult = true
+				}
 				switch f.code {
 				case "HYPERLINK":
 					target, isAnchor := hyperlinkFieldInstr(f.instrFull)
@@ -421,6 +664,11 @@ func flattenFields(runs []docx.Run, vars fieldVars) []docx.Run {
 			if f.suppress {
 				continue
 			}
+			if f.lockResult {
+				// \! locks the cached result — emit the run unchanged.
+				out = append(out, r)
+				continue
+			}
 			if value, ok := lookupFieldValueFull(f.code, f.arg, f.instrFull, vars); ok {
 				if !f.substituted {
 					// Apply \* general-format switches (Upper/Lower/
@@ -488,12 +736,42 @@ func lookupFieldValueFull(code, arg, instrFull string, vars fieldVars) (string, 
 	switch code {
 	case "PAGE":
 		if vars.page > 0 {
-			return formatPageNumber(vars.page, vars.pageFmt), true
+			s := formatPageNumber(vars.page, vars.pageFmt)
+			// `\# "0000"` (numeric picture switch) applies to PAGE/NUMPAGES
+			// too — Word lets users zero-pad page numbers in TOC contexts.
+			// Honors the doc's decimal/grouping symbols.
+			if v := numericSwitchLocale(float64(vars.page), instrFull, vars); v != "" {
+				return v, true
+			}
+			return s, true
 		}
 	case "NUMPAGES":
 		if vars.numPages > 0 {
-			return formatPageNumber(vars.numPages, vars.pageFmt), true
+			s := formatPageNumber(vars.numPages, vars.pageFmt)
+			if v := numericSwitchLocale(float64(vars.numPages), instrFull, vars); v != "" {
+				return v, true
+			}
+			return s, true
 		}
+	case "SECTIONPAGES":
+		// Total page count of the CURRENT section. Header/footer rendering
+		// populates numSectionPages per page; outside that context the
+		// field can't be resolved, so fall through to the cached result.
+		if vars.numSectionPages > 0 {
+			s := formatPageNumber(vars.numSectionPages, vars.pageFmt)
+			if v := numericSwitchLocale(float64(vars.numSectionPages), instrFull, vars); v != "" {
+				return v, true
+			}
+			return s, true
+		}
+		return "", false
+	case "SECTION":
+		// 1-based section number — typically rendered in a footer like
+		// "Section 2 of 5". Falls through to cached result when unknown.
+		if vars.section > 0 {
+			return strconv.Itoa(vars.section), true
+		}
+		return "", false
 	case "DATE":
 		if !vars.now.IsZero() {
 			return formatFieldDateTime(vars.now, instrFull, "2006-01-02"), true
@@ -607,6 +885,25 @@ func lookupFieldValueFull(code, arg, instrFull string, vars fieldVars) (string, 
 	case "REF":
 		// REF consults SET-assigned variables first, then bookmarks.
 		if arg != "" {
+			// Paragraph-number switches reach into the numbering engine.
+			// \r = relative number ("1.2.3"), \w = full paragraph number
+			// up to the cross-reference's level, \p = paragraph number
+			// only (the most specific component). We approximate via the
+			// bookmark's paragraph marker if the caller indexed it.
+			if hasFlagSwitch(instrFull, "r") || hasFlagSwitch(instrFull, "w") || hasFlagSwitch(instrFull, "p") {
+				if vars.bookmarkParaNums != nil {
+					if n, ok := vars.bookmarkParaNums[arg]; ok && n != "" {
+						if hasFlagSwitch(instrFull, "p") {
+							// "paragraph only" = last segment
+							if idx := strings.LastIndex(n, "."); idx >= 0 {
+								return n[idx+1:], true
+							}
+							return n, true
+						}
+						return n, true
+					}
+				}
+			}
 			if vars.setVars != nil {
 				if v, ok := vars.setVars[arg]; ok && v != "" {
 					return v, true
@@ -625,6 +922,9 @@ func lookupFieldValueFull(code, arg, instrFull string, vars fieldVars) (string, 
 		// the surrounding HYPERLINK or by a separate annotation, so we
 		// just emit the number here.
 		if arg != "" {
+			// \p switch on PAGEREF means "above" / "below" relative
+			// position; we don't track relative position so fall through
+			// to absolute page number for sanity.
 			if vars.bookmarkPages != nil {
 				if pg, ok := vars.bookmarkPages[arg]; ok && pg > 0 {
 					return strconv.Itoa(pg), true
@@ -690,14 +990,14 @@ func lookupFieldValueFull(code, arg, instrFull string, vars fieldVars) (string, 
 	case "DOCPROPERTY":
 		if arg != "" && vars.docProperties != nil {
 			if v, ok := vars.docProperties[arg]; ok && v != "" {
-				return v, true
+				return applyValueFormatters(v, instrFull, vars), true
 			}
 		}
 		return "", false
 	case "DOCVARIABLE":
 		if arg != "" && vars.docVars != nil {
 			if v, ok := vars.docVars[arg]; ok && v != "" {
-				return v, true
+				return applyValueFormatters(v, instrFull, vars), true
 			}
 		}
 		return "", false
@@ -714,19 +1014,24 @@ func lookupFieldValueFull(code, arg, instrFull string, vars fieldVars) (string, 
 		}
 		return "", false
 	case "MERGEFIELD":
-		// MERGEFIELD names a mail-merge column. When the caller supplied
-		// Options.MergeData, look up the value (case-insensitive). With
-		// no MergeData, fall through to the cached result so templates
-		// already pre-merged by Word render correctly.
-		if arg != "" && vars.mergeData != nil {
-			v, ok := mergeDataLookup(vars.mergeData, arg)
-			if !ok {
-				return "", false
-			}
-			pre, post := mergeFieldAffixes(instrFull)
-			return pre + v + post, true
+		// MERGEFIELD names a mail-merge column. When MergeRecords is set
+		// (catalog mode), the active record — advanced by NEXT/NEXTIF/SKIPIF
+		// — drives lookup; otherwise the implicit single-record MergeData
+		// map applies. With nothing resolvable we fall through to Word's
+		// cached result so already-merged templates render unchanged.
+		if arg == "" {
+			return "", false
 		}
-		return "", false
+		active := activeMergeRecord(vars)
+		if active == nil {
+			return "", false
+		}
+		v, ok := mergeDataLookup(active, arg)
+		if !ok {
+			return "", false
+		}
+		pre, post := mergeFieldAffixes(instrFull)
+		return pre + applyValueFormatters(v, instrFull, vars) + post, true
 	case "FORMTEXT":
 		// FORMTEXT shows the result region's content as-is — return ""
 		// + false so the result region's text streams through normally.
@@ -755,6 +1060,64 @@ func lookupFieldValueFull(code, arg, instrFull string, vars fieldVars) (string, 
 			return v, true
 		}
 		return "", false
+	case "COMPARE":
+		// COMPARE is IF without the branch texts: it just returns "1"
+		// when the comparison is true, "0" otherwise. We rewrite the
+		// instruction to an IF expression and reuse evaluateIfField.
+		// Falls through to cached on parse failure.
+		trimmed := strings.TrimSpace(instrFull)
+		if !strings.HasPrefix(strings.ToUpper(trimmed), "COMPARE") {
+			return "", false
+		}
+		rest := strings.TrimSpace(trimmed[len("COMPARE"):])
+		rewritten := "IF " + rest + ` "1" "0"`
+		if v, ok := evaluateIfField(rewritten); ok {
+			return v, true
+		}
+		return "", false
+	case "MERGEREC":
+		// Current merge record number. With no merge data we always return
+		// "1" (the implicit record); honest given we never iterate.
+		return "1", true
+	case "MERGESEQ":
+		// Same shape as MERGEREC — sequence number across the run.
+		return "1", true
+	case "NEXT":
+		// Unconditional: advance to the next merge record.
+		advanceMergeCursor(vars)
+		return "", true
+	case "NEXTIF":
+		// Evaluate the IF-style condition embedded in the instruction. The
+		// instr looks like ` NEXTIF <expr1> <op> <expr2> ` — we reuse the
+		// IF evaluator by rewriting to `IF <…> "1" "0"` and advancing on
+		// the truthy branch.
+		if evaluateMergeCondition(instrFull, "NEXTIF") {
+			advanceMergeCursor(vars)
+		}
+		return "", true
+	case "SKIPIF":
+		// SKIPIF: when the condition is true, drop the CURRENT record and
+		// move to the next. We advance the cursor and rewind output for the
+		// current record by emitting nothing here — fields already resolved
+		// upstream keep their values, but later MERGEFIELDs in this record
+		// read from the advanced cursor too. Honest within our scope:
+		// Word's record-rewind behavior isn't reproducible without a full
+		// per-record re-layout pass.
+		if evaluateMergeCondition(instrFull, "SKIPIF") {
+			advanceMergeCursor(vars)
+		}
+		return "", true
+	case "ASK", "FILLIN":
+		// Interactive prompts: the cached result region carries whatever
+		// the user typed last time, so fall through to it.
+		return "", false
+	case "DATABASE":
+		// DATABASE inlines an external query result. We never run the
+		// query; cached result is the best surface.
+		return "", false
+	case "PRINT":
+		// PRINT is a raw printer command; suppress.
+		return "", true
 	case "INCLUDETEXT":
 		// INCLUDETEXT references an external file or rel target. We can't
 		// safely read arbitrary host-filesystem paths from PDF rendering,
@@ -774,13 +1137,20 @@ func lookupFieldValueFull(code, arg, instrFull string, vars fieldVars) (string, 
 		// region (a w:drawing) already carries the image — let it through.
 		return "", false
 	case "TOC":
-		entries := vars.headings
-		// Merge TC field entries (explicit author-added TOC marks) so they
-		// appear alongside the heading-derived ones in source order.
-		// We don't try to splice by position; TC entries just get appended.
-		entries = append(entries, vars.tcEntries...)
+		sw := parseTOCSwitches(instrFull)
+		entries := filterTOCEntries(vars.headings, vars.tcEntries, sw)
+		// Resolve page numbers from the bookmark→page map populated by
+		// the dry layout pass. Filled in-place onto the entry copies so
+		// formatTOCWithSwitches sees them.
+		for i := range entries {
+			if entries[i].PageNum == 0 && entries[i].Bookmark != "" && vars.bookmarkPages != nil {
+				if pg, ok := vars.bookmarkPages[entries[i].Bookmark]; ok {
+					entries[i].PageNum = pg
+				}
+			}
+		}
 		if len(entries) > 0 {
-			return formatTOC(entries), true
+			return formatTOCWithSwitches(entries, sw), true
 		}
 		return "", false
 	case "INDEX":
@@ -807,12 +1177,41 @@ func lookupFieldValueFull(code, arg, instrFull string, vars fieldVars) (string, 
 			return v, true
 		}
 		return "", false
-	case "ADDRESSBLOCK", "GREETINGLINE", "MACROBUTTON", "AUTOTEXTLIST":
-		// Mail-merge / interactive elements with cached display text.
+	case "MACROBUTTON":
+		// Syntax: MACROBUTTON MacroName Display Text
+		// We can't run the macro, but the display text after the macro
+		// name is what Word actually paints. Strip the macro name token.
+		toks := tokenizeFieldArgs(arg)
+		if len(toks) >= 2 {
+			return strings.Join(toks[1:], " "), true
+		}
+		return "", false
+	case "AUTOTEXTLIST":
+		// Syntax: AUTOTEXTLIST "Initial text" \s "style" \t "tip"
+		// The initial text is rendered as the visible placeholder
+		// when the list isn't expanded. Pull the first quoted token.
+		toks := tokenizeFieldArgs(arg)
+		if len(toks) > 0 && toks[0] != "" && !strings.HasPrefix(toks[0], "\\") {
+			return strings.Trim(toks[0], "\""), true
+		}
+		return "", false
+	case "ADDRESSBLOCK", "GREETINGLINE":
+		// Mail-merge composite fields with cached display text. We don't
+		// run the merge so we let the result region show through.
 		return "", false
 	case "EQ":
-		// Legacy equation field — Word stores the typeset glyphs in the
-		// result region. Let those through.
+		// Legacy Word 6 equation field. The instruction encodes a
+		// formula with backslash-prefixed builders:
+		//   \f(num, den)        — fraction
+		//   \r(n, x) / \r(x)    — nth root / square root
+		//   \s\up(x) / \s\do(x) — super / subscript
+		//   \i(lo, hi, expr)    — integral
+		//   \b(\bc\[(expr))     — bracketed expression
+		// We collapse the most common forms to a readable Unicode
+		// string; Word's full EQ grammar is out of scope.
+		if expanded := expandEQField(arg); expanded != "" {
+			return expanded, true
+		}
 		return "", false
 	case "HYPERLINK":
 		return "", false
@@ -932,6 +1331,60 @@ func parseSymbolCodePointWithSwitches(arg, instrFull string) (rune, bool) {
 		return r, true
 	}
 	return parseSymbolCodePoint(arg)
+}
+
+// activeMergeRecord returns the record that MERGEFIELDs should consult,
+// honoring the catalog cursor when MergeRecords is set. Returns nil when
+// there's no merge data at all.
+func activeMergeRecord(vars fieldVars) map[string]string {
+	if len(vars.mergeRecords) > 0 {
+		idx := 0
+		if vars.mergeState != nil {
+			idx = vars.mergeState.Idx
+		}
+		if idx >= len(vars.mergeRecords) {
+			// Past the end: clamp to last record rather than returning nil,
+			// which would otherwise resurface every later MERGEFIELD as
+			// "unresolved" and reveal the cached Word value (jarring after
+			// the catalog rendered fine for the first N records).
+			idx = len(vars.mergeRecords) - 1
+		}
+		return vars.mergeRecords[idx]
+	}
+	return vars.mergeData
+}
+
+// advanceMergeCursor bumps the catalog mail-merge index by one. Clamps at
+// len(mergeRecords) so we don't blow past the array on a stray NEXT.
+func advanceMergeCursor(vars fieldVars) {
+	if vars.mergeState == nil || len(vars.mergeRecords) == 0 {
+		return
+	}
+	if vars.mergeState.Idx+1 < len(vars.mergeRecords) {
+		vars.mergeState.Idx++
+	}
+}
+
+// evaluateMergeCondition rewrites a NEXTIF/SKIPIF instruction into the
+// equivalent IF body and consults evaluateIfField. Substitutes
+// {MERGEFIELD x} placeholders against the active record so authors can
+// write `NEXTIF «State» = "CA"` and have it work.
+func evaluateMergeCondition(instrFull, keyword string) bool {
+	trimmed := strings.TrimSpace(instrFull)
+	upper := strings.ToUpper(trimmed)
+	if !strings.HasPrefix(upper, keyword) {
+		return false
+	}
+	rest := strings.TrimSpace(trimmed[len(keyword):])
+	if rest == "" {
+		return false
+	}
+	rewritten := "IF " + rest + ` "1" "0"`
+	v, ok := evaluateIfField(rewritten)
+	if !ok {
+		return false
+	}
+	return v == "1"
 }
 
 // mergeDataLookup does a case-insensitive lookup on a string map.
@@ -1079,8 +1532,9 @@ func buildDocProperties(doc *docx.Document) map[string]string {
 	return out
 }
 
-// collectHeadings flattens the document body into a list of {level, text}
-// entries for TOC synthesis.
+// collectHeadings flattens the document body into a list of {level, text,
+// style} entries for TOC synthesis. The Style field carries the paragraph
+// style ID so the TOC `\t` switch can filter by it.
 func collectHeadings(doc *docx.Document) []tocEntry {
 	var out []tocEntry
 	var walk func(blocks []docx.Block)
@@ -1092,7 +1546,12 @@ func collectHeadings(doc *docx.Document) []tocEntry {
 				if lvl > 0 {
 					txt := paragraphPlainText(v)
 					if txt != "" {
-						out = append(out, tocEntry{Level: lvl, Text: txt})
+						out = append(out, tocEntry{
+							Level:    lvl,
+							Text:     txt,
+							Style:    v.StyleID,
+							Bookmark: firstHeadingBookmark(v),
+						})
 					}
 				}
 			case docx.Table:
@@ -1110,6 +1569,55 @@ func collectHeadings(doc *docx.Document) []tocEntry {
 		}
 	} else {
 		walk(doc.Body)
+	}
+	return out
+}
+
+// filterTOCEntries applies a TOC field's switches to a heading + TC list:
+//   - `\o N-M` restricts entries to outline levels in that range.
+//   - `\t "Style,N,..."` adds entries from author-named styles. When `\t`
+//     is given WITHOUT `\u`, default Heading-1..9 entries are suppressed
+//     unless they overlap the style map. When BOTH `\t` and `\u` are
+//     given, the union is taken (Word's behavior).
+//   - `\u` keeps entries whose paragraphs have an explicit outlineLvl.
+//     Our headings list already includes those since headingLevel honors
+//     OutlineLvl; `\u` therefore is a no-op extension for our model
+//     beyond suppressing the implicit Title rule.
+//   - `\f SEQID` restricts TC entries to a single SEQ stream.
+//   - `\b name` filters to entries whose Bookmark falls inside the named
+//     bookmark range — not modelled here (we lack bookmark span info);
+//     entries pass through.
+func filterTOCEntries(headings, tcs []tocEntry, sw tocSwitches) []tocEntry {
+	combined := make([]tocEntry, 0, len(headings)+len(tcs))
+	combined = append(combined, headings...)
+	combined = append(combined, tcs...)
+	if !sw.UseStyleMap && sw.MinLvl == 0 && sw.MaxLvl == 0 && sw.SeqName == "" {
+		return combined
+	}
+	out := make([]tocEntry, 0, len(combined))
+	minL := sw.MinLvl
+	maxL := sw.MaxLvl
+	if minL == 0 && maxL == 0 {
+		minL, maxL = 1, 9
+	}
+	for _, e := range combined {
+		level := e.Level
+		if sw.UseStyleMap {
+			key := strings.ToLower(strings.ReplaceAll(e.Style, " ", ""))
+			if lv, ok := sw.StyleMap[key]; ok {
+				level = lv
+			} else if !sw.UseOutline {
+				continue
+			}
+		}
+		if level < minL || level > maxL {
+			continue
+		}
+		if sw.SeqName != "" && e.Seq != "" && !strings.EqualFold(e.Seq, sw.SeqName) {
+			continue
+		}
+		e.Level = level
+		out = append(out, e)
 	}
 	return out
 }
@@ -1208,6 +1716,26 @@ func headingLevel(p docx.Paragraph, doc *docx.Document) int {
 	return 0
 }
 
+// firstHeadingBookmark picks the first `_Toc...`-style anchor on a
+// heading paragraph. Word inserts these implicitly when the user adds the
+// heading to a TOC; falling back to ANY bookmark on the paragraph keeps
+// us useful for hand-authored docs that bookmarked headings manually.
+func firstHeadingBookmark(p docx.Paragraph) string {
+	var fallback string
+	for _, r := range p.Runs {
+		if r.Bookmark == "" {
+			continue
+		}
+		if strings.HasPrefix(r.Bookmark, "_Toc") {
+			return r.Bookmark
+		}
+		if fallback == "" {
+			fallback = r.Bookmark
+		}
+	}
+	return fallback
+}
+
 // paragraphPlainText collapses runs into a single string for TOC entries.
 func paragraphPlainText(p docx.Paragraph) string {
 	var b strings.Builder
@@ -1224,13 +1752,35 @@ func paragraphPlainText(p docx.Paragraph) string {
 	return strings.TrimSpace(b.String())
 }
 
-// formatTOC renders a multi-line TOC from the heading list. Each line is
-// indented by the heading level and padded with a dot-leader filler so
-// the output reads like a real Word TOC even before Word re-cooks it.
-// When vars.bookmarkPages knows where each heading landed we suffix the
-// page number; otherwise the trailing column is omitted.
+// formatTOC renders a multi-line TOC from the heading list using default
+// switches (matches Word's bare `{ TOC }`).
 func formatTOC(entries []tocEntry) string {
+	return formatTOCWithSwitches(entries, tocSwitches{})
+}
+
+// formatTOCWithSwitches renders the TOC, honoring \n / \d / \p switches:
+//   - sw.HidePageNums: suppress the trailing page column.
+//   - sw.HideMinLvl..HideMaxLvl: suppress the page column only for those
+//     levels (other levels render with the page).
+//   - sw.Separator: replace the dot-leader with the literal separator.
+//     `\d " — "` produces `Heading — 12`.
+//   - sw.TabLeader: replace dots with another single character.
+//
+// The visible width target is 60 columns — purely cosmetic for plain-text
+// dumps; the surrounding text layout pass will rewrap and re-leader.
+func formatTOCWithSwitches(entries []tocEntry, sw tocSwitches) string {
 	const lineWidth = 60
+	leader := byte('.')
+	if sw.TabLeader != "" {
+		// First rune only — the TabLeader pattern is documented as one
+		// char in OOXML.
+		for _, r := range sw.TabLeader {
+			if r >= 32 && r < 127 {
+				leader = byte(r)
+			}
+			break
+		}
+	}
 	var b strings.Builder
 	for i, e := range entries {
 		if i > 0 {
@@ -1240,26 +1790,43 @@ func formatTOC(entries []tocEntry) string {
 		if depth < 0 {
 			depth = 0
 		}
-		indent := ""
-		for j := 0; j < depth; j++ {
-			indent += "  "
-		}
+		indent := strings.Repeat("  ", depth)
 		title := strings.TrimSpace(e.Text)
 		body := indent + title
-		// Pad with dot leaders to lineWidth columns. Each character is one
-		// "column" — purely visual; the actual layout is up to the renderer
-		// but this gives a recognizable TOC look in plain text dumps and
-		// reflows tolerably when re-wrapped at narrower widths.
-		if r := lineWidth - len(body); r > 4 {
-			b.WriteString(body)
-			b.WriteByte(' ')
-			for k := 0; k < r-2; k++ {
-				b.WriteByte('.')
-			}
-			b.WriteByte(' ')
-		} else {
-			b.WriteString(body)
+		showPage := !sw.HidePageNums && e.PageNum > 0
+		if sw.HideMaxLvl > 0 && e.Level >= sw.HideMinLvl && e.Level <= sw.HideMaxLvl {
+			showPage = false
 		}
+		if !showPage {
+			b.WriteString(body)
+			continue
+		}
+		pageStr := strconv.Itoa(e.PageNum)
+		if sw.Separator != "" {
+			// `\d "sep"` overrides the dot leader entirely.
+			b.WriteString(body)
+			b.WriteString(sw.Separator)
+			b.WriteString(pageStr)
+			continue
+		}
+		// Default: pad with leader chars between title and page number,
+		// targeting lineWidth total columns.
+		minGap := 4
+		used := len(body) + len(pageStr)
+		if used+minGap > lineWidth {
+			b.WriteString(body)
+			b.WriteByte(' ')
+			b.WriteString(pageStr)
+			continue
+		}
+		gap := lineWidth - used - 2
+		b.WriteString(body)
+		b.WriteByte(' ')
+		for k := 0; k < gap; k++ {
+			b.WriteByte(leader)
+		}
+		b.WriteByte(' ')
+		b.WriteString(pageStr)
 	}
 	return b.String()
 }
@@ -1558,6 +2125,33 @@ func applyWordDateLayout(t time.Time, layout string) string {
 			}
 			return "pm"
 		}()},
+		// Word also accepts mixed-case variants like "A/P", "a/p", and
+		// the implicit "AMPM" / "ampm" without separators. We map them
+		// onto the canonical pair.
+		{"AMPM", func() string {
+			if hour < 12 {
+				return "AM"
+			}
+			return "PM"
+		}()},
+		{"ampm", func() string {
+			if hour < 12 {
+				return "am"
+			}
+			return "pm"
+		}()},
+		{"A/P", func() string {
+			if hour < 12 {
+				return "A"
+			}
+			return "P"
+		}()},
+		{"a/p", func() string {
+			if hour < 12 {
+				return "a"
+			}
+			return "p"
+		}()},
 		{"tt", func() string {
 			if hour < 12 {
 				return "am"
@@ -1567,8 +2161,34 @@ func applyWordDateLayout(t time.Time, layout string) string {
 	}
 	// We need to consume tokens left-to-right with longest-first matching,
 	// so a single sweep with prioritized comparison.
+	//
+	// Single-quote escaping: per Word's date picture-switch spec, text
+	// inside paired single quotes is emitted literally. `'d'` produces the
+	// letter d, not the day-of-month. A doubled single-quote `''` inside
+	// the quoted region emits one literal single quote. Outside the spec
+	// for stray opens we tolerate the bare character.
 	var b strings.Builder
 	for i := 0; i < len(layout); {
+		if layout[i] == '\'' {
+			// Walk to the matching closing quote, copying contents literally.
+			i++
+			for i < len(layout) {
+				if layout[i] == '\'' {
+					// Doubled? Emit one apostrophe and continue inside the
+					// quoted region; single? Stop, exit literal mode.
+					if i+1 < len(layout) && layout[i+1] == '\'' {
+						b.WriteByte('\'')
+						i += 2
+						continue
+					}
+					i++ // consume closer
+					break
+				}
+				b.WriteByte(layout[i])
+				i++
+			}
+			continue
+		}
 		matched := false
 		for _, tk := range tokens {
 			if strings.HasPrefix(layout[i:], tk.tok) {
@@ -1589,7 +2209,7 @@ func applyWordDateLayout(t time.Time, layout string) string {
 // formatNumericValue applies a `\# "format"` switch to v. Returns the
 // decimal string when no switch is present.
 func formatNumericValue(v float64, instrFull string) string {
-	if s := formatNumericSwitch(v, instrFull); s != "" {
+	if s := formatNumericSwitchSep(v, instrFull, ".", ","); s != "" {
 		return s
 	}
 	if v == float64(int64(v)) {
@@ -1598,19 +2218,66 @@ func formatNumericValue(v float64, instrFull string) string {
 	return strconv.FormatFloat(v, 'f', -1, 64)
 }
 
-// formatNumericSwitch implements Word's `\#` numeric picture-format
+// formatNumericValueWith is like formatNumericValue but honors a
+// locale-specific decimal symbol and thousands grouping separator.
+func formatNumericValueWith(v float64, instrFull, decSym, grpSep string) string {
+	if decSym == "" {
+		decSym = "."
+	}
+	if grpSep == "" {
+		grpSep = ","
+	}
+	if s := formatNumericSwitchSep(v, instrFull, decSym, grpSep); s != "" {
+		return s
+	}
+	if v == float64(int64(v)) {
+		return strconv.FormatInt(int64(v), 10)
+	}
+	out := strconv.FormatFloat(v, 'f', -1, 64)
+	if decSym != "." {
+		out = strings.Replace(out, ".", decSym, 1)
+	}
+	return out
+}
+
+// formatNumericSwitch is the default-locale wrapper. Most call sites use
+// "." / "," so we keep this signature stable.
+func formatNumericSwitch(v float64, instrFull string) string {
+	return formatNumericSwitchSep(v, instrFull, ".", ",")
+}
+
+// numericSwitchLocale is the doc-locale variant: it consults
+// settings.xml's w:decimalSymbol / w:listSeparator (carried on vars)
+// instead of the hardcoded "." / "," fallback. Empty on no `\#`.
+func numericSwitchLocale(v float64, instrFull string, vars fieldVars) string {
+	decSym := vars.decimalSymbol
+	if decSym == "" {
+		decSym = "."
+	}
+	grpSep := vars.listSeparator
+	if grpSep == "" {
+		grpSep = ","
+	}
+	return formatNumericSwitchSep(v, instrFull, decSym, grpSep)
+}
+
+// formatNumericSwitchSep implements Word's `\#` numeric picture-format
 // switch. Recognized format chars: '0' = digit required, '#' = digit
 // optional, '.' = decimal separator, ',' = thousands separator,
+// 'x' = drop digits to the right of this position (truncate-then-round),
 // '%' = percent (value gets multiplied by 100 before formatting).
 // Any other characters before / after the numeric block (or between
 // thousands and decimal) are kept as literal prefix / suffix so
 // currency symbols like '$' and unit suffixes pass through.
 //
-// A semicolon splits the picture into positive ; negative sub-formats
-// (e.g. `0.00;(0.00)` shows negative values in parens).
+// A semicolon splits the picture into positive ; negative ; zero
+// sub-formats (e.g. `0.00;(0.00);-` shows negatives in parens, zero as
+// a dash).
 //
+// decSym / grpSep are the locale-specific decimal point and thousands
+// separator the OUTPUT uses; the PICTURE always uses "." and ",".
 // Returns "" when no `\#` switch is present.
-func formatNumericSwitch(v float64, instrFull string) string {
+func formatNumericSwitchSep(v float64, instrFull, decSym, grpSep string) string {
 	i := strings.Index(instrFull, `\#`)
 	if i < 0 {
 		return ""
@@ -1635,71 +2302,182 @@ func formatNumericSwitch(v float64, instrFull string) string {
 	if picture == "" {
 		return ""
 	}
-	// Word allows a single-quote escape around literal chars
-	// ("\# '$'#,##0"). Strip the quotes — the contents stay literal
-	// in the picture.
-	picture = strings.ReplaceAll(picture, "'", "")
-	posPic, negPic, hasNeg := strings.Cut(picture, ";")
-	chosen := posPic
-	negative := v < 0
+	// Word allows single-quote escapes around literal chars to keep them
+	// out of the numeric block ("\# '$'#,##0"). We resolve quotes to a
+	// sentinel byte so subsequent format-rune scanning ignores them,
+	// then restore them as literals at the end.
+	picture = unescapeNumericPicture(picture)
+	posPic, negPic, zeroPic, hasNeg, hasZero := splitNumericPicture(picture)
 	abs := v
+	negative := v < 0
 	if negative {
 		abs = -v
-		if hasNeg && negPic != "" {
-			chosen = negPic
-			// The negative format already encodes the sign, so suppress
-			// the implicit leading minus when applying it.
-			return applyNumericPicture(abs, chosen, false)
-		}
 	}
-	out := applyNumericPicture(abs, chosen, negative)
-	return out
+	if hasZero && v == 0 {
+		return applyNumericPicture(0, zeroPic, false, decSym, grpSep)
+	}
+	if negative && hasNeg && negPic != "" {
+		// Negative format already encodes the sign — suppress the implicit
+		// leading minus.
+		return applyNumericPicture(abs, negPic, false, decSym, grpSep)
+	}
+	chosen := posPic
+	return applyNumericPicture(abs, chosen, negative, decSym, grpSep)
+}
+
+// splitNumericPicture decomposes a `\#` picture into the three Word
+// sub-pictures (positive ; negative ; zero) separated by un-escaped
+// semicolons. Quoted segments don't terminate sub-pictures.
+func splitNumericPicture(picture string) (pos, neg, zero string, hasNeg, hasZero bool) {
+	parts := []string{}
+	cur := strings.Builder{}
+	inQ := false
+	for i := 0; i < len(picture); i++ {
+		c := picture[i]
+		if c == '\x01' { // sentinel: previously a quote
+			inQ = !inQ
+			cur.WriteByte(c)
+			continue
+		}
+		if c == ';' && !inQ {
+			parts = append(parts, cur.String())
+			cur.Reset()
+			continue
+		}
+		cur.WriteByte(c)
+	}
+	parts = append(parts, cur.String())
+	pos = parts[0]
+	if len(parts) > 1 {
+		neg = parts[1]
+		hasNeg = true
+	}
+	if len(parts) > 2 {
+		zero = parts[2]
+		hasZero = true
+	}
+	return
+}
+
+// unescapeNumericPicture replaces every "'" with a sentinel \x01 so the
+// format scanner can skip quoted literals. The applyNumericPicture stage
+// turns the sentinel pair back into the verbatim quoted content.
+func unescapeNumericPicture(s string) string {
+	return strings.ReplaceAll(s, "'", "\x01")
 }
 
 // applyNumericPicture renders v into picture, treating non-format runes
 // as literal text. addMinus prepends a '-' to the numeric block when
 // the caller hasn't already supplied a negative sub-format.
-func applyNumericPicture(v float64, picture string, addMinus bool) string {
+//
+// decSym / grpSep are the runtime decimal point and thousands separator.
+// Format chars in `picture` are still '.' / ',' — the substitution
+// happens at output time.
+//
+// Recognized format chars inside the numeric block:
+//
+//	0  required digit
+//	#  optional digit
+//	.  decimal point
+//	,  thousands grouping
+//	x  drop / round at this fractional position
+//	+  prepend '+' on positive, '-' on negative
+//	-  prepend ' ' on positive, '-' on negative
+//	%  percent (value *= 100)
+func applyNumericPicture(v float64, picture string, addMinus bool, decSym, grpSep string) string {
 	if picture == "" {
 		return ""
+	}
+	if decSym == "" {
+		decSym = "."
+	}
+	if grpSep == "" {
+		grpSep = ","
 	}
 	if strings.Contains(picture, "%") {
 		v *= 100
 	}
-	// Find the numeric block (first run of [0#.,]).
+	// Find the numeric block (first run of [0#.,x] outside quoted regions).
 	start := -1
 	end := -1
 	for i := 0; i < len(picture); i++ {
 		c := picture[i]
-		if c == '0' || c == '#' || c == '.' || c == ',' {
+		if c == '\x01' { // skip the sentinel pair (literal block boundary)
+			if start >= 0 {
+				break
+			}
+			continue
+		}
+		if c == '0' || c == '#' || c == '.' || c == ',' || c == 'x' {
 			if start < 0 {
 				start = i
 			}
 			end = i + 1
 		} else if start >= 0 {
-			// Allow commas/decimal already covered; any other char
-			// after the block closes it.
 			break
 		}
 	}
 	if start < 0 {
-		// No format chars at all — return the picture unchanged.
-		return picture
+		return restoreLiteralSentinel(picture)
 	}
 	prefix := picture[:start]
 	suffix := picture[end:]
 	numPic := picture[start:end]
 
+	// Detect sign-prefix tokens in the literal prefix.
+	signMode := "" // "", "+", "-"
+	for i := len(prefix) - 1; i >= 0; i-- {
+		c := prefix[i]
+		if c == '+' {
+			signMode = "+"
+			prefix = prefix[:i] + prefix[i+1:]
+			break
+		}
+		if c == '-' && i+1 == len(prefix) {
+			// Trailing '-' in the prefix is the Word sign-control marker;
+			// '-' elsewhere is a literal (rendered later).
+			signMode = "-"
+			prefix = prefix[:i]
+			break
+		}
+		if c != ' ' && c != '\t' && c != '\x01' {
+			break
+		}
+	}
+
 	intPart, fracPart, hasFrac := strings.Cut(numPic, ".")
 	intDigitsNeeded := strings.Count(intPart, "0")
+	// 'x' in the fractional part drops everything after it (Word rounds
+	// at that position). 'x' in the integer part rounds away the LOW
+	// digit (we approximate as "round to nearest 10^k").
 	fracDigits := strings.Count(fracPart, "0") + strings.Count(fracPart, "#")
+	fracDrop := strings.IndexByte(fracPart, 'x')
+	if fracDrop >= 0 {
+		fracDigits = fracDrop
+		fracPart = fracPart[:fracDrop]
+	}
+	intDrop := strings.LastIndexByte(intPart, 'x')
+	if intDrop >= 0 {
+		// Number of zeroes to round to.
+		zeroes := len(intPart) - intDrop - 1
+		mul := 1.0
+		for i := 0; i < zeroes; i++ {
+			mul *= 10
+		}
+		if mul > 0 {
+			v = float64(int64(v/mul+0.5)) * mul
+		}
+		// Strip the 'x' run; downstream code treats the rest as digit spec.
+		intPart = strings.ReplaceAll(intPart, "x", "0")
+	}
+
 	if fracDigits > 0 {
 		mul := 1.0
 		for i := 0; i < fracDigits; i++ {
 			mul *= 10
 		}
 		v = float64(int64(v*mul+0.5)) / mul
-	} else {
+	} else if !hasFrac {
 		v = float64(int64(v + 0.5))
 	}
 	intVal := int64(v)
@@ -1712,7 +2490,7 @@ func applyNumericPicture(v float64, picture string, addMinus bool) string {
 		n := len(intStr)
 		for i, c := range intStr {
 			if i > 0 && (n-i)%3 == 0 {
-				b.WriteByte(',')
+				b.WriteString(grpSep)
 			}
 			b.WriteRune(c)
 		}
@@ -1720,17 +2498,23 @@ func applyNumericPicture(v float64, picture string, addMinus bool) string {
 	}
 	numStr := intStr
 	if hasFrac && fracDigits > 0 {
+		// Render via FormatFloat to dodge per-digit float imprecision: ask
+		// for exactly fracDigits decimal places, then peel them off the
+		// rendered string.
+		rendered := strconv.FormatFloat(v, 'f', fracDigits, 64)
+		dotAt := strings.IndexByte(rendered, '.')
 		fracStr := ""
-		fracVal := v - float64(intVal)
-		for i := 0; i < fracDigits; i++ {
-			fracVal *= 10
-			d := int(fracVal)
-			if d > 9 {
-				d = 9
-			}
-			fracStr += strconv.Itoa(d)
-			fracVal -= float64(d)
+		if dotAt >= 0 {
+			fracStr = rendered[dotAt+1:]
 		}
+		for len(fracStr) < fracDigits {
+			fracStr += "0"
+		}
+		if len(fracStr) > fracDigits {
+			fracStr = fracStr[:fracDigits]
+		}
+		// Trim '#' positions where the digit happens to be 0 (Word treats
+		// them as optional).
 		for i := len(fracStr) - 1; i >= 0; i-- {
 			if i >= len(fracPart) {
 				break
@@ -1742,13 +2526,197 @@ func applyNumericPicture(v float64, picture string, addMinus bool) string {
 			break
 		}
 		if fracStr != "" {
-			numStr += "." + fracStr
+			numStr += decSym + fracStr
 		}
 	}
-	if addMinus {
-		numStr = "-" + numStr
+	// Apply sign-prefix logic.
+	switch signMode {
+	case "+":
+		if addMinus {
+			numStr = "-" + numStr
+		} else {
+			numStr = "+" + numStr
+		}
+	case "-":
+		if addMinus {
+			numStr = "-" + numStr
+		} else {
+			numStr = " " + numStr
+		}
+	default:
+		if addMinus {
+			numStr = "-" + numStr
+		}
 	}
-	return prefix + numStr + suffix
+	return restoreLiteralSentinel(prefix + numStr + suffix)
+}
+
+// restoreLiteralSentinel turns the \x01 quote markers back into a no-op
+// (the quoted content survives as-is; quotes themselves are stripped
+// per Word's behavior).
+func restoreLiteralSentinel(s string) string {
+	if !strings.ContainsRune(s, '\x01') {
+		return s
+	}
+	return strings.ReplaceAll(s, "\x01", "")
+}
+
+// applyValueFormatters applies the `\@` (date) and `\#` (numeric) switches
+// to a text value coming from MERGEFIELD / DOCPROPERTY / DOCVARIABLE.
+// When neither switch is present the value passes through unchanged.
+// Uses NumberExtractor to peel currency / unit decorations off the raw
+// string before re-formatting.
+func applyValueFormatters(value, instrFull string, vars fieldVars) string {
+	if strings.Contains(instrFull, `\#`) {
+		if n, frac, ok := extractNumber(value); ok {
+			decSym := vars.decimalSymbol
+			if decSym == "" {
+				decSym = "."
+			}
+			grpSep := vars.listSeparator
+			if grpSep == "" {
+				grpSep = ","
+			}
+			if formatted := formatNumericSwitchSep(n+frac, instrFull, decSym, grpSep); formatted != "" {
+				return formatted
+			}
+		}
+	}
+	if strings.Contains(instrFull, `\@`) {
+		if t, ok := parseFlexibleDate(value); ok {
+			return formatFieldDateTime(t, instrFull, "2006-01-02")
+		}
+	}
+	return value
+}
+
+// extractNumber peels a numeric value out of a free-text string. It tolerates
+// currency symbols, unit suffixes, parens for negatives, and both "1,234.56"
+// and "1.234,56" grouping conventions. Returns ok=false when the string
+// contains no obvious number.
+func extractNumber(s string) (intPart float64, fracPart float64, ok bool) {
+	if s == "" {
+		return 0, 0, false
+	}
+	negative := false
+	if strings.HasPrefix(s, "(") && strings.HasSuffix(s, ")") {
+		negative = true
+		s = s[1 : len(s)-1]
+	}
+	// Walk left → right collecting the first digit run + intervening
+	// punctuation. The first non-digit-non-sep run AFTER the digits
+	// terminates the number.
+	var b strings.Builder
+	started := false
+	sawDot := false
+	sawComma := false
+	for _, r := range s {
+		if r == '-' && !started {
+			negative = true
+			continue
+		}
+		if r == '+' && !started {
+			continue
+		}
+		if r >= '0' && r <= '9' {
+			b.WriteRune(r)
+			started = true
+			continue
+		}
+		if r == '.' || r == ',' || r == ' ' || r == '\u00a0' /* NBSP */ {
+			if !started {
+				continue
+			}
+			if r == '.' {
+				sawDot = true
+				b.WriteRune('.')
+			} else if r == ',' {
+				sawComma = true
+				b.WriteRune(',')
+			} else {
+				continue // ignore spaces inside numbers
+			}
+			continue
+		}
+		if started {
+			break
+		}
+	}
+	raw := b.String()
+	if raw == "" {
+		return 0, 0, false
+	}
+	// Decide which symbol is the decimal point. Heuristic: if BOTH appear,
+	// the LAST one is the decimal point (matches "1.234,56" and
+	// "1,234.56"). If only one appears AND it's followed by exactly 3
+	// digits AND not at the very end, treat it as a grouping separator.
+	last := strings.LastIndexAny(raw, ".,")
+	dec := '.'
+	if sawDot && sawComma {
+		dec = rune(raw[last])
+	} else if sawComma && !sawDot {
+		// Single "," — could be either; default to thousands when followed
+		// by exactly 3 digits.
+		if last >= 0 && len(raw)-last-1 == 3 {
+			dec = '?' // no decimal; treat all separators as grouping
+		} else {
+			dec = ','
+		}
+	}
+	cleaned := strings.Builder{}
+	for i, c := range raw {
+		if c == '.' || c == ',' {
+			if rune(c) == dec && i == last {
+				cleaned.WriteByte('.')
+			}
+			// else: grouping char, drop it
+			continue
+		}
+		cleaned.WriteRune(c)
+	}
+	out := cleaned.String()
+	if out == "" {
+		return 0, 0, false
+	}
+	if v, err := strconv.ParseFloat(out, 64); err == nil {
+		if negative {
+			v = -v
+		}
+		// Split into integer and fractional pieces so the caller can pass
+		// the sum back into the picture formatter (which expects a single
+		// float). The split exists only because the API is friendlier
+		// that way — both halves are summed at call-site.
+		return v, 0, true
+	}
+	return 0, 0, false
+}
+
+// parseFlexibleDate handles the date-shaped strings that DOCPROPERTY /
+// MERGEFIELD typically carry: ISO-8601, RFC-3339, "YYYY/MM/DD", and the
+// docProps/core.xml epoch form. Returns ok=false when nothing parses.
+func parseFlexibleDate(s string) (time.Time, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Time{}, false
+	}
+	layouts := []string{
+		time.RFC3339,
+		"2006-01-02T15:04:05Z",
+		"2006-01-02T15:04:05",
+		"2006-01-02 15:04:05",
+		"2006-01-02",
+		"2006/01/02",
+		"01/02/2006",
+		"02/01/2006",
+		"Jan 2 2006",
+		"Jan 02, 2006",
+	}
+	for _, l := range layouts {
+		if t, err := time.Parse(l, s); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
 }
 
 // initialsOf extracts a 2-3 letter initials string from a full name.
@@ -1869,4 +2837,111 @@ func ifCompare(left, op, right string) bool {
 		return l >= r
 	}
 	return false
+}
+
+// expandEQField turns a Word 6-style equation field instruction into a
+// readable Unicode text approximation. The full EQ grammar is rich
+// (\a arrays, \o overstrike, \b bracket modifiers, …); we recognize
+// the four constructs that account for ~95% of real-world EQ usage
+// and fall through to the raw text otherwise. Used as a fallback path
+// for documents that ship EQ fields without a cached result region
+// (e.g. programmatically generated reports).
+func expandEQField(arg string) string {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return ""
+	}
+	// \f(num,den) — horizontal fraction "num/den".
+	if i := strings.Index(arg, `\f(`); i >= 0 {
+		body := matchParen(arg[i+len(`\f(`):])
+		parts := splitTopLevelCommas(body)
+		if len(parts) == 2 {
+			return expandEQField(parts[0]) + "/" + expandEQField(parts[1])
+		}
+	}
+	// \r(deg,base) or \r(base) — radical.
+	if i := strings.Index(arg, `\r(`); i >= 0 {
+		body := matchParen(arg[i+len(`\r(`):])
+		parts := splitTopLevelCommas(body)
+		switch len(parts) {
+		case 1:
+			return "√(" + expandEQField(parts[0]) + ")"
+		case 2:
+			return expandEQField(parts[0]) + "√(" + expandEQField(parts[1]) + ")"
+		}
+	}
+	// \i(lo,hi,expr) — integral with limits.
+	if i := strings.Index(arg, `\i(`); i >= 0 {
+		body := matchParen(arg[i+len(`\i(`):])
+		parts := splitTopLevelCommas(body)
+		if len(parts) == 3 {
+			return "∫_" + expandEQField(parts[0]) + "^" + expandEQField(parts[1]) + " " + expandEQField(parts[2])
+		}
+	}
+	// \s\up(...) / \s\do(...) — superscript / subscript.
+	if i := strings.Index(arg, `\s\up`); i >= 0 {
+		j := strings.IndexByte(arg[i+len(`\s\up`):], '(')
+		if j >= 0 {
+			body := matchParen(arg[i+len(`\s\up`)+j+1:])
+			return "^(" + expandEQField(body) + ")"
+		}
+	}
+	if i := strings.Index(arg, `\s\do`); i >= 0 {
+		j := strings.IndexByte(arg[i+len(`\s\do`):], '(')
+		if j >= 0 {
+			body := matchParen(arg[i+len(`\s\do`)+j+1:])
+			return "_(" + expandEQField(body) + ")"
+		}
+	}
+	// \b(expr) — bracketed expression. Renders as parentheses; the
+	// bracket-type switches (\bc, \lc, \rc) are ignored for the
+	// text-only approximation.
+	if i := strings.Index(arg, `\b(`); i >= 0 {
+		body := matchParen(arg[i+len(`\b(`):])
+		return "(" + expandEQField(body) + ")"
+	}
+	return arg
+}
+
+// matchParen returns the substring up to the matching close-paren,
+// tracking nesting. The opening "(" is expected to have already been
+// consumed by the caller.
+func matchParen(s string) string {
+	depth := 1
+	for i, r := range s {
+		switch r {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return s[:i]
+			}
+		}
+	}
+	return s
+}
+
+// splitTopLevelCommas splits on commas that aren't inside parentheses,
+// because EQ's nested forms (e.g. \f(1, \f(2,3))) have commas at every
+// depth and only the outermost level matters.
+func splitTopLevelCommas(s string) []string {
+	var out []string
+	depth := 0
+	last := 0
+	for i, r := range s {
+		switch r {
+		case '(':
+			depth++
+		case ')':
+			depth--
+		case ',':
+			if depth == 0 {
+				out = append(out, strings.TrimSpace(s[last:i]))
+				last = i + 1
+			}
+		}
+	}
+	out = append(out, strings.TrimSpace(s[last:]))
+	return out
 }

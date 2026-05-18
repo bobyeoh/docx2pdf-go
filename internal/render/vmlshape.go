@@ -118,6 +118,12 @@ func drawVMLShape(r *renderer, s *docx.VMLShape, x, y, w, h float64) {
 		drawShapeOval(r, left, top, right, bottom, hasFill, hasStroke)
 	case "line":
 		r.pdf.Line(left, top, right, bottom)
+		// Arrow heads at start (a:headEnd) and end (a:tailEnd) of the
+		// line. Both default to "none". The head sits at (left, top) and
+		// the tail at (right, bottom) — matching the order shape.WidthPt /
+		// HeightPt declared in the source.
+		drawLineArrowHead(r, s.HeadEnd, right, bottom, left, top)
+		drawLineArrowHead(r, s.TailEnd, left, top, right, bottom)
 	case "polyline":
 		drawShapePolyline(r, s.Points, left, top, hasStroke)
 	case "group":
@@ -289,6 +295,168 @@ func drawVMLShape(r *renderer, s *docx.VMLShape, x, y, w, h float64) {
 			{X: left + (right-left)*0.15, Y: top + (bottom-top)*0.6},
 			{X: left + (right-left)*0.15, Y: bottom},
 		})
+	case "ribbon", "ribbon2":
+		// Ribbon: horizontal banner with notched tails. ribbon2 is the
+		// upside-down variant (curls down vs up).
+		w, h := right-left, bottom-top
+		inset := w * 0.08
+		notchY := top + h*0.4
+		tailY := top + h*0.7
+		if s.Kind == "ribbon2" {
+			notchY = top + h*0.6
+			tailY = top + h*0.3
+		}
+		drawShapePolygon(r, hasFill, hasStroke, []gopdf.Point{
+			{X: left, Y: tailY},
+			{X: left + inset, Y: top + h*0.5},
+			{X: left, Y: notchY},
+			{X: left + inset*2, Y: notchY},
+			{X: left + inset*2, Y: top},
+			{X: right - inset*2, Y: top},
+			{X: right - inset*2, Y: notchY},
+			{X: right, Y: notchY},
+			{X: right - inset, Y: top + h*0.5},
+			{X: right, Y: tailY},
+			{X: right - inset*2, Y: tailY},
+			{X: right - inset*2, Y: bottom},
+			{X: left + inset*2, Y: bottom},
+			{X: left + inset*2, Y: tailY},
+		})
+	case "flowChartProcess":
+		drawShapeRect(r, left, top, right, bottom, hasFill, hasStroke)
+	case "flowChartDecision":
+		drawShapePolygon(r, hasFill, hasStroke, []gopdf.Point{
+			{X: (left + right) / 2, Y: top},
+			{X: right, Y: (top + bottom) / 2},
+			{X: (left + right) / 2, Y: bottom},
+			{X: left, Y: (top + bottom) / 2},
+		})
+	case "flowChartTerminator":
+		// Rounded rectangle with full-height end caps.
+		drawShapeOval(r, left, top, left+(bottom-top), bottom, hasFill, hasStroke)
+		drawShapeOval(r, right-(bottom-top), top, right, bottom, hasFill, hasStroke)
+		drawShapeRect(r, left+(bottom-top)/2, top, right-(bottom-top)/2, bottom, hasFill, hasStroke)
+	case "flowChartData", "flowChartInputOutput":
+		// Parallelogram (data input/output).
+		skew := (right - left) * 0.15
+		drawShapePolygon(r, hasFill, hasStroke, []gopdf.Point{
+			{X: left + skew, Y: top},
+			{X: right, Y: top},
+			{X: right - skew, Y: bottom},
+			{X: left, Y: bottom},
+		})
+	case "flowChartDocument":
+		// Page with wavy bottom.
+		drawShapePolygon(r, hasFill, hasStroke, []gopdf.Point{
+			{X: left, Y: top},
+			{X: right, Y: top},
+			{X: right, Y: bottom - (bottom-top)*0.18},
+			{X: (2*left + right) / 3, Y: bottom},
+			{X: (left + 2*right) / 3, Y: bottom - (bottom-top)*0.15},
+			{X: left, Y: bottom - (bottom-top)*0.08},
+		})
+	case "flowChartPredefinedProcess":
+		drawShapeRect(r, left, top, right, bottom, hasFill, hasStroke)
+		drawShapeRect(r, left+(right-left)*0.08, top, left+(right-left)*0.08, bottom, false, true)
+		drawShapeRect(r, right-(right-left)*0.08, top, right-(right-left)*0.08, bottom, false, true)
+	case "bracketPair":
+		// Left+right square brackets framing the content area.
+		w := (right - left) * 0.06
+		drawShapePolygon(r, false, hasStroke, []gopdf.Point{
+			{X: left + w, Y: top}, {X: left, Y: top}, {X: left, Y: bottom}, {X: left + w, Y: bottom},
+		})
+		drawShapePolygon(r, false, hasStroke, []gopdf.Point{
+			{X: right - w, Y: top}, {X: right, Y: top}, {X: right, Y: bottom}, {X: right - w, Y: bottom},
+		})
+	case "leftBracket":
+		w := (right - left) * 0.5
+		drawShapePolygon(r, false, hasStroke, []gopdf.Point{
+			{X: left + w, Y: top}, {X: left, Y: top}, {X: left, Y: bottom}, {X: left + w, Y: bottom},
+		})
+	case "rightBracket":
+		w := (right - left) * 0.5
+		drawShapePolygon(r, false, hasStroke, []gopdf.Point{
+			{X: right - w, Y: top}, {X: right, Y: top}, {X: right, Y: bottom}, {X: right - w, Y: bottom},
+		})
+	case "bracePair", "leftBrace", "rightBrace":
+		// Curly braces approximated as polylines — Word's TrueType glyph
+		// curve isn't reproducible without bezier paths so we use 4-point
+		// elbows that read as braces at typical sizes.
+		mid := (top + bottom) / 2
+		w := (right - left) * 0.3
+		if s.Kind != "rightBrace" {
+			drawShapePolygon(r, false, hasStroke, []gopdf.Point{
+				{X: left + w, Y: top}, {X: left + w*0.4, Y: top + (bottom-top)*0.1},
+				{X: left + w*0.4, Y: mid - (bottom-top)*0.05}, {X: left, Y: mid},
+				{X: left + w*0.4, Y: mid + (bottom-top)*0.05},
+				{X: left + w*0.4, Y: bottom - (bottom-top)*0.1}, {X: left + w, Y: bottom},
+			})
+		}
+		if s.Kind != "leftBrace" {
+			drawShapePolygon(r, false, hasStroke, []gopdf.Point{
+				{X: right - w, Y: top}, {X: right - w*0.4, Y: top + (bottom-top)*0.1},
+				{X: right - w*0.4, Y: mid - (bottom-top)*0.05}, {X: right, Y: mid},
+				{X: right - w*0.4, Y: mid + (bottom-top)*0.05},
+				{X: right - w*0.4, Y: bottom - (bottom-top)*0.1}, {X: right - w, Y: bottom},
+			})
+		}
+	case "bentConnector2", "bentConnector3", "bentConnector4", "bentConnector5":
+		// Right-angle (elbow) routing. We don't have control-handle data
+		// so the routing is a simple horizontal-then-vertical at the
+		// midpoint — matches the most common author-placed shape.
+		mid := (left + right) / 2
+		drawShapePolygon(r, false, hasStroke, []gopdf.Point{
+			{X: left, Y: top}, {X: mid, Y: top},
+			{X: mid, Y: bottom}, {X: right, Y: bottom},
+		})
+	case "curvedConnector2", "curvedConnector3", "curvedConnector4", "curvedConnector5":
+		// Smooth S-curve between (left, top) and (right, bottom). We
+		// approximate a single cubic Bézier with 8 line segments.
+		p0 := gopdf.Point{X: left, Y: top}
+		p1 := gopdf.Point{X: (left + right) / 2, Y: top}
+		p2 := gopdf.Point{X: (left + right) / 2, Y: bottom}
+		p3 := gopdf.Point{X: right, Y: bottom}
+		pts := []gopdf.Point{p0}
+		const segs = 8
+		for i := 1; i <= segs; i++ {
+			tt := float64(i) / segs
+			u := 1 - tt
+			x := u*u*u*p0.X + 3*u*u*tt*p1.X + 3*u*tt*tt*p2.X + tt*tt*tt*p3.X
+			y := u*u*u*p0.Y + 3*u*u*tt*p1.Y + 3*u*tt*tt*p2.Y + tt*tt*tt*p3.Y
+			pts = append(pts, gopdf.Point{X: x, Y: y})
+		}
+		drawShapePolygon(r, false, hasStroke, pts)
+	case "explosion1", "explosion2", "irregularSeal1", "irregularSeal2":
+		// Jagged-edged seal (16-point star with randomized radii).
+		cx := (left + right) / 2
+		cy := (top + bottom) / 2
+		rx := (right - left) / 2
+		ry := (bottom - top) / 2
+		const points = 16
+		pts := make([]gopdf.Point, 0, points)
+		seed := 0.85
+		for i := 0; i < points; i++ {
+			theta := float64(i) * 2 * 3.14159265 / float64(points)
+			rad := 1.0
+			if i%2 == 1 {
+				rad = seed
+				seed = 0.55 + 0.45*((float64((i*7)%5)/4.0)+0.1)
+				if seed > 1 {
+					seed = 1
+				}
+			}
+			pts = append(pts, gopdf.Point{
+				X: cx + rx*rad*math.Cos(theta),
+				Y: cy + ry*rad*math.Sin(theta),
+			})
+		}
+		drawShapePolygon(r, hasFill, hasStroke, pts)
+	case "arc", "pie", "blockArc":
+		// Drawn as ellipse for simplicity — the partial-arc geometry
+		// requires sweep+startAngle params we'd have to pull from avLst.
+		drawShapeOval(r, left, top, right, bottom, hasFill, hasStroke)
+	case "wedgeRectCallout", "wedgeRoundRectCallout":
+		drawShapeRect(r, left, top, right, bottom, hasFill, hasStroke)
 	default:
 		// Names that came in as "prst:<unknown>" — render outline only.
 		drawShapeRect(r, left, top, right, bottom, hasFill, hasStroke)
@@ -314,17 +482,117 @@ func drawVMLShape(r *renderer, s *docx.VMLShape, x, y, w, h float64) {
 	drawVMLChildren(r, s, left, top, right, bottom)
 }
 
+// shapeBodyInsets returns the effective text-frame insets in points,
+// honoring a:bodyPr/@lIns / tIns / rIns / bIns when set or falling back
+// to Word's defaults: 0.1" horizontal, 0.05" vertical.
+func shapeBodyInsets(s *docx.VMLShape) (l, t, r, b float64) {
+	defL, defT, defR, defB := 7.2, 3.6, 7.2, 3.6
+	l, t, r, bb := s.TextLeftInsetPt, s.TextTopInsetPt, s.TextRightInsetPt, s.TextBottomInsetPt
+	if l == 0 {
+		l = defL
+	}
+	if t == 0 {
+		t = defT
+	}
+	if r == 0 {
+		r = defR
+	}
+	if bb == 0 {
+		bb = defB
+	}
+	return l, t, r, bb
+}
+
 // drawShapeBoxContent prefers the rich block tree (paragraphs, runs with
 // formatting) when present, falling back to the flat string for shapes
 // whose textbox content didn't survive structured parsing.
 func drawShapeBoxContent(r *renderer, s *docx.VMLShape, left, top, right, bottom float64) {
+	// Apply a:bodyPr insets: tighten the drawable box per shape config.
+	lIns, tIns, rIns, bIns := shapeBodyInsets(s)
+	innerLeft := left + lIns
+	innerTop := top + tIns
+	innerRight := right - rIns
+	innerBottom := bottom - bIns
+	if innerRight <= innerLeft || innerBottom <= innerTop {
+		return
+	}
+	// Vertical anchor: predict total content height and shift the origin
+	// for "ctr" or "b" anchors.
+	if s.TextAnchor == "ctr" || s.TextAnchor == "b" {
+		h := predictShapeContentHeight(r, s, innerRight-innerLeft)
+		boxH := innerBottom - innerTop
+		if h < boxH {
+			switch s.TextAnchor {
+			case "ctr":
+				innerTop += (boxH - h) / 2
+			case "b":
+				innerTop = innerBottom - h
+			}
+		}
+	}
 	if len(s.TextBoxBlocks) > 0 {
-		stampShapeBlocks(r, s.TextBoxBlocks, left, top, right, bottom)
+		stampShapeBlocks(r, s.TextBoxBlocks, innerLeft, innerTop, innerRight, innerBottom)
 		return
 	}
 	if s.TextBox != "" {
-		stampShapeText(r, s.TextBox, left, top, right, bottom)
+		stampShapeText(r, s.TextBox, innerLeft, innerTop, innerRight, innerBottom)
 	}
+}
+
+// predictShapeContentHeight measures the total y-advance of a shape's
+// text content at width w. Used to position the content vertically when
+// the shape has a bodyPr anchor of "ctr" or "b" — we need to know how
+// much space the content will consume before laying it out.
+//
+// For plain-string textboxes we approximate using line count × line
+// height. For rich blocks we sum paragraph predictions; nested tables
+// and unusual blocks fall back to a constant per-block estimate.
+func predictShapeContentHeight(r *renderer, s *docx.VMLShape, w float64) float64 {
+	lineH := r.opts.DefaultFontSize * 1.2
+	if len(s.TextBoxBlocks) > 0 {
+		h := 0.0
+		for _, b := range s.TextBoxBlocks {
+			switch v := b.(type) {
+			case docx.Paragraph:
+				h += predictShapeParaHeight(r, v, w)
+			default:
+				_ = v
+				h += lineH
+			}
+		}
+		return h
+	}
+	if s.TextBox == "" {
+		return 0
+	}
+	// Plain string: split on newlines, rough estimate.
+	lines := 1
+	for _, c := range s.TextBox {
+		if c == '\n' {
+			lines++
+		}
+	}
+	return float64(lines) * lineH
+}
+
+// predictShapeParaHeight is a rough height estimate matching what
+// drawShapeParagraph would emit; accurate to ~1 line at typical sizes.
+func predictShapeParaHeight(r *renderer, p docx.Paragraph, w float64) float64 {
+	lineH := r.opts.DefaultFontSize * 1.2
+	// Count rendered text width vs available width to estimate line count.
+	total := 0.0
+	for _, run := range p.Runs {
+		size := r.opts.DefaultFontSize
+		if run.Props.FontSize > 0 {
+			size = run.Props.FontSize
+		}
+		total += float64(len(run.Text)) * size * 0.45
+	}
+	if w <= 0 {
+		w = 100
+	}
+	lines := int(total/w) + 1
+	return float64(lines) * lineH
 }
 
 // drawShapeShadow paints an offset, dimmer copy of the shape behind the
@@ -1290,4 +1558,53 @@ func truncateTextRender(s string, max int) string {
 		return string(s[0])
 	}
 	return s[:max-1] + "…"
+}
+
+// drawLineArrowHead paints an arrow decoration of the given DrawingML type
+// at (tipX, tipY), pointing away from (fromX, fromY). Supported types:
+// "triangle", "stealth", "arrow" — filled triangles; "oval" — small circle;
+// "diamond" — filled rhombus; "none"/"" — no-op. Unknown types degrade to
+// a plain triangle so unfamiliar arrow styles still surface the intent.
+func drawLineArrowHead(r *renderer, kind string, fromX, fromY, tipX, tipY float64) {
+	if kind == "" || kind == "none" {
+		return
+	}
+	dx := tipX - fromX
+	dy := tipY - fromY
+	dist := math.Hypot(dx, dy)
+	if dist <= 0 {
+		return
+	}
+	// Size scales with stroke length but caps so a long line doesn't get
+	// an oversized arrow. 8pt is the typical Word default.
+	const arrowLen = 8.0
+	const arrowWid = 4.0
+	ux := dx / dist
+	uy := dy / dist
+	// Base point sits arrowLen back from tip along the line.
+	baseX := tipX - ux*arrowLen
+	baseY := tipY - uy*arrowLen
+	// Perpendicular for triangle wings.
+	px := -uy * arrowWid
+	py := ux * arrowWid
+
+	switch kind {
+	case "oval":
+		r.pdf.Oval(tipX-arrowWid, tipY-arrowWid, tipX+arrowWid, tipY+arrowWid)
+	case "diamond":
+		mx, my := (tipX+baseX)/2, (tipY+baseY)/2
+		drawShapePolygon(r, true, true, []gopdf.Point{
+			{X: tipX, Y: tipY},
+			{X: mx + px, Y: my + py},
+			{X: baseX, Y: baseY},
+			{X: mx - px, Y: my - py},
+		})
+	default:
+		// "triangle", "stealth", "arrow", any unknown → filled triangle.
+		drawShapePolygon(r, true, true, []gopdf.Point{
+			{X: tipX, Y: tipY},
+			{X: baseX + px, Y: baseY + py},
+			{X: baseX - px, Y: baseY - py},
+		})
+	}
 }

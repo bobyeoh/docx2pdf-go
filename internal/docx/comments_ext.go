@@ -56,6 +56,53 @@ func parsePeople(f *zip.File, doc *Document) error {
 	}
 }
 
+// parseCommentsIds reads word/commentsIds.xml (Office 2016 w16cid namespace).
+// Maps each comment's paraId to a stable durableId. The structure is:
+//
+//	<w16cid:commentsIds>
+//	  <w16cid:commentId w16cid:paraId="…" w16cid:durableId="…"/>
+//	  …
+//	</w16cid:commentsIds>
+//
+// The durableId survives copy/paste and revision merges, so consumers that
+// build cross-document threading should prefer it over the volatile paraId.
+func parseCommentsIds(f *zip.File, doc *Document) error {
+	rc, err := openZipFile(f)
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+	dec := xml.NewDecoder(rc)
+	if doc.CommentsExtended == nil {
+		doc.CommentsExtended = map[string]CommentExtended{}
+	}
+	for {
+		tok, err := dec.Token()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		se, ok := tok.(xml.StartElement)
+		if !ok {
+			continue
+		}
+		if se.Name.Local != "commentId" {
+			continue
+		}
+		paraID := attr(se, "paraId")
+		durable := attr(se, "durableId")
+		if paraID != "" {
+			ex := doc.CommentsExtended[paraID]
+			ex.ParaID = paraID
+			ex.DurableID = durable
+			doc.CommentsExtended[paraID] = ex
+		}
+		_ = dec.Skip()
+	}
+}
+
 func parseCommentsExtended(f *zip.File, doc *Document) error {
 	rc, err := openZipFile(f)
 	if err != nil {

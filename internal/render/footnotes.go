@@ -71,7 +71,12 @@ func buildNoteLabels(doc *docx.Document, endnote bool) map[string]string {
 				}
 			}
 		}
-		if restart == "eachSect" {
+		if restart == "eachSect" || restart == "eachPage" {
+			// eachPage is best-effort: without auto-pagination at this
+			// stage we cannot tell where page boundaries land, so we
+			// degrade to per-section reset. Users get more correct
+			// resets than treating it as continuous; a fully accurate
+			// page-aware pass would have to run after layout.
 			counter = start - 1
 		} else if counter == 0 {
 			counter = start - 1

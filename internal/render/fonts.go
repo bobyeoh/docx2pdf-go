@@ -13,6 +13,7 @@ const (
 	italicFamily    = "doc-i"
 	headingFamily   = "doc-h"
 	fallbackFamily  = "doc-fb"
+	symbolFamily    = "doc-sym"
 	embFamilyPrefix = "emb-"
 )
 
@@ -29,6 +30,7 @@ func (r *renderer) registerFonts() error {
 	r.tryLoadOptionalFont(italicFamily, r.opts.FontItalic)
 	r.tryLoadOptionalFont(headingFamily, r.opts.FontHeading)
 	r.tryLoadOptionalFont(fallbackFamily, r.opts.FontFallback)
+	r.tryLoadOptionalFont(symbolFamily, r.opts.FontSymbol)
 	r.registerEmbeddedFonts()
 	return nil
 }
@@ -248,6 +250,14 @@ func (r *renderer) applyFontFamily(p docx.RunProps, family string) error {
 	if p.VertAlign == "superscript" || p.VertAlign == "subscript" {
 		size *= 0.6
 	}
+	// w:fitText horizontal squeeze — pre-computed at cell entry. We shrink
+	// the font size uniformly so the entire cell content stays within its
+	// column width. gopdf has no Tz (horizontal-scale) operator, so this
+	// is an isotropic approximation rather than the asymmetric squash
+	// Word performs; readable, just not pixel-faithful.
+	if r.fitTextScale > 0 && r.fitTextScale != 1.0 {
+		size *= r.fitTextScale
+	}
 	if err := r.pdf.SetFont(family, "", size); err != nil {
 		return err
 	}
@@ -293,30 +303,45 @@ func charSpacingFor(p docx.RunProps, fontSize float64) float64 {
 //	If both are zero, return the hex unchanged.
 //	Pure grayscale colors (S = 0) keep saturation 0; only L moves.
 func applyLumModOff(hex string, lumMod, lumOff float64) string {
-	if lumMod == 0 && lumOff == 0 {
+	return applyColorMods(hex, lumMod, lumOff, 0, 0)
+}
+
+// applyColorMods extends applyLumModOff with saturation modulation
+// (satMod / satOff), per ECMA-376 §17.18.99. Order is L-then-S so the
+// L derivation matches Word; both transforms run in HSL space.
+func applyColorMods(hex string, lumMod, lumOff, satMod, satOff float64) string {
+	if lumMod == 0 && lumOff == 0 && satMod == 0 && satOff == 0 {
 		return hex
 	}
 	r, g, b := parseHexColor(hex)
 	h, s, l := rgbToHSL(r, g, b)
-	// w:themeShade → lumMod ∈ (0,1) — scale L toward black.
 	if lumMod != 0 && lumMod != 1 {
 		l *= lumMod
 	}
-	// w:themeTint → lumOff ∈ (0,1) — add white in proportion to (1-L)
-	// per ECMA-376 §17.18.45. This is asymmetric to lumMod: it pulls
-	// the color toward white without ever overshooting it.
 	if lumOff > 0 {
 		l = l + (1-l)*lumOff
 	} else if lumOff < 0 {
-		// Spec doesn't say much about negative lumOff, but the natural
-		// reading is "pull toward black", symmetric to the positive case.
 		l = l + l*lumOff
+	}
+	if satMod != 0 && satMod != 1 {
+		s *= satMod
+	}
+	if satOff > 0 {
+		s = s + (1-s)*satOff
+	} else if satOff < 0 {
+		s = s + s*satOff
 	}
 	if l < 0 {
 		l = 0
 	}
 	if l > 1 {
 		l = 1
+	}
+	if s < 0 {
+		s = 0
+	}
+	if s > 1 {
+		s = 1
 	}
 	rr, gg, bb := hslToRGB(h, s, l)
 	return fmt.Sprintf("%02X%02X%02X", rr, gg, bb)
@@ -537,7 +562,19 @@ func isCJK(r rune) bool {
 // these (notably Arial on macOS lacks U+2713 CHECK MARK), and any
 // real CJK fallback covers them.
 func (r *renderer) chooseFamily(rn rune, p docx.RunProps) string {
-	if r.fonts[fallbackFamily] && (isCJK(rn) || isSymbolGlyph(rn)) {
+	// Symbol-block runes (ballot box, arrows, dingbats, ...) prefer the
+	// dedicated symbol face when one is registered. CJK fonts often skip
+	// these blocks (WQY Zen Hei lacks U+2610 / U+2612, for example), so
+	// without a symbol font the glyph would render as a missing-GID box.
+	if isSymbolGlyph(rn) {
+		if r.fonts[symbolFamily] {
+			return symbolFamily
+		}
+		if r.fonts[fallbackFamily] {
+			return fallbackFamily
+		}
+	}
+	if r.fonts[fallbackFamily] && isCJK(rn) {
 		return fallbackFamily
 	}
 	return r.selectFont(p)

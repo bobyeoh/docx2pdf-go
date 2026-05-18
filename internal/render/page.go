@@ -67,22 +67,37 @@ func (r *renderer) stampPageDecorations(sections []docx.Section, sectionPageStar
 			r.pdf.SetFillColor(r1, g1, b1)
 			r.pdf.Rectangle(0, 0, r.pageW, r.pageH, "F", 0, 0)
 		}
-		drawPageBorders(r, sec.Borders)
+		secIdx := sectionOf(i)
+		pageInSection := i - sectionPageStart[secIdx] + 1
+		isLastSecPage := i == n || (secIdx+1 < len(sectionPageStart) && sectionPageStart[secIdx+1]-1 == i)
+		if shouldDrawPageBorder(sec.Borders.Display, pageInSection, isLastSecPage) {
+			drawPageBorders(r, sec.Borders)
+		}
 
 		if sec.LineNumbering.CountBy > 0 {
 			drawLineNumbers(r, sec)
 		}
 
 		savedFields := r.fields
-		pageInSection := i - sectionPageStart[sectionOf(i)] + 1
 		displayPage := pageInSection
 		if sec.PageNumber.Start > 0 {
 			displayPage = sec.PageNumber.Start + pageInSection - 1
 		}
+		// pages in THIS section = next-section-start - this-section-start.
+		// Last section runs to the end of the document.
+		secPagesEnd := n
+		if secIdx+1 < len(sectionPageStart) {
+			secPagesEnd = sectionPageStart[secIdx+1] - 1
+		}
+		numSecPages := secPagesEnd - sectionPageStart[secIdx] + 1
 		r.fields = fieldVars{
-			page:          displayPage,
-			numPages:      n,
-			pageFmt:       sec.PageNumber.Fmt,
+			page:            displayPage,
+			numPages:        n,
+			pageFmt:         sec.PageNumber.Fmt,
+			numSectionPages: numSecPages,
+			section:         secIdx + 1,
+			decimalSymbol:   savedFields.decimalSymbol,
+			listSeparator:   savedFields.listSeparator,
 			now:           savedFields.now,
 			filename:      savedFields.filename,
 			author:        savedFields.author,
@@ -332,22 +347,71 @@ func (r *renderer) stampPageNumbers() error {
 
 // applyLineHeight converts a natural (font-derived) line height to the
 // effective line height per the paragraph's w:spacing w:line semantics.
+// When the active section declares a w:docGrid line pitch we additionally
+// snap the result UP to a multiple of that pitch so consecutive lines
+// land on the CJK grid (Word's "line grid" feature).
 func (r *renderer) applyLineHeight(natural float64) float64 {
+	var h float64
 	switch r.lineHeight.Rule {
 	case "exact":
 		if r.lineHeight.Pt > 0 {
-			return r.lineHeight.Pt
+			h = r.lineHeight.Pt
+		} else {
+			h = natural
 		}
 	case "atLeast":
 		if r.lineHeight.Pt > natural {
-			return r.lineHeight.Pt
+			h = r.lineHeight.Pt
+		} else {
+			h = natural
 		}
 	case "auto":
 		if r.lineHeight.Mul > 0 {
-			return natural * r.lineHeight.Mul
+			h = natural * r.lineHeight.Mul
+		} else {
+			h = natural
+		}
+	default:
+		h = natural
+	}
+	// docGrid snap: only for the line-grid modes ("lines" or
+	// "linesAndChars"). The pitch is in 1/20 pt units.
+	if (r.activeDocGrid.Type == "lines" || r.activeDocGrid.Type == "linesAndChars") &&
+		r.activeDocGrid.LinePitch > 0 && r.lineHeight.Rule != "exact" {
+		pitch := float64(r.activeDocGrid.LinePitch) / 20.0
+		if pitch > 0 {
+			// Snap upward to the next whole pitch step.
+			steps := h / pitch
+			rounded := float64(int(steps))
+			if rounded < steps {
+				rounded++
+			}
+			snapped := rounded * pitch
+			if snapped > h {
+				h = snapped
+			}
 		}
 	}
-	return natural
+	return h
+}
+
+// activeCharSpacePt returns extra letter-spacing in points to apply to
+// CJK text in the current section, derived from w:docGrid/@w:charSpace.
+// Returns 0 unless the section enables the linesAndChars grid mode.
+//
+// CharSpace is stored in 1/100 pt; OOXML uses it as the additional space
+// inserted between CJK characters so the grid spacing equals
+// LinePitch + CharSpace/100 (per the spec). For Latin text the effect
+// is negligible at typical CharSpace values, so we apply it uniformly —
+// the visible difference on CJK is what authors are after.
+func (r *renderer) activeCharSpacePt() float64 {
+	if r.activeDocGrid.Type != "linesAndChars" {
+		return 0
+	}
+	if r.activeDocGrid.CharSpace <= 0 {
+		return 0
+	}
+	return float64(r.activeDocGrid.CharSpace) / 100.0
 }
 
 // appendCommentsSection renders the Comments trailer with author/date
@@ -507,6 +571,82 @@ func orderCommentsByThread(ids []string, doc *docx.Document, paraToCommentID map
 	return out
 }
 
+// allSectionsHaveSectEndnotes reports whether every section in the
+// document declares w:endnotePr w:pos="sectEnd". When true the renderer
+// suppresses the doc-end endnote trailer because each section already
+// emitted its endnotes inline.
+func allSectionsHaveSectEndnotes(secs []docx.Section) bool {
+	if len(secs) == 0 {
+		return false
+	}
+	for _, s := range secs {
+		if s.EndnotePr == nil || s.EndnotePr.Pos != "sectEnd" {
+			return false
+		}
+	}
+	return true
+}
+
+// appendSectionEndnotes renders the endnotes referenced from sec.Blocks
+// inline (at the current cursor) under a "Section N endnotes" heading.
+func (r *renderer) appendSectionEndnotes(sec docx.Section, secIdx int) error {
+	ids := collectNoteRefs(sec.Blocks, true)
+	if len(ids) == 0 {
+		return nil
+	}
+	// Filter to unique IDs that actually have bodies.
+	seen := map[string]bool{}
+	uniq := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if seen[id] {
+			continue
+		}
+		if _, ok := r.doc.Endnotes[id]; !ok {
+			continue
+		}
+		seen[id] = true
+		uniq = append(uniq, id)
+	}
+	if len(uniq) == 0 {
+		return nil
+	}
+	r.ensureRoom(24)
+	r.cursorY += 12
+	heading := docx.Paragraph{
+		Runs:         []docx.Run{{Text: "Endnotes", Props: docx.RunProps{Bold: true, FontSize: 11}}},
+		SpacingAfter: 4,
+	}
+	_ = secIdx // section index unused in label; reserved for callers that want "Section N Endnotes"
+	if err := r.drawParagraph(heading); err != nil {
+		return err
+	}
+	for _, id := range uniq {
+		label := id
+		if lbl, ok := r.endnoteLabels[id]; ok && lbl != "" {
+			label = lbl
+		}
+		marker := docx.Paragraph{
+			Runs: []docx.Run{{Text: label + ". ", Props: docx.RunProps{Bold: true}}},
+		}
+		if err := r.drawParagraph(marker); err != nil {
+			return err
+		}
+		for _, b := range r.doc.Endnotes[id] {
+			switch v := b.(type) {
+			case docx.Paragraph:
+				if err := r.drawParagraph(v); err != nil {
+					return err
+				}
+			case docx.Table:
+				if err := r.drawTable(v); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
 // appendNotesSection appends a heading + the note bodies (each prefixed with
 // "[id]") to the current page. Skipped silently if notes is empty.
 
@@ -591,6 +731,13 @@ func drawLineNumbers(r *renderer, sec docx.Section) {
 	r.pdf.SetTextColor(120, 120, 120)
 	n := r.lineNumCounter
 	for y := r.marT; y+lineH < r.pageH-r.marB; y += lineH {
+		// w:suppressLineNumbers paragraphs don't advance the counter or
+		// emit a marker. We check the suppressed bands rather than
+		// per-paragraph since the line-number gutter is rasterized after
+		// the page body is finished.
+		if isSuppressedY(r.suppressedLineNumRanges, y, y+lineH) {
+			continue
+		}
 		if n%countBy == 0 {
 			r.pdf.SetX(x)
 			r.pdf.SetY(y)
@@ -601,6 +748,19 @@ func drawLineNumbers(r *renderer, sec docx.Section) {
 	if sec.LineNumbering.Restart != "newSection" {
 		r.lineNumCounter = n
 	}
+}
+
+// isSuppressedY reports whether a line whose top/bottom y straddle any of
+// the suppressed ranges should be skipped. A line that partially overlaps
+// a suppressed band still skips — Word's behavior is conservative.
+func isSuppressedY(ranges []suppressedRange, top, bottom float64) bool {
+	for _, sr := range ranges {
+		if bottom < sr.top || top > sr.bottom {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 // pageBorderRect computes the four border-line positions for the current
@@ -650,6 +810,31 @@ func pageBorderRect(r *renderer, b docx.PageBorders) (x1, y1, x2, y2 float64) {
 	x2 = r.pageW - rig
 	y2 = r.pageH - bot
 	return
+}
+
+// shouldDrawPageBorder reports whether the page-border frame should appear
+// on this page given the section's w:display selector:
+//
+//	"" / "allPages": draw on every page.
+//	"firstPage":     only on the section's first page.
+//	"notFirstPage": every page except the section's first.
+//	"notLastPage":  every page except the section's last (Word actually
+//	                spells this "lastPage" with inverted semantics; we
+//	                accept either form to stay forgiving).
+func shouldDrawPageBorder(display string, pageInSection int, isLastSecPage bool) bool {
+	switch display {
+	case "", "allPages":
+		return true
+	case "firstPage":
+		return pageInSection == 1
+	case "notFirstPage":
+		return pageInSection != 1
+	case "lastPage":
+		return isLastSecPage
+	case "notLastPage":
+		return !isLastSecPage
+	}
+	return true
 }
 
 // drawPageBorders draws the four w:pgBorders edges. Position respects
@@ -850,6 +1035,7 @@ func (r *renderer) newPage() {
 	// Wrap bands belong to the page they were established on — drop any
 	// active band so content on the new page starts at full width.
 	r.floatBand = nil
+	r.suppressedLineNumRanges = r.suppressedLineNumRanges[:0]
 	primeContentStream(r.pdf)
 }
 

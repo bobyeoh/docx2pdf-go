@@ -142,10 +142,106 @@ func applyImageEffects(img image.Image, effs []docx.ImageEffect) image.Image {
 					}
 				}
 			}
+		case "sepia":
+			// Sepia matrix from a:duotone — but pre-set warm browns.
+			for y := b.Min.Y; y < b.Max.Y; y++ {
+				for x := b.Min.X; x < b.Max.X; x++ {
+					c := out.NRGBAAt(x, y)
+					rr := float64(c.R)*0.393 + float64(c.G)*0.769 + float64(c.B)*0.189
+					gg := float64(c.R)*0.349 + float64(c.G)*0.686 + float64(c.B)*0.168
+					bb := float64(c.R)*0.272 + float64(c.G)*0.534 + float64(c.B)*0.131
+					out.SetNRGBA(x, y, color.NRGBA{
+						R: uint8(clamp01(rr / 255 * 255)),
+						G: uint8(clamp01(gg / 255 * 255)),
+						B: uint8(clamp01(bb / 255 * 255)),
+						A: c.A,
+					})
+				}
+			}
+		case "alphaInv":
+			// Invert alpha: areas that were opaque become transparent and
+			// vice versa. eff.FgHex (optional) is the color used to tint
+			// the inverted region; without it the pixel keeps its RGB.
+			for y := b.Min.Y; y < b.Max.Y; y++ {
+				for x := b.Min.X; x < b.Max.X; x++ {
+					c := out.NRGBAAt(x, y)
+					c.A = 255 - c.A
+					out.SetNRGBA(x, y, c)
+				}
+			}
+		case "hsl":
+			// HSL shift. eff.HueDeg shifts hue; eff.Saturation scales S;
+			// eff.Lum (Lightness) scales L.
+			for y := b.Min.Y; y < b.Max.Y; y++ {
+				for x := b.Min.X; x < b.Max.X; x++ {
+					c := out.NRGBAAt(x, y)
+					h, s, l := rgbToHSL(c.R, c.G, c.B)
+					h = mathMod(h+eff.HueDeg/360.0, 1.0)
+					s *= 1 + eff.Saturation
+					l *= 1 + eff.Lum
+					if s < 0 {
+						s = 0
+					} else if s > 1 {
+						s = 1
+					}
+					if l < 0 {
+						l = 0
+					} else if l > 1 {
+						l = 1
+					}
+					rr, gg, bb := hslToRGB(h, s, l)
+					out.SetNRGBA(x, y, color.NRGBA{R: rr, G: gg, B: bb, A: c.A})
+				}
+			}
+		case "tint":
+			// Mix toward white by `eff.Amount` (0..100 → 0..1).
+			amt := clamp01(eff.Amount / 100)
+			for y := b.Min.Y; y < b.Max.Y; y++ {
+				for x := b.Min.X; x < b.Max.X; x++ {
+					c := out.NRGBAAt(x, y)
+					rr := uint8(float64(c.R) + (255-float64(c.R))*amt)
+					gg := uint8(float64(c.G) + (255-float64(c.G))*amt)
+					bb := uint8(float64(c.B) + (255-float64(c.B))*amt)
+					out.SetNRGBA(x, y, color.NRGBA{R: rr, G: gg, B: bb, A: c.A})
+				}
+			}
+		case "shade":
+			// Mix toward black by `eff.Amount` (0..100 → 0..1).
+			amt := clamp01(eff.Amount / 100)
+			for y := b.Min.Y; y < b.Max.Y; y++ {
+				for x := b.Min.X; x < b.Max.X; x++ {
+					c := out.NRGBAAt(x, y)
+					rr := uint8(float64(c.R) * (1 - amt))
+					gg := uint8(float64(c.G) * (1 - amt))
+					bb := uint8(float64(c.B) * (1 - amt))
+					out.SetNRGBA(x, y, color.NRGBA{R: rr, G: gg, B: bb, A: c.A})
+				}
+			}
 		}
 	}
 	return out
 }
+
+func clamp01(f float64) float64 {
+	if f < 0 {
+		return 0
+	}
+	if f > 255 {
+		return 255
+	}
+	return f
+}
+
+func mathMod(x, m float64) float64 {
+	for x < 0 {
+		x += m
+	}
+	for x >= m {
+		x -= m
+	}
+	return x
+}
+
 
 // adjustLum applies bright + contrast (each in [-1, 1]) to a single
 // channel triple. Bright shifts; contrast scales around 0.5.
@@ -181,6 +277,51 @@ func mustHex(hex string, fallback color.NRGBA) color.NRGBA {
 		B: uint8(v),
 		A: 255,
 	}
+}
+
+// drawTransformedImage applies optional flip + rotation to an image
+// before painting it. Flips operate on the image data (we synthesize a
+// horizontally / vertically mirrored copy); rotation uses gopdf's
+// transform.
+func (r *renderer) drawTransformedImage(img image.Image, x, y, w, h float64, rotDeg float64, flipH, flipV bool) error {
+	if flipH {
+		img = flipImageH(img)
+	}
+	if flipV {
+		img = flipImageV(img)
+	}
+	if rotDeg != 0 {
+		cx, cy := x+w/2, y+h/2
+		r.pdf.Rotate(rotDeg, cx, cy)
+		defer r.pdf.RotateReset()
+	}
+	return r.drawImage(img, x, y, w, h)
+}
+
+// flipImageH returns a horizontally mirrored copy of img.
+func flipImageH(src image.Image) image.Image {
+	b := src.Bounds()
+	dst := image.NewNRGBA(b)
+	for y := b.Min.Y; y < b.Max.Y; y++ {
+		for x := b.Min.X; x < b.Max.X; x++ {
+			sx := b.Max.X - 1 - (x - b.Min.X)
+			dst.Set(x, y, src.At(sx, y))
+		}
+	}
+	return dst
+}
+
+// flipImageV returns a vertically mirrored copy of img.
+func flipImageV(src image.Image) image.Image {
+	b := src.Bounds()
+	dst := image.NewNRGBA(b)
+	for y := b.Min.Y; y < b.Max.Y; y++ {
+		sy := b.Max.Y - 1 - (y - b.Min.Y)
+		for x := b.Min.X; x < b.Max.X; x++ {
+			dst.Set(x, y, src.At(x, sy))
+		}
+	}
+	return dst
 }
 
 // drawImage normalizes img to 8-bit NRGBA before PNG-encoding. JPEG sources

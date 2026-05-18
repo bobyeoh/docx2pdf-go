@@ -55,13 +55,17 @@ func (r *renderer) drawFrame(p docx.Paragraph) error {
 	if err != nil {
 		return err
 	}
-	// wrap="around" / "tight" / "through": after drawing the frame, set
-	// the floatBand so subsequent body paragraphs wrap around it.
-	// Without this, body text whose y-range overlaps the frame would
-	// just draw straight through. Frame side defaults to left when
-	// XAlign isn't set — Word centers/wraps the same way for textbox
-	// frames whose XAlign was implied by w:x.
-	if fr.Wrap == "around" || fr.Wrap == "tight" || fr.Wrap == "through" {
+	// wrap="around" / "tight" / "through" / "auto" (the default when
+	// no w:wrap attribute is set): after drawing the frame, set the
+	// floatBand so subsequent body paragraphs wrap around it. Without
+	// this, body text whose y-range overlaps the frame would just draw
+	// straight through. Frame side defaults to left when XAlign isn't
+	// set — Word centers/wraps the same way for textbox frames whose
+	// XAlign was implied by w:x. "notBeside" is the explicit opt-out
+	// (Word renders such frames as block-only); "none" skips wrapping
+	// to match Word's "skip" behavior.
+	switch fr.Wrap {
+	case "around", "tight", "through", "auto", "":
 		bottom := frameBottom
 		if bottom <= frameY {
 			// Fall back to declared frame height when the paragraph drew
@@ -79,6 +83,7 @@ func (r *renderer) drawFrame(p docx.Paragraph) error {
 		r.floatBand = &floatWrapBand{
 			leftX:   frameX,
 			rightX:  frameX + frameW,
+			topY:    frameY,
 			bottomY: bottom,
 			side:    side,
 			gapPt:   6,

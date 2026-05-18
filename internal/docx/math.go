@@ -88,6 +88,42 @@ type MathNode struct {
 	SepChar  string // m:dPr sepChar (defaults to ",")
 	NaryChar string // m:naryPr chr (∑, ∫, ∏ ...)
 	AccChar  string // m:accPr chr
+	// FracType from m:fPr/m:type val: "" (bar — default), "skw" (skewed),
+	// "lin" (in-line a/b), "noBar" (stack with no horizontal line).
+	FracType string
+	// NaryLimLoc from m:naryPr/m:limLoc val: "" (default per script style),
+	// "subSup" (sub/sup positioning), "undOvr" (under/over positioning).
+	NaryLimLoc string
+	// NarySupHide / NarySubHide from m:naryPr — when true the sup/sub
+	// limit of the n-ary operator is suppressed (no script rendered).
+	NarySupHide, NarySubHide bool
+	// DGrow from m:dPr/m:grow val: when "1"/"true", the delimiters should
+	// scale vertically to match the height of their content.
+	DGrow bool
+	// AccUnder from m:groupChrPr/m:pos val: "over" (default) or "under" —
+	// places the group character above or below the base. Same field is
+	// reused by m:barPr.
+	AccUnder bool
+	// Math run properties pulled from m:rPr (only meaningful on "r" / "t"
+	// nodes, propagated to descendant "t" during decode).
+	//   Nor      → true when m:nor is present (force upright/normal style,
+	//              overriding the variable-italic default)
+	//   StyleB   → m:sty val=b  (bold)
+	//   StyleI   → m:sty val=i  (italic; default for math variables)
+	//   StyleBI  → m:sty val=bi (bold-italic)
+	//   StyleP   → m:sty val=p  (plain — same effect as Nor)
+	//   Script   → m:scr val=roman | script | fraktur | sansSerif | monospace | doubleStruck
+	Nor      bool
+	StyleB   bool
+	StyleI   bool
+	StyleBI  bool
+	StyleP   bool
+	Script   string
+	// Align is the display-block alignment hint from m:oMathParaPr/m:jc on
+	// an oMathPara wrapper: "" (Word default — center), "left", "center",
+	// "right", "centerGroup". Only meaningful on the root node when its
+	// Kind is "oMathPara".
+	Align string
 }
 
 func newMathNode(kind string) *mathNode { return &mathNode{Kind: kind} }
@@ -150,12 +186,113 @@ func decodeMathNode(dec *xml.Decoder, start xml.StartElement) (*mathNode, error)
 				n.BegChar = child.BegChar
 				n.EndChar = child.EndChar
 				n.SepChar = child.SepChar
+				if child.DGrow {
+					n.DGrow = true
+				}
+			case "fPr":
+				// Fraction-properties wrapper. m:type val carries the
+				// fraction style. Decoder threads the child's FracType up.
+				if child.FracType != "" {
+					n.FracType = child.FracType
+				}
 			case "naryPr":
 				n.NaryChar = child.NaryChar
-				// nary props also carry sub-position / lim-loc info; we
-				// ignore those (formatting only).
+				if child.NaryLimLoc != "" {
+					n.NaryLimLoc = child.NaryLimLoc
+				}
+				if child.NarySupHide {
+					n.NarySupHide = true
+				}
+				if child.NarySubHide {
+					n.NarySubHide = true
+				}
 			case "accPr":
 				n.AccChar = child.AccChar
+			case "groupChrPr", "barPr":
+				if child.AccChar != "" {
+					n.AccChar = child.AccChar
+				}
+				if child.AccUnder {
+					n.AccUnder = true
+				}
+			case "type":
+				// m:type lives inside m:fPr (val=bar/skw/lin/noBar).
+				if n.Kind == "fPr" {
+					for _, a := range t.Attr {
+						if a.Name.Local == "val" {
+							n.FracType = a.Value
+						}
+					}
+				}
+			case "limLoc":
+				// m:limLoc lives inside m:naryPr (val=subSup or undOvr).
+				if n.Kind == "naryPr" {
+					for _, a := range t.Attr {
+						if a.Name.Local == "val" {
+							n.NaryLimLoc = a.Value
+						}
+					}
+				}
+			case "supHide":
+				if n.Kind == "naryPr" {
+					for _, a := range t.Attr {
+						if a.Name.Local == "val" && (a.Value == "1" || a.Value == "true" || a.Value == "on") {
+							n.NarySupHide = true
+						}
+					}
+					if len(t.Attr) == 0 {
+						n.NarySupHide = true
+					}
+				}
+			case "subHide":
+				if n.Kind == "naryPr" {
+					for _, a := range t.Attr {
+						if a.Name.Local == "val" && (a.Value == "1" || a.Value == "true" || a.Value == "on") {
+							n.NarySubHide = true
+						}
+					}
+					if len(t.Attr) == 0 {
+						n.NarySubHide = true
+					}
+				}
+			case "grow":
+				if n.Kind == "dPr" {
+					on := true
+					for _, a := range t.Attr {
+						if a.Name.Local == "val" {
+							switch a.Value {
+							case "0", "false", "off":
+								on = false
+							}
+						}
+					}
+					n.DGrow = on
+				}
+			case "pos":
+				// m:pos lives in m:groupChrPr / m:barPr. val=top/bot.
+				if n.Kind == "groupChrPr" || n.Kind == "barPr" {
+					for _, a := range t.Attr {
+						if a.Name.Local == "val" && a.Value == "bot" {
+							n.AccUnder = true
+						}
+					}
+				}
+			case "jc":
+				// m:jc lives inside m:oMathParaPr (display alignment). The
+				// child decoder doesn't recognize the element, so capture
+				// the val attribute on the parent props node and surface
+				// via oMathPara → child propagation below.
+				if n.Kind == "oMathParaPr" {
+					for _, a := range t.Attr {
+						if a.Name.Local == "val" {
+							n.Align = a.Value
+						}
+					}
+				}
+			case "oMathParaPr":
+				if child.Align != "" {
+					n.Align = child.Align
+				}
 			case "begChr":
 				n.BegChar = child.Text
 			case "endChr":
@@ -172,6 +309,50 @@ func decodeMathNode(dec *xml.Decoder, start xml.StartElement) (*mathNode, error)
 					n.AccChar = child.Text
 				} else if n.Kind == "groupChrPr" {
 					n.AccChar = child.Text
+				}
+			case "rPr":
+				// Math run properties: copy the styling flags onto the
+				// parent (typically an m:r) so layout can pick them up.
+				n.Nor = child.Nor
+				n.StyleB = child.StyleB
+				n.StyleI = child.StyleI
+				n.StyleBI = child.StyleBI
+				n.StyleP = child.StyleP
+				if child.Script != "" {
+					n.Script = child.Script
+				}
+			case "nor":
+				// Inside m:rPr: force upright (override default italic).
+				if n.Kind == "rPr" {
+					n.Nor = true
+				}
+			case "sty":
+				// Inside m:rPr: bold / italic style override.
+				if n.Kind == "rPr" {
+					for _, a := range t.Attr {
+						if a.Name.Local == "val" {
+							switch a.Value {
+							case "b":
+								n.StyleB = true
+							case "i":
+								n.StyleI = true
+							case "bi":
+								n.StyleBI = true
+							case "p":
+								n.StyleP = true
+							}
+						}
+					}
+				}
+			case "scr":
+				// Inside m:rPr: script-style override (roman, script,
+				// fraktur, sansSerif, monospace, doubleStruck).
+				if n.Kind == "rPr" {
+					for _, a := range t.Attr {
+						if a.Name.Local == "val" {
+							n.Script = a.Value
+						}
+					}
 				}
 			default:
 				n.Children = append(n.Children, child)
@@ -228,6 +409,11 @@ func (n *mathNode) render() string {
 		return n.Base.render() + subScript(n.Sub.render())
 	case "sSubSup":
 		return n.Base.render() + subScript(n.Sub.render()) + supScript(n.Sup.render())
+	case "sPre":
+		// Pre-script: subscripts/superscripts placed BEFORE the base.
+		// Common in chemistry/isotope notation (e.g. ²³⁵U) and tensor
+		// indices. Layout order: ⁢sub⁢sup base.
+		return subScript(n.Sub.render()) + supScript(n.Sup.render()) + n.Base.render()
 	case "nary":
 		op := n.NaryChar
 		if op == "" {
@@ -297,17 +483,36 @@ func (n *mathNode) render() string {
 		}
 		return n.Base.render() + ch
 	case "bar":
+		// w:barPr w:pos=top → overline; pos=bot → underline. AccUnder
+		// captures the under variant.
+		if n.AccUnder {
+			return n.Base.render() + "̲"
+		}
 		return "‾" + n.Base.render()
 	case "box":
-		return "⌜" + n.Base.render() + "⌝"
+		// m:box is a logical grouping element — Word uses it to prevent
+		// breaks across a sub-expression. It is NOT a visible box; the
+		// rendered text should be just the contents.
+		return n.Base.render()
 	case "borderBox":
+		// m:borderBox draws a visible rectangle around the contents.
+		// Plain-text fallback uses square brackets — the 2D layout
+		// actually strokes the box.
 		return "[" + n.Base.render() + "]"
 	case "groupChr":
+		// m:groupChr places a (typically) stretchy character above or
+		// below the base. AccUnder selects the "below" placement.
 		ch := n.AccChar
-		if ch == "" {
-			ch = "⏞"
+		if n.AccUnder {
+			if ch == "" {
+				ch = "⏟" // bottom curly bracket
+			}
+			return n.Base.render() + ch
 		}
-		return ch + "{" + n.Base.render() + "}"
+		if ch == "" {
+			ch = "⏞" // top curly bracket
+		}
+		return ch + n.Base.render()
 	case "m", "matrix":
 		// Matrix: rows separated by "; ", cells in a row by " ".
 		out := make([]string, 0, len(n.Rows))

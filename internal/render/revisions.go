@@ -94,12 +94,50 @@ func tableHasRevision(t docx.Table) bool {
 			return true
 		}
 		for _, c := range row.Cells {
-			if c.PrChange != nil {
+			if c.PrChange != nil || c.CellRevision != nil {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+// drawCellRevisionMarker paints a small marker on the cell to surface the
+// w:cellIns / w:cellDel / w:cellMerge tracked-change tag. Colors follow the
+// run-level palette: blue for insertions, red for deletions, purple for
+// merges. The cell's text content already renders normally — the marker
+// sits on top in the cell's top-left corner so reviewers can see what
+// changed without losing readability.
+func (r *renderer) drawCellRevisionMarker(rev *docx.CellRevision, x, y, width, height float64) {
+	if rev == nil || height <= 0 || width <= 0 {
+		return
+	}
+	color := "0000C0"
+	letter := "I"
+	switch rev.Kind {
+	case "del":
+		color = "C00000"
+		letter = "D"
+	case "merge":
+		color = "7030A0"
+		letter = "M"
+	}
+	if rev.Author != "" {
+		color = revisionColorForAuthor(rev.Author, color)
+	}
+	rr, gg, bb := parseHexColor(color)
+	r.pdf.SetLineWidth(1.2)
+	r.pdf.SetStrokeColor(rr, gg, bb)
+	r.pdf.Line(x, y, x, y+height) // change bar along the cell's left edge
+	r.pdf.SetFillColor(rr, gg, bb)
+	r.pdf.Oval(x+1, y+1, x+9, y+9)
+	r.pdf.SetFontSize(6)
+	r.pdf.SetX(x + 3)
+	r.pdf.SetY(y + 2)
+	r.pdf.SetTextColor(255, 255, 255)
+	_ = r.pdf.Cell(nil, letter)
+	r.pdf.SetTextColor(0, 0, 0)
+	r.pdf.SetFontSize(r.opts.DefaultFontSize)
 }
 
 // drawRevisionChangeBar paints a vertical bar to the left of the content

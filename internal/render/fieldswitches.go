@@ -79,6 +79,31 @@ func applyOneGeneralFormat(value, tok string) string {
 			return strconv.Itoa(n)
 		}
 		return value
+	case "ArabicDash":
+		// "- 1 -" page-number bracketing common in technical reports.
+		if n, ok := parseIntFlexible(value); ok {
+			return "- " + strconv.Itoa(n) + " -"
+		}
+		return value
+	case "ZOdiac", "Zodiac":
+		// Zodiac calendars: we don't ship the tables but mustn't break the
+		// pipeline — pass the value through.
+		return value
+	case "SBCHAR", "sbchar":
+		// Half-width / single-byte digit form — already what we emit.
+		return value
+	case "DBCHAR", "dbchar":
+		// Full-width digit form (e.g. ASCII '1' → '１'). Map ASCII 0..9
+		// onto the Unicode full-width block; non-digit chars pass through.
+		var b strings.Builder
+		for _, r := range value {
+			if r >= '0' && r <= '9' {
+				b.WriteRune(0xFF10 + (r - '0'))
+			} else {
+				b.WriteRune(r)
+			}
+		}
+		return b.String()
 	case "roman":
 		if n, ok := parseIntFlexible(value); ok && n > 0 {
 			return roman(n, false)

@@ -577,6 +577,51 @@ func flatTextToParagraphs(s string, defaults RunProps) []Block {
 	return blocks
 }
 
+// resolveXPathWithPrefixes is the prefix-aware variant of resolveXPath:
+// when prefixes is non-empty, each step's prefix is resolved to a URI and
+// the walker matches the element's namespace URI against it. This is what
+// Word's <w:dataBinding w:prefixMappings> compels — otherwise distinct
+// namespaces with overlapping local names would alias.
+//
+// An empty prefixes map falls back to legacy name-only behavior.
+func resolveXPathWithPrefixes(parts []CustomXMLPart, xpath string, prefixes map[string]string) (string, bool) {
+	xpath = strings.TrimSpace(xpath)
+	if xpath == "" {
+		return "", false
+	}
+	attrSel := ""
+	if i := strings.LastIndex(xpath, "/@"); i >= 0 {
+		attrSel = xpath[i+2:]
+		if j := strings.IndexAny(attrSel, "[/"); j >= 0 {
+			attrSel = attrSel[:j]
+		}
+		xpath = xpath[:i]
+	}
+	if attrSel != "" {
+		if j := strings.IndexByte(attrSel, ':'); j >= 0 {
+			attrSel = attrSel[j+1:]
+		}
+	}
+	rawSteps := strings.Split(strings.TrimPrefix(xpath, "/"), "/")
+	steps := make([]xpathStep, 0, len(rawSteps))
+	for _, s := range rawSteps {
+		st := parseXPathStep(s)
+		if st.name == "" {
+			continue
+		}
+		steps = append(steps, st)
+	}
+	if len(steps) == 0 && attrSel == "" {
+		return "", false
+	}
+	for _, part := range parts {
+		if v, ok := walkXMLForPathWithPrefixes(part.Data, steps, attrSel, prefixes); ok {
+			return v, true
+		}
+	}
+	return "", false
+}
+
 // resolveXPath does a very small subset of XPath against a custom-xml store.
 // Supports:
 //   - "/ns:Root/ns:Foo/ns:Bar"             element-suffix match → first text
@@ -631,15 +676,26 @@ func resolveXPath(parts []CustomXMLPart, xpath string) (string, bool) {
 // single attribute-equality "[@a='v']" predicate; other forms are ignored.
 type xpathStep struct {
 	name string
+	// prefix carries the namespace prefix declared on this step
+	// ("ns0" in "ns0:Root"). The walker resolves it against the
+	// prefixMappings map passed alongside, then compares URIs.
+	// Empty prefix is taken as "match any namespace" (legacy behavior).
+	prefix string
 	// position > 0 selects the Nth match (1-based). 0 means "any".
 	position int
 	// attrName/attrVal are non-empty for attribute-equality predicates.
 	attrName, attrVal string
+	// childName/childVal are non-empty for child-equality predicates
+	// (e.g. /Items/Item[Name='Foo']/Price). Compared against the child
+	// element's inner text. Prefix-stripped — namespace match is
+	// best-effort by local name only.
+	childName, childVal string
 }
 
 func parseXPathStep(s string) xpathStep {
 	var step xpathStep
 	if i := strings.IndexByte(s, ':'); i >= 0 {
+		step.prefix = s[:i]
 		s = s[i+1:]
 	}
 	if i := strings.IndexByte(s, '['); i >= 0 {
@@ -656,17 +712,88 @@ func parseXPathStep(s string) xpathStep {
 				v = strings.Trim(v, `'"`)
 				step.attrVal = v
 			}
+		} else if eq := strings.IndexByte(pred, '='); eq >= 0 {
+			// Child-element equality predicate: [Name='Foo'] or
+			// [ns:Name="Foo"]. Strip namespace prefix; match by
+			// local name only.
+			name := strings.TrimSpace(pred[:eq])
+			if ci := strings.IndexByte(name, ':'); ci >= 0 {
+				name = name[ci+1:]
+			}
+			v := strings.TrimSpace(pred[eq+1:])
+			v = strings.Trim(v, `'"`)
+			step.childName = name
+			step.childVal = v
 		}
 	}
 	step.name = s
 	return step
 }
 
+// parsePrefixMappings unpacks Word's <w:dataBinding w:prefixMappings="…">
+// attribute. The value is a space-delimited list of `xmlns:prefix='uri'`
+// declarations. The legacy form `prefix=uri` (no xmlns prefix, no quotes)
+// is also accepted for older docs.
+//
+// Returns a map prefix→URI; empty when input is empty/malformed.
+func parsePrefixMappings(s string) map[string]string {
+	out := map[string]string{}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return out
+	}
+	// Find each "xmlns:NAME=" prefix → quoted URI in the string.
+	for len(s) > 0 {
+		i := strings.Index(s, "xmlns:")
+		if i < 0 {
+			break
+		}
+		s = s[i+len("xmlns:"):]
+		eq := strings.IndexByte(s, '=')
+		if eq < 0 {
+			break
+		}
+		prefix := strings.TrimSpace(s[:eq])
+		s = s[eq+1:]
+		// Quoted URI: ' or " — accept either.
+		var uri string
+		switch {
+		case strings.HasPrefix(s, `'`):
+			end := strings.IndexByte(s[1:], '\'')
+			if end < 0 {
+				return out
+			}
+			uri = s[1 : 1+end]
+			s = s[2+end:]
+		case strings.HasPrefix(s, `"`):
+			end := strings.IndexByte(s[1:], '"')
+			if end < 0 {
+				return out
+			}
+			uri = s[1 : 1+end]
+			s = s[2+end:]
+		default:
+			// Bare URI up to next whitespace.
+			end := strings.IndexAny(s, " \t")
+			if end < 0 {
+				end = len(s)
+			}
+			uri = s[:end]
+			s = s[end:]
+		}
+		if prefix != "" {
+			out[prefix] = uri
+		}
+	}
+	return out
+}
+
 // xpathFrame is one element on the walker's stack.
 type xpathFrame struct {
-	name      string
-	attrs     map[string]string
-	childPos  map[string]int // how many times each child tag has been seen
+	name     string
+	uri      string // namespace URI of this element
+	attrs    map[string]string
+	childPos map[string]int // how many times each child tag has been seen
 }
 
 // resolveXPathInStore is the store-scoped variant of resolveXPath: when
@@ -674,8 +801,22 @@ type xpathFrame struct {
 // empty, every part is searched (legacy behavior). Returns the value
 // and a found flag.
 func resolveXPathInStore(parts []CustomXMLPart, storeItemID, xpath string) (string, bool) {
+	return resolveXPathInStoreWithPrefixes(parts, storeItemID, xpath, nil)
+}
+
+// resolveXPathInStoreWithPrefixes is the namespace-aware variant. When
+// prefixes is non-empty, namespace prefixes embedded in xpath are matched
+// against element URIs rather than dropped — required for documents that
+// bind multiple custom-xml stores carrying overlapping local names.
+func resolveXPathInStoreWithPrefixes(parts []CustomXMLPart, storeItemID, xpath string, prefixes map[string]string) (string, bool) {
+	resolve := func(p []CustomXMLPart) (string, bool) {
+		if len(prefixes) > 0 {
+			return resolveXPathWithPrefixes(p, xpath, prefixes)
+		}
+		return resolveXPath(p, xpath)
+	}
 	if storeItemID == "" {
-		return resolveXPath(parts, xpath)
+		return resolve(parts)
 	}
 	guid := strings.Trim(storeItemID, "{}")
 	for _, p := range parts {
@@ -683,14 +824,14 @@ func resolveXPathInStore(parts []CustomXMLPart, storeItemID, xpath string) (stri
 		if !strings.EqualFold(pg, guid) {
 			continue
 		}
-		if v, ok := resolveXPath([]CustomXMLPart{p}, xpath); ok {
+		if v, ok := resolve([]CustomXMLPart{p}); ok {
 			return v, true
 		}
 		return "", false
 	}
 	// Fallback: GUID not found among loaded stores (older docs sometimes
 	// drop the itemProps file). Search every store as a recovery.
-	return resolveXPath(parts, xpath)
+	return resolve(parts)
 }
 
 // readStoreItemGUID locates customXml/itemPropsN.xml that pairs with
@@ -877,6 +1018,95 @@ func walkXMLForPath(data []byte, steps []xpathStep, attrSel string) (string, boo
 	}
 }
 
+// walkXMLForPathWithPrefixes is walkXMLForPath plus URI matching when the
+// step carries a namespace prefix that resolves through `prefixes`.
+//
+// Empty prefixes map = legacy local-name matching for every step (callers
+// who want namespace-strict matching must populate prefixes from
+// w:prefixMappings).
+func walkXMLForPathWithPrefixes(data []byte, steps []xpathStep, attrSel string, prefixes map[string]string) (string, bool) {
+	dec := xml.NewDecoder(strings.NewReader(string(data)))
+	var stack []xpathFrame
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return "", false
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			if len(stack) > 0 {
+				if stack[len(stack)-1].childPos == nil {
+					stack[len(stack)-1].childPos = map[string]int{}
+				}
+				stack[len(stack)-1].childPos[t.Name.Local]++
+			}
+			attrs := map[string]string{}
+			for _, a := range t.Attr {
+				attrs[a.Name.Local] = a.Value
+			}
+			stack = append(stack, xpathFrame{
+				name:  t.Name.Local,
+				uri:   t.Name.Space,
+				attrs: attrs,
+			})
+			if attrSel != "" && matchSuffixNS(stack, steps, prefixes) {
+				if v, ok := attrs[attrSel]; ok {
+					return strings.TrimSpace(v), true
+				}
+			}
+		case xml.EndElement:
+			if len(stack) > 0 {
+				stack = stack[:len(stack)-1]
+			}
+		case xml.CharData:
+			if attrSel != "" {
+				continue
+			}
+			if matchSuffixNS(stack, steps, prefixes) {
+				v := strings.TrimSpace(string(t))
+				if v != "" {
+					return v, true
+				}
+			}
+		}
+	}
+}
+
+// matchSuffixNS is matchSuffixWithPredicates plus a namespace-URI check
+// when the step's prefix resolves through `prefixes`. Steps with no
+// prefix (or with a prefix not in the map) match by local name only —
+// keeping behavior identical to the legacy resolver for those steps.
+func matchSuffixNS(stack []xpathFrame, steps []xpathStep, prefixes map[string]string) bool {
+	if len(stack) < len(steps) {
+		return false
+	}
+	off := len(stack) - len(steps)
+	for i, st := range steps {
+		f := stack[off+i]
+		if st.name != "" && st.name != f.name {
+			return false
+		}
+		if st.prefix != "" && len(prefixes) > 0 {
+			if uri, ok := prefixes[st.prefix]; ok && uri != f.uri {
+				return false
+			}
+		}
+		if st.position > 0 {
+			var parentCount int
+			if off+i-1 >= 0 {
+				parentCount = stack[off+i-1].childPos[f.name]
+			}
+			if parentCount != st.position {
+				return false
+			}
+		}
+		if st.attrName != "" && f.attrs[st.attrName] != st.attrVal {
+			return false
+		}
+	}
+	return true
+}
+
 // matchSuffixWithPredicates returns true when the last len(steps) stack
 // frames satisfy their corresponding steps' tag-name and optional predicate.
 func matchSuffixWithPredicates(stack []xpathFrame, steps []xpathStep) bool {
@@ -1018,6 +1248,24 @@ func extractChartStruct(f *zip.File) (ChartData, error) {
 		switch se.Name.Local {
 		case "title":
 			out.Title = extractChartTitle(dec, se)
+		case "catAx":
+			title, deleted := parseAxisInfo(dec, se)
+			if title != "" {
+				out.XAxisTitle = title
+			}
+			if deleted {
+				out.CategoryAxisDeleted = true
+			}
+		case "valAx":
+			title, deleted := parseAxisInfo(dec, se)
+			if title != "" {
+				out.YAxisTitle = title
+			}
+			if deleted {
+				out.ValueAxisDeleted = true
+			}
+		case "dLbls":
+			parseDLbls(dec, se, &out.DataLabels)
 		case "barChart":
 			out.Kind = "column"
 			for _, a := range se.Attr {
@@ -1065,14 +1313,24 @@ func extractChartStruct(f *zip.File) (ChartData, error) {
 				return out, err
 			}
 		case "stockChart":
-			// Stock chart is rendered as a line chart for the closing series.
-			out.Kind = "line"
+			// Stock chart carries 3 or 4 series (open/high/low/close). The
+			// renderer composes candlesticks from them.
+			out.Kind = "stock"
 			if err := parseChartTypeBody(dec, se, &out); err != nil {
 				return out, err
 			}
 		case "surfaceChart", "surface3DChart":
-			// Surface charts have no good 2D analogue; fall through to line.
-			out.Kind = "line"
+			// Surface charts: render as stacked line series with subtle
+			// gradient-style fills between adjacent series so the
+			// "topographic" intent is at least suggested.
+			out.Kind = "surface"
+			if err := parseChartTypeBody(dec, se, &out); err != nil {
+				return out, err
+			}
+		case "ofPieChart":
+			// Pie-of-pie / bar-of-pie. The detail series gets pulled out
+			// of the main pie into a smaller adjacent pie or column.
+			out.Kind = "ofPie"
 			if err := parseChartTypeBody(dec, se, &out); err != nil {
 				return out, err
 			}
@@ -1105,6 +1363,86 @@ func extractChartTitle(dec *xml.Decoder, start xml.StartElement) string {
 		}
 	}
 	return strings.TrimSpace(sb.String())
+}
+
+// parseAxisInfo walks a c:catAx / c:valAx subtree, scraping the axis
+// title text and whether the axis is marked deleted.
+func parseAxisInfo(dec *xml.Decoder, start xml.StartElement) (title string, deleted bool) {
+	depth := 1
+	for depth > 0 {
+		tok, err := dec.Token()
+		if err != nil {
+			return
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			switch t.Name.Local {
+			case "title":
+				title = extractChartTitle(dec, t)
+			case "delete":
+				v := attr(t, "val")
+				deleted = v == "" || v == "1" || v == "true"
+				_ = dec.Skip()
+			default:
+				depth++
+			}
+		case xml.EndElement:
+			depth--
+		}
+	}
+	return
+}
+
+// parseDLbls reads c:dLbls option toggles into out.
+func parseDLbls(dec *xml.Decoder, start xml.StartElement, out *DataLabelOptions) {
+	depth := 1
+	for depth > 0 {
+		tok, err := dec.Token()
+		if err != nil {
+			return
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			val := attr(t, "val")
+			truthy := val == "" || val == "1" || val == "true"
+			switch t.Name.Local {
+			case "showVal":
+				if truthy {
+					out.ShowVal = true
+				}
+				_ = dec.Skip()
+			case "showCatName":
+				if truthy {
+					out.ShowCatName = true
+				}
+				_ = dec.Skip()
+			case "showSerName":
+				if truthy {
+					out.ShowSerName = true
+				}
+				_ = dec.Skip()
+			case "showPercent":
+				if truthy {
+					out.ShowPercent = true
+				}
+				_ = dec.Skip()
+			case "showLegendKey":
+				if truthy {
+					out.ShowLegendKey = true
+				}
+				_ = dec.Skip()
+			case "showBubbleSize":
+				if truthy {
+					out.ShowBubbleSize = true
+				}
+				_ = dec.Skip()
+			default:
+				depth++
+			}
+		case xml.EndElement:
+			depth--
+		}
+	}
 }
 
 // parseChartTypeBody walks the children of a chart type element, picking

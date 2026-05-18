@@ -44,6 +44,16 @@ type sdtProps struct {
 	// when present — we don't currently chase the glossary part, but we
 	// keep the field so future code can.
 	placeholderText string
+	// showingPlcHdr mirrors <w:showingPlcHdr/>. When set, Word renders
+	// the placeholder text (glossary lookup) rather than user-supplied
+	// content. We surface it so the renderer can prefer the placeholder
+	// even if the sdtContent has user typing.
+	showingPlcHdr bool
+	// lock mirrors <w:lock w:val="…"/> — "unlocked", "sdtLocked",
+	// "contentLocked", or "sdtContentLocked". Informational only; the
+	// PDF surface has no native edit-permission marker, but consumers
+	// inspecting the AST (e.g. for tag-aware exports) can read it.
+	lock string
 }
 
 // decodeBlockSdt walks a block-level <w:sdt> subtree and returns the
@@ -66,7 +76,7 @@ func decodeBlockSdt(dec *xml.Decoder, start xml.StartElement, pctx *parseDocCont
 			case "sdtPr":
 				props = scanSdtProps(dec, t)
 				if props.xpath != "" {
-					if v, ok := resolveXPathInStore(pctx.doc.CustomXMLRoots, props.storeItemID, props.xpath); ok {
+					if v, ok := resolveXPathInStoreWithPrefixes(pctx.doc.CustomXMLRoots, props.storeItemID, applyRepeatContext(props.xpath, pctx.repeatStack), parsePrefixMappings(props.xpathPrefix)); ok {
 						boundText = v
 						bindingResolved = true
 					}
@@ -83,7 +93,7 @@ func decodeBlockSdt(dec *xml.Decoder, start xml.StartElement, pctx *parseDocCont
 					_ = dec.Skip()
 					continue
 				}
-				if syntheticText, useSynth := sdtSyntheticText(props); useSynth {
+				if syntheticText, useSynth := sdtSyntheticTextWithGlossary(props, pctx.doc.Glossary); useSynth {
 					_ = dec.Skip()
 					p := Paragraph{Runs: []Run{{Text: syntheticText, Props: pctx.doc.Defaults}}}
 					out = append(out, p)
@@ -95,21 +105,44 @@ func decodeBlockSdt(dec *xml.Decoder, start xml.StartElement, pctx *parseDocCont
 					out = append(out, p)
 					continue
 				}
-				// OpenDoPE repeat: capture the content once, then clone it
-				// N times. Decoded blocks share the same content text since
-				// we don't currently splice per-iteration XPath substitutions.
+				// OpenDoPE repeat: capture the content's raw token stream
+				// once, then RE-DECODE it for each iteration with a fresh
+				// repeat frame on pctx.repeatStack. Inner SDT XPaths
+				// (resolved during decoding) consult the frame via
+				// applyRepeatContext, so each clone resolves its own
+				// iteration's data instead of all sharing iteration 0.
 				if props.odRepeat != "" {
 					n := resolveOpenDoPERepeatCount(pctx.doc, props.odRepeat)
 					if n <= 0 {
 						_ = dec.Skip()
 						continue
 					}
-					captured := []Block{}
-					if err := decodeSdtContentBlocks(dec, t, pctx, &captured); err != nil {
+					buf, err := captureElementXML(dec, t)
+					if err != nil {
 						return nil, err
 					}
+					// xpathPrefix used for inner-XPath rewriting: the base
+					// XPath the repeat is iterating over.
+					prefix := ""
+					if px, ok := pctx.doc.OpenDoPEXPaths[props.odRepeat]; ok {
+						prefix = px
+					}
 					for i := 0; i < n; i++ {
-						out = append(out, captured...)
+						pctx.repeatStack = append(pctx.repeatStack, openDopeRepeatFrame{
+							xpathPrefix: prefix,
+							index:       i + 1,
+						})
+						sub := xml.NewDecoder(strings.NewReader(buf))
+						// captureElementXML wraps the captured content in
+						// a synthetic <sdtContent> envelope so we can drive
+						// the standard block decoder against it.
+						subStart, err := readNextStart(sub)
+						if err == nil {
+							captured := []Block{}
+							_ = decodeSdtContentBlocks(sub, subStart, pctx, &captured)
+							out = append(out, captured...)
+						}
+						pctx.repeatStack = pctx.repeatStack[:len(pctx.repeatStack)-1]
 					}
 					continue
 				}
@@ -125,6 +158,31 @@ func decodeBlockSdt(dec *xml.Decoder, start xml.StartElement, pctx *parseDocCont
 			}
 		}
 	}
+}
+
+// sdtSyntheticTextWithGlossary is the placeholder-aware variant. It
+// first tries the typed state (checkbox/date/dropdown/picture). Failing
+// that, when the sdtPr declared a w:placeholder/w:docPart, it looks up
+// the doc-part name in the glossary and returns the resulting text.
+//
+// When <w:showingPlcHdr/> is set, the placeholder lookup wins even when
+// typed state exists — matches Word's behavior where un-filled controls
+// always show their placeholder until the user starts typing.
+func sdtSyntheticTextWithGlossary(p sdtProps, glossary map[string]string) (string, bool) {
+	if p.showingPlcHdr && p.placeholderText != "" && glossary != nil {
+		if v, ok := glossary[p.placeholderText]; ok && v != "" {
+			return v, true
+		}
+	}
+	if s, ok := sdtSyntheticText(p); ok {
+		return s, true
+	}
+	if p.placeholderText != "" && glossary != nil {
+		if v, ok := glossary[p.placeholderText]; ok && v != "" {
+			return v, true
+		}
+	}
+	return "", false
 }
 
 // sdtSyntheticText returns a text representation when the SDT carries
@@ -304,8 +362,18 @@ func scanSdtProps(dec *xml.Decoder, start xml.StartElement) sdtProps {
 					p.kind = "picture"
 				}
 			case "placeholder":
-				if p.defaultText == "" {
-					p.defaultText = ""
+				// <w:placeholder><w:docPart w:val="DocPartName"/></w:placeholder>
+				// names a glossary doc-part whose body Word substitutes when
+				// the SDT has no other content. We capture the name; the
+				// caller resolves it against the Document.Glossary map.
+				if dpName := scanPlaceholderDocPart(dec, t); dpName != "" {
+					p.placeholderText = dpName
+				}
+			case "showingPlcHdr":
+				p.showingPlcHdr = true
+			case "lock":
+				if v := attr(t, "val"); v != "" {
+					p.lock = v
 				}
 			}
 		case xml.EndElement:
@@ -319,6 +387,97 @@ func scanSdtProps(dec *xml.Decoder, start xml.StartElement) sdtProps {
 // sdtPr subtree, kept for callers that don't need the typed metadata.
 func scanSdtBinding(dec *xml.Decoder, start xml.StartElement) string {
 	return scanSdtProps(dec, start).xpath
+}
+
+// scanPlaceholderDocPart walks a w:placeholder subtree and returns the
+// w:docPart w:val attribute when present. This name keys into the
+// Document.Glossary map; an empty return means the placeholder didn't
+// reference a glossary part.
+func scanPlaceholderDocPart(dec *xml.Decoder, start xml.StartElement) string {
+	depth := 1
+	for depth > 0 {
+		tok, err := dec.Token()
+		if err != nil {
+			return ""
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			depth++
+			if t.Name.Local == "docPart" {
+				for _, a := range t.Attr {
+					if a.Name.Local == "val" {
+						return a.Value
+					}
+				}
+			}
+		case xml.EndElement:
+			depth--
+		}
+	}
+	return ""
+}
+
+// captureElementXML serializes the current element's full sub-tree
+// (start through matching end) into a string buffer so callers can
+// re-decode the same content multiple times. The decoder is positioned
+// at the open of `start` and is advanced through the matching end-tag
+// on return. The returned XML wraps the captured content in the same
+// outer element so re-decoding starts at the same level.
+//
+// Note: namespaces declared on ancestor elements aren't repeated on the
+// captured element. This is acceptable for our consumers (the SDT block
+// decoder) which only consult local names — but means the captured XML
+// shouldn't be handed to an XPath-style consumer expecting full
+// namespace context.
+func captureElementXML(dec *xml.Decoder, start xml.StartElement) (string, error) {
+	var b strings.Builder
+	enc := xml.NewEncoder(&strBuilderWriter{&b})
+	if err := enc.EncodeToken(start); err != nil {
+		return "", err
+	}
+	depth := 1
+	for depth > 0 {
+		tok, err := dec.Token()
+		if err != nil {
+			return "", err
+		}
+		if err := enc.EncodeToken(tok); err != nil {
+			return "", err
+		}
+		switch tok.(type) {
+		case xml.StartElement:
+			depth++
+		case xml.EndElement:
+			depth--
+		}
+	}
+	if err := enc.Flush(); err != nil {
+		return "", err
+	}
+	return b.String(), nil
+}
+
+// readNextStart advances the decoder to the next start-element token
+// and returns it. Returns the zero StartElement on early EOF.
+func readNextStart(dec *xml.Decoder) (xml.StartElement, error) {
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return xml.StartElement{}, err
+		}
+		if s, ok := tok.(xml.StartElement); ok {
+			return s, nil
+		}
+	}
+}
+
+// strBuilderWriter adapts strings.Builder to the io.Writer interface
+// xml.NewEncoder needs. (strings.Builder.Write already exists, but
+// xml.Encoder constructs an *bufio.Writer that wants io.Writer.)
+type strBuilderWriter struct{ b *strings.Builder }
+
+func (w *strBuilderWriter) Write(p []byte) (int, error) {
+	return w.b.Write(p)
 }
 
 // decodeSdtContentBlocks dispatches block-level children of <w:sdtContent>.
@@ -376,7 +535,7 @@ func decodeInlineSdt(dec *xml.Decoder, start xml.StartElement, p *Paragraph, par
 			case "sdtPr":
 				props = scanSdtProps(dec, t)
 				if props.xpath != "" {
-					if v, ok := resolveXPathInStore(pctx.doc.CustomXMLRoots, props.storeItemID, props.xpath); ok {
+					if v, ok := resolveXPathInStoreWithPrefixes(pctx.doc.CustomXMLRoots, props.storeItemID, applyRepeatContext(props.xpath, pctx.repeatStack), parsePrefixMappings(props.xpathPrefix)); ok {
 						boundText = v
 						bindingResolved = true
 					}

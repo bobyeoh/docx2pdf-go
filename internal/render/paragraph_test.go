@@ -151,29 +151,55 @@ func TestFormatNumber(t *testing.T) {
 
 func TestFormatLevelText(t *testing.T) {
 	// Bullet shortcut.
-	if got := formatLevelText(docx.NumLevel{Format: "bullet", Text: "•"}, nil); got != "•" {
+	if got := formatLevelText(docx.NumLevel{Format: "bullet", Text: "•"}, nil, nil); got != "•" {
 		t.Errorf("bullet: got %q", got)
 	}
 	// Default bullet when text is empty.
-	if got := formatLevelText(docx.NumLevel{Format: "bullet"}, nil); got != "•" {
+	if got := formatLevelText(docx.NumLevel{Format: "bullet"}, nil, nil); got != "•" {
 		t.Errorf("default bullet: got %q", got)
 	}
 	// Decimal substitution.
 	lv := docx.NumLevel{Format: "decimal", Text: "%1."}
 	counters := map[int]int{0: 5}
-	if got := formatLevelText(lv, counters); got != "5." {
+	all := map[int]docx.NumLevel{0: lv}
+	if got := formatLevelText(lv, all, counters); got != "5." {
 		t.Errorf("decimal: got %q", got)
 	}
-	// Multi-level legal numbering.
-	lv = docx.NumLevel{Format: "decimal", Text: "%1.%2.%3"}
+	// Multi-level legal numbering — each %N uses its own level's format.
+	allMulti := map[int]docx.NumLevel{
+		0: {Format: "decimal", Text: "%1."},
+		1: {Format: "decimal", Text: "%1.%2."},
+		2: {Format: "decimal", Text: "%1.%2.%3"},
+	}
+	lv = allMulti[2]
 	counters = map[int]int{0: 1, 1: 2, 2: 3}
-	if got := formatLevelText(lv, counters); got != "1.2.3" {
+	if got := formatLevelText(lv, allMulti, counters); got != "1.2.3" {
 		t.Errorf("multi-level: got %q", got)
 	}
-	// IsLgl forces decimal for all placeholders even if level format isn't.
+	// IsLgl forces decimal even when other levels are roman/letter.
 	lv = docx.NumLevel{Format: "upperLetter", Text: "%1.%2", IsLgl: true}
+	allLgl := map[int]docx.NumLevel{
+		0: {Format: "upperRoman", Text: "%1"},
+		1: lv,
+	}
 	counters = map[int]int{0: 1, 1: 2}
-	if got := formatLevelText(lv, counters); got != "1.2" {
+	if got := formatLevelText(lv, allLgl, counters); got != "1.2" {
 		t.Errorf("isLgl: got %q", got)
+	}
+}
+
+// TestFormatLevelText_PerLevelFormat exercises the new behavior where each
+// %N substitution honors the FORMAT OF THAT LEVEL rather than blindly using
+// the current level's. A mixed roman/decimal outline must show "II.3" when
+// level 0 is upperRoman and level 1 is decimal.
+func TestFormatLevelText_PerLevelFormat(t *testing.T) {
+	all := map[int]docx.NumLevel{
+		0: {Format: "upperRoman", Text: "%1."},
+		1: {Format: "decimal", Text: "%1.%2"},
+	}
+	counters := map[int]int{0: 2, 1: 3}
+	got := formatLevelText(all[1], all, counters)
+	if got != "II.3" {
+		t.Errorf("mixed roman+decimal: got %q want II.3", got)
 	}
 }

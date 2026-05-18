@@ -285,17 +285,31 @@ func trimHash(s string) string { return strings.TrimPrefix(s, "#") }
 // parseBlipEffects walks an <a:blip> subtree collecting per-pixel filter
 // children. start is the <a:blip> element token; on return the decoder
 // has consumed up through </a:blip>.
-func parseBlipEffects(dec *xml.Decoder, start xml.StartElement, theme Theme) []ImageEffect {
+//
+// Also returns the asvg:svgBlip embed rId when the blip's extLst carries
+// an Office 365 SVG extension — callers prefer this rId over the raster
+// preview embed so vector graphics render at native resolution.
+func parseBlipEffects(dec *xml.Decoder, start xml.StartElement, theme Theme) ([]ImageEffect, string) {
 	var out []ImageEffect
+	svgRID := ""
 	depth := 1
 	for depth > 0 {
 		tok, err := dec.Token()
 		if err != nil {
-			return out
+			return out, svgRID
 		}
 		switch t := tok.(type) {
 		case xml.StartElement:
 			switch t.Name.Local {
+			case "svgBlip":
+				// asvg:svgBlip r:embed="rIdN" — the SVG source for the
+				// raster preview held by the outer a:blip.
+				for _, a := range t.Attr {
+					if a.Name.Local == "embed" && svgRID == "" {
+						svgRID = a.Value
+					}
+				}
+				_ = dec.Skip()
 			case "alphaModFix":
 				eff := ImageEffect{Kind: "alphaModFix", Amount: 100}
 				if v := attr(t, "amt"); v != "" {
@@ -361,6 +375,48 @@ func parseBlipEffects(dec *xml.Decoder, start xml.StartElement, theme Theme) []I
 				}
 				out = append(out, eff)
 				_ = dec.Skip()
+			case "hsl":
+				// a:hsl carries hue (degrees * 60000), saturation
+				// (1/100000), and lum (1/100000). Signed.
+				eff := ImageEffect{Kind: "hsl"}
+				if v := attr(t, "hue"); v != "" {
+					if x, e := strconv.ParseFloat(v, 64); e == nil {
+						eff.HueDeg = x / 60000.0
+					}
+				}
+				if v := attr(t, "sat"); v != "" {
+					if x, e := strconv.ParseFloat(v, 64); e == nil {
+						eff.Saturation = x / 100000.0
+					}
+				}
+				if v := attr(t, "lum"); v != "" {
+					if x, e := strconv.ParseFloat(v, 64); e == nil {
+						eff.Lum = x / 100000.0
+					}
+				}
+				out = append(out, eff)
+				_ = dec.Skip()
+			case "tint":
+				eff := ImageEffect{Kind: "tint"}
+				if v := attr(t, "amt"); v != "" {
+					if x, e := strconv.ParseFloat(v, 64); e == nil {
+						eff.Amount = x / 1000.0 // 0..100000 → 0..100
+					}
+				}
+				out = append(out, eff)
+				_ = dec.Skip()
+			case "shade":
+				eff := ImageEffect{Kind: "shade"}
+				if v := attr(t, "amt"); v != "" {
+					if x, e := strconv.ParseFloat(v, 64); e == nil {
+						eff.Amount = x / 1000.0
+					}
+				}
+				out = append(out, eff)
+				_ = dec.Skip()
+			case "alphaInv":
+				out = append(out, ImageEffect{Kind: "alphaInv"})
+				_ = dec.Skip()
 			default:
 				depth++
 			}
@@ -368,7 +424,7 @@ func parseBlipEffects(dec *xml.Decoder, start xml.StartElement, theme Theme) []I
 			depth--
 		}
 	}
-	return out
+	return out, svgRID
 }
 
 // drainColorListUntilEnd reads color leaves inside start until limit

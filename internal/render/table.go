@@ -16,11 +16,14 @@ import (
 // than one condition (e.g. firstRow + firstColumn = nwCell) the more
 // specific corner condition wins.
 func (r *renderer) applyTableStyleToCells(t *docx.Table) {
-	if t.StyleID == "" {
+	// When the table has no style we still want to apply Table.Shading as
+	// a per-cell fallback. Build an empty TableStyle so the loop below
+	// runs and gets a chance to fill cell.Shading from t.Shading.
+	ts, ok := r.doc.TableStyles[t.StyleID]
+	if t.StyleID != "" && !ok {
 		return
 	}
-	ts, ok := r.doc.TableStyles[t.StyleID]
-	if !ok {
+	if t.StyleID == "" && t.Shading == "" {
 		return
 	}
 	nRows := len(t.Rows)
@@ -28,7 +31,7 @@ func (r *renderer) applyTableStyleToCells(t *docx.Table) {
 		nCols := len(t.Rows[ri].Cells)
 		for ci := range t.Rows[ri].Cells {
 			cell := &t.Rows[ri].Cells[ci]
-			conds := matchingConditions(t.Look, ri, ci, nRows, nCols)
+			conds := matchingConditions(t.Look, ri, ci, nRows, nCols, t.RowBandSize, t.ColBandSize, t.Rows[ri].CnfStyle, cell.CnfStyle)
 
 			// Build the merged extra props/shading/borders from the
 			// matching condition blocks. Later entries in `conds`
@@ -81,6 +84,11 @@ func (r *renderer) applyTableStyleToCells(t *docx.Table) {
 			if cell.Shading == "" && condShading != "" {
 				cell.Shading = condShading
 			}
+			// Fall back to the table-level w:shd when the cell still has
+			// no shading after style+conditional resolution.
+			if cell.Shading == "" && t.Shading != "" {
+				cell.Shading = t.Shading
+			}
 			if condBorders.Top.Has() && !cell.Borders.Top.Has() {
 				cell.Borders.Top = condBorders.Top
 			}
@@ -118,19 +126,35 @@ func hasCondition(ts docx.TableStyle, name string) bool {
 // the cell at (ri, ci) in row order: bands first (lowest priority), then
 // firstRow/lastRow/firstCol/lastCol, finally corner cells (highest
 // priority). The caller merges in that order so specific entries win.
-func matchingConditions(look docx.TableLook, ri, ci, nRows, nCols int) []string {
+//
+// rowBand and colBand are the table's banding sizes (default 1). When > 1
+// the parity computation uses (index / size) so e.g. rowBandSize=2 groups
+// rows in pairs of two before alternating bands.
+//
+// rowCnf and cellCnf are explicit w:cnfStyle bits read from this row/cell;
+// when any flag is set the corresponding condition key is forced into the
+// output regardless of position. This is how Word lets a mid-table row
+// pose as a "firstRow" stylistically.
+func matchingConditions(look docx.TableLook, ri, ci, nRows, nCols, rowBand, colBand int, rowCnf, cellCnf docx.CnfStyle) []string {
+	if rowBand < 1 {
+		rowBand = 1
+	}
+	if colBand < 1 {
+		colBand = 1
+	}
 	var out []string
 	// Banding (zero-indexed). Banding fires only when the relevant
-	// "NoHBand"/"NoVBand" flag is clear.
+	// "NoHBand"/"NoVBand" flag is clear. Banding groups consecutive rows /
+	// columns by RowBandSize / ColBandSize before alternating.
 	if !look.NoHBand && nRows > 1 {
-		if ri%2 == 0 {
+		if (ri/rowBand)%2 == 0 {
 			out = append(out, "band1Horz")
 		} else {
 			out = append(out, "band2Horz")
 		}
 	}
 	if !look.NoVBand && nCols > 1 {
-		if ci%2 == 0 {
+		if (ci/colBand)%2 == 0 {
 			out = append(out, "band1Vert")
 		} else {
 			out = append(out, "band2Vert")
@@ -161,11 +185,88 @@ func matchingConditions(look docx.TableLook, ri, ci, nRows, nCols int) []string 
 	if look.LastRow && look.LastColumn && ri == nRows-1 && ci == nCols-1 && nRows > 1 && nCols > 1 {
 		out = append(out, "seCell")
 	}
+	// Explicit per-row / per-cell cnfStyle overrides — these forcibly add
+	// a condition key even when the cell isn't at the table edge. Word
+	// uses this when a row in the middle of the table should restyle as
+	// if it were the first/last/header row.
+	addCnf := func(c docx.CnfStyle) {
+		if !c.Any() {
+			return
+		}
+		if c.FirstRow {
+			out = append(out, "firstRow")
+		}
+		if c.LastRow {
+			out = append(out, "lastRow")
+		}
+		if c.FirstColumn {
+			out = append(out, "firstCol")
+		}
+		if c.LastColumn {
+			out = append(out, "lastCol")
+		}
+		if c.Band1Horz {
+			out = append(out, "band1Horz")
+		}
+		if c.Band2Horz {
+			out = append(out, "band2Horz")
+		}
+		if c.Band1Vert {
+			out = append(out, "band1Vert")
+		}
+		if c.Band2Vert {
+			out = append(out, "band2Vert")
+		}
+		if c.NWCell {
+			out = append(out, "nwCell")
+		}
+		if c.NECell {
+			out = append(out, "neCell")
+		}
+		if c.SWCell {
+			out = append(out, "swCell")
+		}
+		if c.SECell {
+			out = append(out, "seCell")
+		}
+	}
+	addCnf(rowCnf)
+	addCnf(cellCnf)
 	return out
+}
+
+// applyDefaultCellMargins folds w:tblCellMar (table-level default cell
+// padding) into each cell that didn't set its own w:tcMar. Done as a
+// pre-pass so drawRow can ignore the table object and just use the cell
+// fields. Mirrors docx4j's BorderConflictResolverNG behavior:
+// per-cell value WINS when present, otherwise inherit the table default.
+func applyDefaultCellMargins(t *docx.Table) {
+	dm := t.DefaultCellMargins
+	if dm.Top == 0 && dm.Bottom == 0 && dm.Left == 0 && dm.Right == 0 {
+		return
+	}
+	for ri := range t.Rows {
+		for ci := range t.Rows[ri].Cells {
+			c := &t.Rows[ri].Cells[ci]
+			if c.MarginTopPt == 0 {
+				c.MarginTopPt = dm.Top
+			}
+			if c.MarginBottomPt == 0 {
+				c.MarginBottomPt = dm.Bottom
+			}
+			if c.MarginLeftPt == 0 {
+				c.MarginLeftPt = dm.Left
+			}
+			if c.MarginRightPt == 0 {
+				c.MarginRightPt = dm.Right
+			}
+		}
+	}
 }
 
 func (r *renderer) drawTable(t docx.Table) error {
 	r.applyTableStyleToCells(&t)
+	applyDefaultCellMargins(&t)
 	r.resolveHMerge(&t)
 	r.resolveAdjacentBorders(&t)
 	r.resolveVMerge(&t)
@@ -186,6 +287,21 @@ func (r *renderer) drawTable(t docx.Table) error {
 		return nil
 	}
 	widths := r.resolveColumnWidths(t, cols)
+	// BidiVisual: render columns right-to-left. We reverse the per-row cell
+	// order plus the resolved width slice so every downstream "left edge
+	// of column i" computation Just Works without sprinkling RTL checks
+	// across drawRow / resolveColumnWidths.
+	if t.BidiVisual {
+		for i, j := 0, len(widths)-1; i < j; i, j = i+1, j-1 {
+			widths[i], widths[j] = widths[j], widths[i]
+		}
+		for ri := range t.Rows {
+			cells := t.Rows[ri].Cells
+			for i, j := 0, len(cells)-1; i < j; i, j = i+1, j-1 {
+				cells[i], cells[j] = cells[j], cells[i]
+			}
+		}
+	}
 	r.activeTableSpacing = t.CellSpacingTwips
 	defer func() { r.activeTableSpacing = 0 }()
 
@@ -197,9 +313,41 @@ func (r *renderer) drawTable(t docx.Table) error {
 		tblIndent = float64(t.IndentTwips) / 20.0
 	}
 
-	// Floating table (tblpPr): full text-wrap isn't implemented but we
-	// at least honor the requested horizontal alignment and absolute
-	// X offset so the table lands roughly where the source asked.
+	// w:jc on the table (Alignment "center" / "right" / "end") shifts the
+	// whole table inside contentW by the slack between the table's total
+	// width and contentW. We implement it via marL/contentW the same way
+	// floating tables do, but only when no FloatPos is set (FloatPos owns
+	// its own alignment).
+	if t.FloatPos == nil && (t.Alignment == "center" || t.Alignment == "right" || t.Alignment == "end") {
+		sum := 0.0
+		for _, w := range widths {
+			sum += w
+		}
+		slack := r.contentW - sum
+		if slack > 0 {
+			shift := 0.0
+			switch t.Alignment {
+			case "center":
+				shift = slack / 2
+			case "right", "end":
+				shift = slack
+			}
+			savedMarL, savedContentW := r.marL, r.contentW
+			r.marL += shift
+			r.contentW = sum
+			defer func() {
+				r.marL = savedMarL
+				r.contentW = savedContentW
+			}()
+			// jc already absorbed tblIndent's role; don't double-shift.
+			tblIndent = 0
+		}
+	}
+
+	// Floating table (tblpPr): honor X position via XAlign/XTwips, and Y
+	// via YAlign/YTwips relative to vAnchor. Real text-wrap (other content
+	// flowing around the table) needs per-line clipping which we don't yet
+	// emit — at least the table now lands at the requested Y.
 	if t.FloatPos != nil {
 		fp := t.FloatPos
 		sum := 0.0
@@ -233,12 +381,74 @@ func (r *renderer) drawTable(t docx.Table) error {
 		if newMarL < 0 {
 			newMarL = 0
 		}
+		// Y positioning. vAnchor: "page" anchors from page top; "margin"
+		// (default) anchors from marT; "text" stays in flow. yAlign:
+		// top/center/bottom relative to the anchor; explicit yTwips
+		// when no alignment.
+		savedY := r.cursorY
+		if fp.VAnchor != "text" {
+			anchorTop := r.marT
+			anchorBottom := r.pageH - r.marB
+			if fp.VAnchor == "page" {
+				anchorTop = 0
+				anchorBottom = r.pageH
+			}
+			tableH := r.predictTableHeight(t, widths)
+			var newY float64
+			switch fp.YAlign {
+			case "top":
+				newY = anchorTop
+			case "center":
+				newY = (anchorTop+anchorBottom)/2 - tableH/2
+			case "bottom":
+				newY = anchorBottom - tableH
+			default:
+				if fp.YTwips != 0 {
+					newY = anchorTop + float64(fp.YTwips)/20.0
+				} else {
+					newY = r.cursorY
+				}
+			}
+			if newY < r.marT {
+				newY = r.marT
+			}
+			r.cursorY = newY
+		}
 		savedMarL, savedContentW := r.marL, r.contentW
 		r.marL = newMarL
 		r.contentW = sum
+		// floatBand registration for out-of-flow tables: once the
+		// table is drawn, subsequent in-flow paragraphs should wrap
+		// around it. Word's default for w:tblpPr-anchored tables is
+		// to wrap surrounding text; we always register the band.
+		floatBandTopY := r.cursorY
+		side := "left"
+		switch fp.XAlign {
+		case "right", "outside":
+			side = "right"
+		}
 		defer func() {
+			tableBottomY := r.cursorY
 			r.marL = savedMarL
 			r.contentW = savedContentW
+			// For "text" vAnchor leave the table's tail position alone;
+			// for page/margin anchor restore the in-flow cursor — the
+			// table renders out-of-flow.
+			if fp.VAnchor != "text" {
+				r.cursorY = savedY
+			}
+			// Set the band only when the table actually occupied a
+			// non-zero vertical extent.
+			if tableBottomY > floatBandTopY+1 {
+				r.floatBand = &floatWrapBand{
+					leftX:   newMarL,
+					rightX:  newMarL + sum,
+					topY:    floatBandTopY,
+					bottomY: tableBottomY,
+					side:    side,
+					gapPt:   6,
+				}
+			}
 		}()
 		// Disable tblIndent on floating tables — XAlign already places
 		// the table's left edge.
@@ -423,6 +633,26 @@ func (r *renderer) resolveColumnWidths(t docx.Table, cols int) []float64 {
 				widths[i] *= scale
 			}
 		}
+		// Autofit *expansion*: when the table doesn't declare an explicit
+		// width (tblW absent or "auto") and the grid totals less than
+		// contentW, Word grows columns proportionally to fill the
+		// available width. Skip this when tblW pct/dxa pinned the width
+		// or when we're inside a column/cell context where the table is
+		// meant to stay narrow — those are detected as a small contentW
+		// (< ~3 inches) or an explicit non-auto width.
+		if (t.TableWidthType == "" || t.TableWidthType == "auto") &&
+			t.FloatPos == nil && len(widths) > 0 {
+			sum := 0.0
+			for _, w := range widths {
+				sum += w
+			}
+			if sum > 0 && sum < r.contentW*0.95 && r.contentW > 216 {
+				scale := r.contentW / sum
+				for i := range widths {
+					widths[i] *= scale
+				}
+			}
+		}
 		// When the table has total width slack AND any column is too
 		// narrow to hold its widest unbreakable atom (e.g. an English
 		// word), redistribute slack from wide columns toward those
@@ -503,12 +733,31 @@ func (r *renderer) distributeAutofitSlack(t docx.Table, widths []float64) {
 // cellMinWidth measures the widest unbreakable atom inside a cell so
 // distributeAutofitSlack can guarantee that atom fits. Side-effect free:
 // pendingFootnotes is saved/restored.
+//
+// When the cell carries w:noWrap, the min width becomes the FULL single-
+// line width of each paragraph rather than just the widest atom. Word
+// uses this for narrow numeric columns that must stay on one line even
+// if that means widening the column.
 func (r *renderer) cellMinWidth(cell docx.TableCell) float64 {
 	savedFootnotes := r.pendingFootnotes
 	defer func() { r.pendingFootnotes = savedFootnotes }()
 	maxW := 0.0
 	for _, p := range cell.Paragraphs() {
-		for _, a := range r.runsToAtoms(p.Runs) {
+		atoms := r.runsToAtoms(p.Runs)
+		if cell.NoWrap {
+			// Sum every visible atom — that's the single-line length.
+			lineW := 0.0
+			for _, a := range atoms {
+				if a.kind == atomWord || a.kind == atomSpace {
+					lineW += a.width
+				}
+			}
+			if lineW > maxW {
+				maxW = lineW
+			}
+			continue
+		}
+		for _, a := range atoms {
 			if a.kind == atomWord && a.width > maxW {
 				maxW = a.width
 			}
@@ -761,6 +1010,17 @@ func (r *renderer) resolveHMerge(t *docx.Table) {
 	}
 }
 
+// predictTableHeight sums predictRowHeight across all rows so the
+// floating-table positioner can compute YAlign="bottom"/"center"
+// relative to a finite table size.
+func (r *renderer) predictTableHeight(t docx.Table, widths []float64) float64 {
+	h := 0.0
+	for _, row := range t.Rows {
+		h += r.predictRowHeight(row, widths)
+	}
+	return h
+}
+
 // predictRowHeight computes the row's rendered height without drawing
 // anything. Used by drawTable for pre-flight page-break detection so we
 // can inject the repeating header BEFORE the row that overflows
@@ -790,22 +1050,46 @@ func (r *renderer) predictRowHeight(row docx.TableRow, widths []float64) float64
 			rowH = h
 		}
 	}
-	if rowH < r.opts.DefaultFontSize*1.4 {
+	// w:hideMark on every visible cell waives the implicit paragraph-mark
+	// floor — empty rows can then collapse to zero height instead of the
+	// default 1.4 × font-size.
+	allHideMark := len(row.Cells) > 0
+	for _, c := range row.Cells {
+		if !c.HideMark && c.VMerge != "continue" {
+			allHideMark = false
+			break
+		}
+	}
+	if !allHideMark && rowH < r.opts.DefaultFontSize*1.4 {
 		rowH = r.opts.DefaultFontSize * 1.4
 	}
 	if row.HeightTwips > 0 {
-		minH := float64(row.HeightTwips) / 20.0
-		if row.HeightRuleExact || minH > rowH {
-			rowH = minH
+		declared := float64(row.HeightTwips) / 20.0
+		switch {
+		case row.HeightRule == "exact" || row.HeightRuleExact:
+			rowH = declared
+		case row.HeightRule == "auto":
+			// content-driven; ignore
+		default:
+			if declared > rowH {
+				rowH = declared
+			}
 		}
 	}
 	return rowH
 }
 
 func (r *renderer) drawRow(row docx.TableRow, widths []float64) error {
+	// w:trPr/w:hidden — suppress the row entirely.
+	if row.Hidden {
+		return nil
+	}
 	rowTop := r.cursorY
 	cellHeights := make([]float64, len(row.Cells))
 	col := 0
+	if row.GridBefore > 0 {
+		col = row.GridBefore
+	}
 	for i, cell := range row.Cells {
 		if col >= len(widths) {
 			break
@@ -828,13 +1112,37 @@ func (r *renderer) drawRow(row docx.TableRow, widths []float64) error {
 			rowH = h
 		}
 	}
-	if rowH < r.opts.DefaultFontSize*1.4 {
+	// w:hideMark on every visible cell waives the implicit paragraph-mark
+	// floor — empty rows can then collapse to zero height instead of the
+	// default 1.4 × font-size.
+	allHideMark := len(row.Cells) > 0
+	for _, c := range row.Cells {
+		if !c.HideMark && c.VMerge != "continue" {
+			allHideMark = false
+			break
+		}
+	}
+	if !allHideMark && rowH < r.opts.DefaultFontSize*1.4 {
 		rowH = r.opts.DefaultFontSize * 1.4
 	}
+	// w:trHeight semantics:
+	//   "exact"   → use HeightTwips verbatim (overflow gets clipped below)
+	//   "auto"    → content-driven; HeightTwips is ignored
+	//   "atLeast" or absent → HeightTwips is a floor (this matches Word's
+	//                de-facto behavior — ECMA-376 nominally says "auto" is
+	//                the absent default, but every Office build treats a
+	//                bare w:trHeight as atLeast).
 	if row.HeightTwips > 0 {
-		minH := float64(row.HeightTwips) / 20.0
-		if row.HeightRuleExact || minH > rowH {
-			rowH = minH
+		declared := float64(row.HeightTwips) / 20.0
+		switch {
+		case row.HeightRule == "exact" || row.HeightRuleExact:
+			rowH = declared
+		case row.HeightRule == "auto":
+			// content-driven; ignore the hint
+		default:
+			if declared > rowH {
+				rowH = declared
+			}
 		}
 	}
 
@@ -863,7 +1171,48 @@ func (r *renderer) drawRow(row docx.TableRow, widths []float64) error {
 	cellSpacingPt := float64(cellSpacingTwips) / 20.0
 
 	x := r.marL
+	// w:trPr/w:jc — per-row horizontal alignment override. Word resolves
+	// this relative to the section text margins (i.e. shifts the row's
+	// starting X within the available content width). When the table is
+	// already floated or centered via w:tblPr/w:jc the row override wins.
+	if row.Alignment == "center" || row.Alignment == "right" || row.Alignment == "end" {
+		sum := 0.0
+		for _, w := range widths {
+			sum += w
+		}
+		slack := r.contentW - sum
+		if slack > 0 {
+			switch row.Alignment {
+			case "center":
+				x += slack / 2
+			case "right", "end":
+				x += slack
+			}
+		}
+	}
 	col = 0
+	// w:gridBefore — phantom leading columns. The cells are visually
+	// present (so any tblBorders surface a frame) but carry no content.
+	// w:wBefore — extra leading offset in twips (when gridBefore isn't used).
+	if row.GridBefore > 0 {
+		skip := row.GridBefore
+		if skip > len(widths) {
+			skip = len(widths)
+		}
+		// Use the first real cell's borders as the reference style for
+		// phantom edges so the row reads as one continuous frame.
+		var ref docx.CellBorders
+		if len(row.Cells) > 0 {
+			ref = row.Cells[0].Borders
+		}
+		for i := 0; i < skip; i++ {
+			drawPhantomCell(r, x, rowTop, widths[i], rowH, ref)
+			x += widths[i]
+		}
+		col = skip
+	} else if row.WBeforeTwips > 0 {
+		x += float64(row.WBeforeTwips) / 20.0
+	}
 	const defaultCellPad = 4.0
 	for ci, cell := range row.Cells {
 		if col >= len(widths) {
@@ -929,6 +1278,13 @@ func (r *renderer) drawRow(row docx.TableRow, widths []float64) error {
 		if cell.Borders.TR2BL.Has() {
 			drawCellEdge(r, cell.Borders.TR2BL, right, top, left, bottom)
 		}
+		// w:cellIns / w:cellDel / w:cellMerge marker. Only painted when
+		// the user opted into ShowRevisions; otherwise the cell is
+		// auto-accepted (insertions kept, deletions dropped above the
+		// table walk, merges treated as committed).
+		if r.opts.ShowRevisions && cell.CellRevision != nil {
+			r.drawCellRevisionMarker(cell.CellRevision, left, top, right-left, bottom-top)
+		}
 
 		if cell.VMerge != "continue" {
 			savedY := r.cursorY
@@ -936,6 +1292,32 @@ func (r *renderer) drawRow(row docx.TableRow, widths []float64) error {
 			savedContentW := r.contentW
 			r.marL = left + padL
 			r.contentW = (right - left) - (padL + padR)
+			// w:textDirection rotates the cell's text frame. We pivot the
+			// rendering coordinate system around the cell's center and
+			// swap the effective inner width and height so the renderer's
+			// horizontal flow walks DOWN the cell instead of across it.
+			//   tbRl / tbRlV — 90° clockwise (Chinese/Japanese top-to-bottom)
+			//   btLr / lrTbV — 90° counter-clockwise (rotated English headers)
+			//   tbLrV         — 180° (rare; supported for completeness)
+			rot := 0.0
+			switch cell.TextDirection {
+			case "tbRl", "tbRlV":
+				rot = 90
+			case "btLr", "lrTbV":
+				rot = -90
+			case "tbLrV":
+				rot = 180
+			}
+			rotated := rot != 0
+			if rotated {
+				if rot == 90 || rot == -90 {
+					innerH := (bottom - top) - (padT + padB)
+					r.contentW = innerH
+				}
+				cx := (left + right) / 2
+				cy := (top + bottom) / 2
+				r.pdf.Rotate(rot, cx, cy)
+			}
 			if r.fields.tableCtx != nil {
 				r.fields.tableCtx.col = col
 			}
@@ -985,6 +1367,16 @@ func (r *renderer) drawRow(row docx.TableRow, widths []float64) error {
 				}
 				r.pdf.ClipPolygon(clipBox)
 			}
+			// w:fitText — uniformly scale font sizes inside the cell so the
+			// natural text width fits the available column. Skipped when the
+			// content already fits.
+			savedFitScale := r.fitTextScale
+			if cell.FitText {
+				scale := r.computeFitTextScale(cell.Blocks, r.contentW)
+				if scale > 0 && scale < 1 {
+					r.fitTextScale = scale
+				}
+			}
 			for _, b := range cell.Blocks {
 				switch v := b.(type) {
 				case docx.Paragraph:
@@ -1000,6 +1392,10 @@ func (r *renderer) drawRow(row docx.TableRow, widths []float64) error {
 			if clipped {
 				r.pdf.RestoreGraphicsState()
 			}
+			if rotated {
+				r.pdf.RotateReset()
+			}
+			r.fitTextScale = savedFitScale
 			r.marL = savedMarL
 			r.contentW = savedContentW
 			r.cursorY = savedY
@@ -1008,8 +1404,79 @@ func (r *renderer) drawRow(row docx.TableRow, widths []float64) error {
 		x += w
 		col += span
 	}
+	// w:gridAfter — phantom trailing columns. Same idea as GridBefore
+	// but on the right edge.
+	if row.GridAfter > 0 {
+		take := row.GridAfter
+		if col+take > len(widths) {
+			take = len(widths) - col
+		}
+		var ref docx.CellBorders
+		if len(row.Cells) > 0 {
+			ref = row.Cells[len(row.Cells)-1].Borders
+		}
+		for i := 0; i < take; i++ {
+			drawPhantomCell(r, x, rowTop, widths[col+i], rowH, ref)
+			x += widths[col+i]
+		}
+	}
 	r.cursorY = rowTop + rowH
 	return nil
+}
+
+// computeFitTextScale measures the longest text run in a cell's blocks
+// and returns the ratio of column width to that natural width — clamped
+// to (0, 1]. A scale of 1 means content already fits; the caller skips
+// scaling. The measurement is intentionally approximate: we sum each
+// paragraph's run widths at the run's current font size and pick the
+// maximum across paragraphs. Multi-line wrapping inside a paragraph
+// would only make the natural width SMALLER than this estimate, so the
+// computed scale is conservative.
+func (r *renderer) computeFitTextScale(blocks []docx.Block, columnW float64) float64 {
+	if columnW <= 0 {
+		return 1
+	}
+	maxW := 0.0
+	for _, b := range blocks {
+		para, ok := b.(docx.Paragraph)
+		if !ok {
+			continue
+		}
+		w := 0.0
+		for _, run := range para.Runs {
+			if run.Text == "" {
+				continue
+			}
+			fs := run.Props.FontSize
+			if fs == 0 {
+				fs = r.opts.DefaultFontSize
+			}
+			fam := r.selectFont(run.Props)
+			_ = r.pdf.SetFont(fam, "", fs)
+			tw, _ := r.pdf.MeasureTextWidth(run.Text)
+			w += tw
+		}
+		if w > maxW {
+			maxW = w
+		}
+	}
+	if maxW <= columnW || maxW == 0 {
+		return 1
+	}
+	return columnW / maxW
+}
+
+// drawPhantomCell paints the top/bottom edges of a w:gridBefore /
+// w:gridAfter phantom column using the same border style as a reference
+// real cell from the row. When the table has no borders, the reference
+// edges are zero-valued and we draw nothing — matching docx4j's
+// fo:table-cell-with-no-borders behavior for empty grid slots.
+func drawPhantomCell(r *renderer, x, y, w, h float64, refBorders docx.CellBorders) {
+	if w <= 0 || h <= 0 {
+		return
+	}
+	drawCellEdge(r, refBorders.Top, x, y, x+w, y)
+	drawCellEdge(r, refBorders.Bottom, x, y+h, x+w, y+h)
 }
 
 // drawCellEdge draws one of a cell's four edges. An empty edge (zero

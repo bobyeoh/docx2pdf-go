@@ -59,14 +59,22 @@ func drawChart(r *renderer, c *docx.ChartData, left, top, right, bottom float64)
 		drawBarChart(r, c, left, plotTop, right, plotBottom)
 	case "pie", "doughnut":
 		drawPieChart(r, c, left, plotTop, right, plotBottom, c.Kind == "doughnut")
-	case "line", "scatter":
+	case "line":
 		drawLineChart(r, c, left, plotTop, right, plotBottom)
+	case "scatter":
+		drawScatterChart(r, c, left, plotTop, right, plotBottom)
 	case "area":
 		drawAreaChart(r, c, left, plotTop, right, plotBottom)
 	case "bubble":
 		drawBubbleChart(r, c, left, plotTop, right, plotBottom)
 	case "radar":
 		drawRadarChart(r, c, left, plotTop, right, plotBottom)
+	case "stock":
+		drawStockChart(r, c, left, plotTop, right, plotBottom)
+	case "surface":
+		drawSurfaceChart(r, c, left, plotTop, right, plotBottom)
+	case "ofPie":
+		drawOfPieChart(r, c, left, plotTop, right, plotBottom)
 	}
 	if legendH > 0 {
 		drawChartLegend(r, c.Series, left, plotBottom, right, bottom)
@@ -157,7 +165,7 @@ func drawColumnChart(r *renderer, c *docx.ChartData, left, top, right, bottom fl
 				if y1 < y0 {
 					y0, y1 = y1, y0
 				}
-				color := seriesColor(ser, si)
+				color := r.themedSeriesColor(ser, si)
 				rr, gg, bb := parseHexColor(color)
 				r.pdf.SetFillColor(rr, gg, bb)
 				r.pdf.SetStrokeColor(rr, gg, bb)
@@ -177,7 +185,7 @@ func drawColumnChart(r *renderer, c *docx.ChartData, left, top, right, bottom fl
 				if y1 < y0 {
 					y0, y1 = y1, y0
 				}
-				color := seriesColor(ser, si)
+				color := r.themedSeriesColor(ser, si)
 				rr, gg, bb := parseHexColor(color)
 				r.pdf.SetFillColor(rr, gg, bb)
 				r.pdf.SetStrokeColor(rr, gg, bb)
@@ -271,7 +279,7 @@ func drawBarChart(r *renderer, c *docx.ChartData, left, top, right, bottom float
 				if x1 < x0 {
 					x0, x1 = x1, x0
 				}
-				color := seriesColor(ser, si)
+				color := r.themedSeriesColor(ser, si)
 				rr, gg, bb := parseHexColor(color)
 				r.pdf.SetFillColor(rr, gg, bb)
 				r.pdf.SetLineWidth(0)
@@ -290,7 +298,7 @@ func drawBarChart(r *renderer, c *docx.ChartData, left, top, right, bottom float
 				if x1 < x0 {
 					x0, x1 = x1, x0
 				}
-				color := seriesColor(ser, si)
+				color := r.themedSeriesColor(ser, si)
 				rr, gg, bb := parseHexColor(color)
 				r.pdf.SetFillColor(rr, gg, bb)
 				r.pdf.SetLineWidth(0)
@@ -337,7 +345,8 @@ func drawPieChart(r *renderer, c *docx.ChartData, left, top, right, bottom float
 		}
 		frac := v / total
 		end := startAngle + frac*2*math.Pi
-		color := paletteColor(i)
+		palette := r.themedPalette()
+		color := palette[i%len(palette)]
 		if i < len(c.Categories) && i < len(c.Series) {
 			_ = c.Series[i] // categories may have explicit series colors when each slice was a series
 		}
@@ -416,7 +425,7 @@ func drawLineChart(r *renderer, c *docx.ChartData, left, top, right, bottom floa
 	drawAxes(r, plotL, plotT, plotR, plotB, minV, maxV)
 	step := (plotR - plotL) / float64(maxN-1)
 	for si, ser := range c.Series {
-		color := seriesColor(ser, si)
+		color := r.themedSeriesColor(ser, si)
 		rr, gg, bb := parseHexColor(color)
 		r.pdf.SetStrokeColor(rr, gg, bb)
 		r.pdf.SetFillColor(rr, gg, bb)
@@ -486,7 +495,7 @@ func drawAreaChart(r *renderer, c *docx.ChartData, left, top, right, bottom floa
 		if len(ser.Values) == 0 {
 			continue
 		}
-		color := seriesColor(ser, si)
+		color := r.themedSeriesColor(ser, si)
 		rr, gg, bb := lightenHex(color, 0.55)
 		r.pdf.SetFillColor(rr, gg, bb)
 		r.pdf.SetLineWidth(0)
@@ -550,7 +559,7 @@ func drawBubbleChart(r *renderer, c *docx.ChartData, left, top, right, bottom fl
 	step := (plotR - plotL) / float64(maxN)
 	maxBubble := math.Min(step*0.6, (plotB-plotT)/5)
 	for si, ser := range c.Series {
-		color := seriesColor(ser, si)
+		color := r.themedSeriesColor(ser, si)
 		rr, gg, bb := lightenHex(color, 0.3)
 		r.pdf.SetFillColor(rr, gg, bb)
 		rrS, ggS, bbS := parseHexColor(color)
@@ -622,7 +631,7 @@ func drawRadarChart(r *renderer, c *docx.ChartData, left, top, right, bottom flo
 	}
 	// One polygon per series.
 	for si, ser := range c.Series {
-		color := seriesColor(ser, si)
+		color := r.themedSeriesColor(ser, si)
 		rr, gg, bb := lightenHex(color, 0.55)
 		r.pdf.SetFillColor(rr, gg, bb)
 		rrS, ggS, bbS := parseHexColor(color)
@@ -707,7 +716,7 @@ func drawChartLegend(r *renderer, series []docx.ChartSeries, left, top, right, b
 	}
 	y := top + (bottom-top-r.opts.DefaultFontSize)/2
 	for i, s := range series {
-		color := seriesColor(s, i)
+		color := r.themedSeriesColor(s, i)
 		rr, gg, bb := parseHexColor(color)
 		r.pdf.SetFillColor(rr, gg, bb)
 		r.pdf.Rectangle(x, y+1, x+r.opts.DefaultFontSize*0.6, y+r.opts.DefaultFontSize*0.6+1, "F", 0, 0)
@@ -816,6 +825,48 @@ func seriesColor(s docx.ChartSeries, idx int) string {
 	return paletteColor(idx)
 }
 
+// themedSeriesColor is the renderer-aware variant: honors an explicit
+// per-series color first, then falls back to the document theme's
+// accent palette, and finally the static palette. Use this from chart
+// kinds that have access to the renderer (most paths do).
+func (r *renderer) themedSeriesColor(s docx.ChartSeries, idx int) string {
+	if s.Color != "" {
+		return s.Color
+	}
+	pal := r.themedPalette()
+	if idx < 0 {
+		idx = 0
+	}
+	return pal[idx%len(pal)]
+}
+
+// themedPalette returns a series palette built from the document's
+// theme accent1..accent6 colors when present, falling back to the
+// hardcoded chartPalette otherwise. Called per-render so docs with a
+// non-default theme get series strokes that match their other
+// theme-colored text.
+func (r *renderer) themedPalette() []string {
+	if r == nil || r.doc == nil || len(r.doc.Theme.Colors) == 0 {
+		return chartPalette
+	}
+	pick := func(name string) string {
+		if v, ok := r.doc.Theme.Colors[name]; ok && v != "" {
+			return v
+		}
+		return ""
+	}
+	var out []string
+	for _, n := range []string{"accent1", "accent2", "accent3", "accent4", "accent5", "accent6"} {
+		if v := pick(n); v != "" {
+			out = append(out, v)
+		}
+	}
+	if len(out) < 2 {
+		return chartPalette
+	}
+	return out
+}
+
 func paletteColor(idx int) string {
 	if idx < 0 {
 		idx = 0
@@ -849,3 +900,262 @@ func utf8len(s string) int {
 // renderer when emitted from textbox content. Defined here so internal
 // callers don't have to import strings only for this one use.
 var _ = strings.TrimSpace
+
+// drawScatterChart plots each series as markers (diamonds) connected by
+// thin lines. Differs from drawLineChart by drawing a visible marker at
+// every data point — scatter's primary visual signature.
+func drawScatterChart(r *renderer, c *docx.ChartData, left, top, right, bottom float64) {
+	if len(c.Series) == 0 {
+		return
+	}
+	const axisPad = 28.0
+	plotL := left + axisPad
+	plotB := bottom - r.opts.DefaultFontSize*1.4
+	plotT := top + r.opts.DefaultFontSize*0.5
+	plotR := right - 4
+	if plotR-plotL < 20 || plotB-plotT < 20 {
+		return
+	}
+	r.pdf.SetLineWidth(0.5)
+	r.pdf.SetStrokeColor(0x80, 0x80, 0x80)
+	r.pdf.Line(plotL, plotT, plotL, plotB)
+	r.pdf.Line(plotL, plotB, plotR, plotB)
+	lo, hi := seriesValueRange(c.Series)
+	if lo == hi {
+		hi = lo + 1
+	}
+	maxPts := maxCategoryCount(c)
+	if maxPts < 2 {
+		maxPts = 2
+	}
+	for si, s := range c.Series {
+		col := r.themedSeriesColor(s, si)
+		cr, cg, cb := parseHexColor(col)
+		r.pdf.SetStrokeColor(cr, cg, cb)
+		r.pdf.SetFillColor(cr, cg, cb)
+		r.pdf.SetLineWidth(0.6)
+		prevX, prevY, has := 0.0, 0.0, false
+		for i, v := range s.Values {
+			fx := float64(i) / float64(maxPts-1)
+			fy := (v - lo) / (hi - lo)
+			px := plotL + fx*(plotR-plotL)
+			py := plotB - fy*(plotB-plotT)
+			if has {
+				r.pdf.Line(prevX, prevY, px, py)
+			}
+			// Diamond marker.
+			d := 2.0
+			r.pdf.SetLineWidth(0.4)
+			r.pdf.Line(px-d, py, px, py-d)
+			r.pdf.Line(px, py-d, px+d, py)
+			r.pdf.Line(px+d, py, px, py+d)
+			r.pdf.Line(px, py+d, px-d, py)
+			prevX, prevY, has = px, py, true
+		}
+	}
+}
+
+// drawStockChart renders an OHLC-style candlestick per category. Series
+// are interpreted positionally: 4 series → [open, high, low, close];
+// 3 series → [high, low, close]; otherwise we fall back to drawLineChart.
+func drawStockChart(r *renderer, c *docx.ChartData, left, top, right, bottom float64) {
+	n := len(c.Series)
+	if n != 3 && n != 4 {
+		drawLineChart(r, c, left, top, right, bottom)
+		return
+	}
+	const axisPad = 28.0
+	plotL := left + axisPad
+	plotB := bottom - r.opts.DefaultFontSize*1.4
+	plotT := top + r.opts.DefaultFontSize*0.5
+	plotR := right - 4
+	if plotR-plotL < 20 || plotB-plotT < 20 {
+		return
+	}
+	r.pdf.SetLineWidth(0.5)
+	r.pdf.SetStrokeColor(0x80, 0x80, 0x80)
+	r.pdf.Line(plotL, plotT, plotL, plotB)
+	r.pdf.Line(plotL, plotB, plotR, plotB)
+	lo, hi := seriesValueRange(c.Series)
+	if lo == hi {
+		hi = lo + 1
+	}
+	maxPts := maxCategoryCount(c)
+	if maxPts < 1 {
+		return
+	}
+	step := (plotR - plotL) / float64(maxPts)
+	bodyW := step * 0.5
+	openIdx, highIdx, lowIdx, closeIdx := -1, 0, 1, 2
+	if n == 4 {
+		openIdx, highIdx, lowIdx, closeIdx = 0, 1, 2, 3
+	}
+	yOf := func(v float64) float64 {
+		return plotB - (v-lo)/(hi-lo)*(plotB-plotT)
+	}
+	for i := 0; i < maxPts; i++ {
+		cx := plotL + (float64(i)+0.5)*step
+		highVal := safeAt(c.Series[highIdx].Values, i)
+		lowVal := safeAt(c.Series[lowIdx].Values, i)
+		closeVal := safeAt(c.Series[closeIdx].Values, i)
+		openVal := closeVal
+		if openIdx >= 0 {
+			openVal = safeAt(c.Series[openIdx].Values, i)
+		}
+		// Wick: high → low vertical line.
+		r.pdf.SetLineWidth(0.4)
+		r.pdf.SetStrokeColor(0x40, 0x40, 0x40)
+		r.pdf.Line(cx, yOf(highVal), cx, yOf(lowVal))
+		// Body: open to close rectangle. Filled green when close > open,
+		// red otherwise (the universal market convention).
+		bodyTop := yOf(openVal)
+		bodyBot := yOf(closeVal)
+		if bodyTop > bodyBot {
+			bodyTop, bodyBot = bodyBot, bodyTop
+		}
+		if closeVal >= openVal {
+			r.pdf.SetFillColor(0x70, 0xAD, 0x47)
+		} else {
+			r.pdf.SetFillColor(0xC0, 0x00, 0x00)
+		}
+		r.pdf.Rectangle(cx-bodyW/2, bodyTop, cx+bodyW/2, bodyBot, "F", 0, 0)
+	}
+}
+
+// drawSurfaceChart approximates a 3D surface as a stack of filled bands,
+// one per series, each with a gradient from light at the top to slightly
+// darker at the bottom so the "topographic" reading carries.
+func drawSurfaceChart(r *renderer, c *docx.ChartData, left, top, right, bottom float64) {
+	if len(c.Series) == 0 {
+		return
+	}
+	const axisPad = 28.0
+	plotL := left + axisPad
+	plotB := bottom - r.opts.DefaultFontSize*1.4
+	plotT := top + r.opts.DefaultFontSize*0.5
+	plotR := right - 4
+	if plotR-plotL < 20 || plotB-plotT < 20 {
+		return
+	}
+	r.pdf.SetLineWidth(0.5)
+	r.pdf.SetStrokeColor(0x80, 0x80, 0x80)
+	r.pdf.Line(plotL, plotT, plotL, plotB)
+	r.pdf.Line(plotL, plotB, plotR, plotB)
+	lo, hi := seriesValueRange(c.Series)
+	if lo == hi {
+		hi = lo + 1
+	}
+	maxPts := maxCategoryCount(c)
+	if maxPts < 2 {
+		return
+	}
+	step := (plotR - plotL) / float64(maxPts-1)
+	for si, s := range c.Series {
+		col := r.themedSeriesColor(s, si)
+		cr, cg, cb := parseHexColor(col)
+		// Fill polygon from baseline up to the series line.
+		var poly []gopdf.Point
+		poly = append(poly, gopdf.Point{X: plotL, Y: plotB})
+		for i, v := range s.Values {
+			x := plotL + float64(i)*step
+			y := plotB - (v-lo)/(hi-lo)*(plotB-plotT)
+			poly = append(poly, gopdf.Point{X: x, Y: y})
+		}
+		poly = append(poly, gopdf.Point{X: plotL + float64(len(s.Values)-1)*step, Y: plotB})
+		// Stagger fill alpha by series index so layers stack.
+		light := uint8(255 - si*15)
+		_ = light
+		r.pdf.SetFillColor(cr, cg, cb)
+		drawPolygonFill(r, poly)
+		// Outline.
+		r.pdf.SetStrokeColor(cr, cg, cb)
+		r.pdf.SetLineWidth(0.8)
+		for i := 1; i < len(poly)-1; i++ {
+			r.pdf.Line(poly[i].X, poly[i].Y, poly[i+1].X, poly[i+1].Y)
+		}
+	}
+}
+
+// drawOfPieChart renders a pie-of-pie / bar-of-pie. The first series is
+// the main pie; we slice off the last min(3, len/3) values as the
+// "detail" group, render them as a smaller second pie to the right,
+// and draw a connector between them.
+func drawOfPieChart(r *renderer, c *docx.ChartData, left, top, right, bottom float64) {
+	if len(c.Series) == 0 || len(c.Series[0].Values) == 0 {
+		drawPieChart(r, c, left, top, right, bottom, false)
+		return
+	}
+	values := c.Series[0].Values
+	categories := c.Categories
+	detailCount := len(values) / 3
+	if detailCount < 2 {
+		detailCount = 2
+	}
+	if detailCount > len(values)-1 {
+		detailCount = len(values) - 1
+	}
+	if detailCount <= 0 {
+		drawPieChart(r, c, left, top, right, bottom, false)
+		return
+	}
+	// Build the main pie (everything but the last detailCount values,
+	// plus a combined "Other" slice equal to their sum).
+	mainCount := len(values) - detailCount
+	mainValues := make([]float64, 0, mainCount+1)
+	mainCats := make([]string, 0, mainCount+1)
+	otherSum := 0.0
+	for i := 0; i < mainCount; i++ {
+		mainValues = append(mainValues, values[i])
+		if i < len(categories) {
+			mainCats = append(mainCats, categories[i])
+		} else {
+			mainCats = append(mainCats, "")
+		}
+	}
+	for i := mainCount; i < len(values); i++ {
+		otherSum += values[i]
+	}
+	mainValues = append(mainValues, otherSum)
+	mainCats = append(mainCats, "Other")
+	mainChart := *c
+	mainChart.Series = []docx.ChartSeries{{Values: mainValues}}
+	mainChart.Categories = mainCats
+	// Detail pie: just the last detailCount values.
+	detValues := values[mainCount:]
+	detCats := categories
+	if mainCount < len(categories) {
+		detCats = categories[mainCount:]
+	} else {
+		detCats = []string{}
+	}
+	detChart := *c
+	detChart.Series = []docx.ChartSeries{{Values: detValues}}
+	detChart.Categories = detCats
+
+	mid := (left + right) / 2
+	drawPieChart(r, &mainChart, left, top, mid-4, bottom, false)
+	drawPieChart(r, &detChart, mid+4, top+(bottom-top)*0.15, right, bottom-(bottom-top)*0.15, false)
+	// Connector lines suggesting the link between the "Other" slice and
+	// the detail pie.
+	r.pdf.SetLineWidth(0.5)
+	r.pdf.SetStrokeColor(0xA0, 0xA0, 0xA0)
+	r.pdf.Line(mid-8, top+(bottom-top)*0.4, mid+4, top+(bottom-top)*0.4)
+	r.pdf.Line(mid-8, top+(bottom-top)*0.6, mid+4, top+(bottom-top)*0.6)
+}
+
+func safeAt(xs []float64, i int) float64 {
+	if i < 0 || i >= len(xs) {
+		return 0
+	}
+	return xs[i]
+}
+
+// drawPolygonFill paints a closed filled polygon. Used by surface charts
+// where we need a many-vertex region; gopdf's Rectangle path doesn't
+// cover the arbitrary shape.
+func drawPolygonFill(r *renderer, pts []gopdf.Point) {
+	if len(pts) < 3 {
+		return
+	}
+	r.pdf.Polygon(pts, "F")
+}

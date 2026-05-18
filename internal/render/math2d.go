@@ -38,18 +38,18 @@ func (r *renderer) buildMathBox(n *docx.MathNode, fontSize float64) mathBox {
 	}
 	switch n.Kind {
 	case "t":
-		return r.mathTextBox(n.Text, fontSize)
+		return r.mathStyledTextBox(applyMathScript(n.Text, n.Script), fontSize, runPropsForMath(n))
 	case "r":
 		// w:r in OMML carries a w:t leaf — n.Text was populated by the
 		// decoder via CharData. Render directly. Children, when present,
 		// are non-text formatting wrappers we treat as a sequence.
 		if n.Text != "" {
-			return r.mathTextBox(n.Text, fontSize)
+			return r.mathStyledTextBox(applyMathScript(n.Text, n.Script), fontSize, runPropsForMath(n))
 		}
 		return r.mathSequence(n.Children, fontSize)
 	case "e", "num", "den", "deg", "sup", "sub", "lim", "fName", "oMath", "oMathPara":
 		if n.Text != "" && len(n.Children) == 0 {
-			return r.mathTextBox(n.Text, fontSize)
+			return r.mathStyledTextBox(n.Text, fontSize, docx.RunProps{Italic: true})
 		}
 		return r.mathSequence(n.Children, fontSize)
 	case "f":
@@ -62,6 +62,8 @@ func (r *renderer) buildMathBox(n *docx.MathNode, fontSize float64) mathBox {
 		return r.mathSubBox(n, fontSize)
 	case "sSubSup":
 		return r.mathSubSupBox(n, fontSize)
+	case "sPre":
+		return r.mathPreScriptBox(n, fontSize)
 	case "nary":
 		return r.mathNaryBox(n, fontSize)
 	case "d":
@@ -72,12 +74,26 @@ func (r *renderer) buildMathBox(n *docx.MathNode, fontSize float64) mathBox {
 		return r.mathAccBox(n, fontSize)
 	case "bar":
 		return r.mathBarBox(n, fontSize)
+	case "box":
+		// m:box is a non-visible grouping — pass the base box through.
+		return r.buildMathBox(n.Base, fontSize)
+	case "borderBox":
+		return r.mathBorderBoxBox(n, fontSize)
+	case "groupChr":
+		return r.mathGroupChrBox(n, fontSize)
+	case "eqArr":
+		return r.mathEqArrBox(n, fontSize)
 	case "limLow":
 		return r.mathLimBox(n, n.LimLo, true, fontSize)
 	case "limUpp":
 		return r.mathLimBox(n, n.LimUp, false, fontSize)
 	case "m", "matrix":
 		return r.mathMatrixBox(n, fontSize)
+	case "phant":
+		// Phantom: reserve space without rendering.
+		inner := r.buildMathBox(n.Base, fontSize)
+		inner.draw = nil
+		return inner
 	}
 	// Unknown kind: fall back to the textual approximation.
 	if n.Text != "" {
@@ -88,6 +104,13 @@ func (r *renderer) buildMathBox(n *docx.MathNode, fontSize float64) mathBox {
 
 // mathTextBox renders a single string at the active font size.
 func (r *renderer) mathTextBox(s string, fontSize float64) mathBox {
+	return r.mathStyledTextBox(s, fontSize, docx.RunProps{Italic: true})
+}
+
+// mathStyledTextBox renders a styled math glyph run. The default math
+// styling is italic (variables); m:nor / m:sty p flips to upright,
+// m:sty b / bi adds bold.
+func (r *renderer) mathStyledTextBox(s string, fontSize float64, props docx.RunProps) mathBox {
 	if s == "" {
 		return mathBox{}
 	}
@@ -97,12 +120,87 @@ func (r *renderer) mathTextBox(s string, fontSize float64) mathBox {
 		ascent:  fontSize * 0.75,
 		descent: fontSize * 0.25,
 		draw: func(r *renderer, x, baseline float64) {
+			fam := r.selectFont(props)
+			style := ""
+			if props.Bold && props.Italic {
+				style = "BI"
+			} else if props.Bold {
+				style = "B"
+			} else if props.Italic {
+				style = "I"
+			}
+			_ = r.pdf.SetFont(fam, style, fontSize)
 			r.pdf.SetFontSize(fontSize)
 			r.pdf.SetX(x)
 			r.pdf.SetY(baseline - fontSize*0.75)
 			_ = r.pdf.Cell(nil, s)
 		},
 	}
+}
+
+// applyMathScript transforms ASCII letters via the Unicode "Mathematical
+// Alphanumeric Symbols" block for the requested OMML script style. The
+// substitution is lossy when the rendering font lacks the destination
+// glyphs (most desktop fonts don't ship 1D400-1D7FF); callers should
+// only enable this for documents that explicitly request it.
+func applyMathScript(s, script string) string {
+	if script == "" || script == "roman" {
+		return s
+	}
+	// Each entry maps the starting code point for uppercase A / lowercase
+	// a / digit 0 in the destination block. Empty offsets mean "no
+	// transformation for that range".
+	var aU, aL, d rune
+	switch script {
+	case "script":
+		aU, aL = 0x1D49C, 0x1D4B6
+	case "fraktur":
+		aU, aL = 0x1D504, 0x1D51E
+	case "doubleStruck":
+		aU, aL, d = 0x1D538, 0x1D552, 0x1D7D8
+	case "sansSerif":
+		aU, aL, d = 0x1D5A0, 0x1D5BA, 0x1D7E2
+	case "monospace":
+		aU, aL, d = 0x1D670, 0x1D68A, 0x1D7F6
+	default:
+		return s
+	}
+	out := make([]rune, 0, len(s))
+	for _, r := range s {
+		switch {
+		case r >= 'A' && r <= 'Z' && aU != 0:
+			out = append(out, aU+(r-'A'))
+		case r >= 'a' && r <= 'z' && aL != 0:
+			out = append(out, aL+(r-'a'))
+		case r >= '0' && r <= '9' && d != 0:
+			out = append(out, d+(r-'0'))
+		default:
+			out = append(out, r)
+		}
+	}
+	return string(out)
+}
+
+// runPropsForMath converts the styling flags on an m:r node into a
+// RunProps the renderer's font picker can consume. Variables default to
+// italic; m:nor / m:sty p reverts to upright.
+func runPropsForMath(n *docx.MathNode) docx.RunProps {
+	p := docx.RunProps{Italic: true}
+	if n.Nor || n.StyleP {
+		p.Italic = false
+	}
+	if n.StyleB {
+		p.Bold = true
+		p.Italic = false
+	}
+	if n.StyleI {
+		p.Italic = true
+	}
+	if n.StyleBI {
+		p.Bold = true
+		p.Italic = true
+	}
+	return p
 }
 
 func mustMeasureMath(r *renderer, s string, fontSize float64) float64 {
@@ -157,6 +255,69 @@ func (r *renderer) mathSequence(kids []*docx.MathNode, fontSize float64) mathBox
 
 // mathFractionBox stacks numerator over denominator with a horizontal bar.
 func (r *renderer) mathFractionBox(n *docx.MathNode, fontSize float64) mathBox {
+	// "lin" renders a/b inline — same shape as a regular sequence.
+	if n.FracType == "lin" {
+		num := r.buildMathBox(n.Num, fontSize)
+		den := r.buildMathBox(n.Den, fontSize)
+		slash := r.mathTextBox("/", fontSize)
+		w := num.w + slash.w + den.w
+		asc := num.ascent
+		if slash.ascent > asc {
+			asc = slash.ascent
+		}
+		if den.ascent > asc {
+			asc = den.ascent
+		}
+		desc := num.descent
+		if slash.descent > desc {
+			desc = slash.descent
+		}
+		if den.descent > desc {
+			desc = den.descent
+		}
+		return mathBox{
+			w: w, ascent: asc, descent: desc,
+			draw: func(r *renderer, x, baseline float64) {
+				cx := x
+				if num.draw != nil {
+					num.draw(r, cx, baseline)
+				}
+				cx += num.w
+				if slash.draw != nil {
+					slash.draw(r, cx, baseline)
+				}
+				cx += slash.w
+				if den.draw != nil {
+					den.draw(r, cx, baseline)
+				}
+			},
+		}
+	}
+	// "skw" renders a skewed fraction: num superscript-left of a slash,
+	// den subscript-right. Approximate as a/b with raised num and lowered
+	// den so the visual is at least suggestive.
+	if n.FracType == "skw" {
+		num := r.buildMathBox(n.Num, fontSize*0.85)
+		den := r.buildMathBox(n.Den, fontSize*0.85)
+		slash := r.mathTextBox("/", fontSize)
+		w := num.w + slash.w*0.5 + den.w
+		asc := num.ascent + fontSize*0.2
+		desc := den.descent + fontSize*0.2
+		return mathBox{
+			w: w, ascent: asc, descent: desc,
+			draw: func(r *renderer, x, baseline float64) {
+				if num.draw != nil {
+					num.draw(r, x, baseline-fontSize*0.2)
+				}
+				if slash.draw != nil {
+					slash.draw(r, x+num.w, baseline)
+				}
+				if den.draw != nil {
+					den.draw(r, x+num.w+slash.w*0.5, baseline+fontSize*0.2)
+				}
+			},
+		}
+	}
 	num := r.buildMathBox(n.Num, fontSize*0.9)
 	den := r.buildMathBox(n.Den, fontSize*0.9)
 	w := num.w
@@ -169,6 +330,7 @@ func (r *renderer) mathFractionBox(n *docx.MathNode, fontSize float64) mathBox {
 	// the fraction bar.
 	asc := num.height() + barGap
 	desc := den.height() + barGap
+	drawBar := n.FracType != "noBar"
 	return mathBox{
 		w:       w + 2, // a small margin on each side for the bar
 		ascent:  asc,
@@ -181,9 +343,11 @@ func (r *renderer) mathFractionBox(n *docx.MathNode, fontSize float64) mathBox {
 			if den.draw != nil {
 				den.draw(r, x+(w-den.w)/2+1, barY+barGap+den.ascent)
 			}
-			r.pdf.SetLineWidth(0.5)
-			r.pdf.SetStrokeColor(0, 0, 0)
-			r.pdf.Line(x+1, barY, x+1+w, barY)
+			if drawBar {
+				r.pdf.SetLineWidth(0.5)
+				r.pdf.SetStrokeColor(0, 0, 0)
+				r.pdf.Line(x+1, barY, x+1+w, barY)
+			}
 		},
 	}
 }
@@ -317,6 +481,45 @@ func (r *renderer) mathSubSupBox(n *docx.MathNode, fontSize float64) mathBox {
 	}
 }
 
+// mathPreScriptBox renders m:sPre — a prescript: sub/sup placed BEFORE
+// the base rather than after. Common in chemistry / tensor notation
+// (₆¹⁴C, the 6 sits as a pre-subscript and 14 as a pre-superscript on
+// the carbon glyph). Layout mirrors mathSubSupBox but on the left.
+func (r *renderer) mathPreScriptBox(n *docx.MathNode, fontSize float64) mathBox {
+	base := r.buildMathBox(n.Base, fontSize)
+	sup := r.buildMathBox(n.Sup, fontSize*0.75)
+	sub := r.buildMathBox(n.Sub, fontSize*0.75)
+	maxScriptW := sup.w
+	if sub.w > maxScriptW {
+		maxScriptW = sub.w
+	}
+	w := maxScriptW + base.w
+	supRise := fontSize * 0.45
+	subDrop := fontSize * 0.25
+	asc := base.ascent
+	if supRise+sup.ascent > asc {
+		asc = supRise + sup.ascent
+	}
+	desc := base.descent
+	if subDrop+sub.descent > desc {
+		desc = subDrop + sub.descent
+	}
+	return mathBox{
+		w: w, ascent: asc, descent: desc,
+		draw: func(r *renderer, x, baseline float64) {
+			if sup.draw != nil {
+				sup.draw(r, x+(maxScriptW-sup.w), baseline-supRise)
+			}
+			if sub.draw != nil {
+				sub.draw(r, x+(maxScriptW-sub.w), baseline+subDrop)
+			}
+			if base.draw != nil {
+				base.draw(r, x+maxScriptW, baseline)
+			}
+		},
+	}
+}
+
 // mathNaryBox renders an n-ary operator (∑ / ∫ / ∏) with stacked
 // limits when present. The operator glyph defaults to ∑.
 func (r *renderer) mathNaryBox(n *docx.MathNode, fontSize float64) mathBox {
@@ -326,8 +529,57 @@ func (r *renderer) mathNaryBox(n *docx.MathNode, fontSize float64) mathBox {
 	}
 	op := r.mathTextBox(glyph, fontSize*1.4)
 	base := r.buildMathBox(n.Base, fontSize)
-	lo := r.buildMathBox(n.LimLo, fontSize*0.7)
-	hi := r.buildMathBox(n.LimUp, fontSize*0.7)
+	// Honor m:supHide / m:subHide by zeroing the limit boxes — they then
+	// contribute no width or vertical reservation.
+	var lo, hi mathBox
+	if !n.NarySubHide {
+		lo = r.buildMathBox(n.LimLo, fontSize*0.7)
+	}
+	if !n.NarySupHide {
+		hi = r.buildMathBox(n.LimUp, fontSize*0.7)
+	}
+	// limLoc=subSup → render limits as sub/super on the right of the
+	// operator (rather than stacked above/below). The default is
+	// limLoc=undOvr for sum-like operators and subSup for integrals;
+	// when the spec says subSup explicitly we shift positions.
+	subSupStyle := n.NaryLimLoc == "subSup"
+	if subSupStyle {
+		w := op.w + lo.w + base.w + 4
+		if hi.w > lo.w {
+			w = op.w + hi.w + base.w + 4
+		}
+		asc := op.ascent
+		if hi.ascent > 0 && hi.ascent+fontSize*0.4 > asc {
+			asc = hi.ascent + fontSize*0.4
+		}
+		desc := op.descent
+		if lo.descent > 0 {
+			desc = op.descent + lo.descent*0.3
+		}
+		return mathBox{
+			w:       w,
+			ascent:  asc,
+			descent: desc,
+			draw: func(r *renderer, x, baseline float64) {
+				if op.draw != nil {
+					op.draw(r, x, baseline)
+				}
+				if hi.draw != nil {
+					hi.draw(r, x+op.w, baseline-fontSize*0.4)
+				}
+				if lo.draw != nil {
+					lo.draw(r, x+op.w, baseline+fontSize*0.2)
+				}
+				if base.draw != nil {
+					rightW := hi.w
+					if lo.w > rightW {
+						rightW = lo.w
+					}
+					base.draw(r, x+op.w+rightW+2, baseline)
+				}
+			},
+		}
+	}
 	limW := lo.w
 	if hi.w > limW {
 		limW = hi.w
@@ -414,6 +666,17 @@ func (r *renderer) mathDelimBox(n *docx.MathNode, fontSize float64) mathBox {
 	bodyH := maxA + maxD
 	if bodyH > fontSize*1.4 {
 		delimScale = bodyH / (fontSize * 1.1)
+	}
+	// m:dPr/m:grow="1" forces vertical scaling to match the body height
+	// even when the body is small enough that the heuristic skipped it.
+	// In practice this is how Word's "auto-resize delimiters" toggle is
+	// surfaced — without honoring grow, fixed-glyph parens around a tall
+	// fraction look stunted.
+	if n.DGrow && bodyH > fontSize {
+		want := bodyH / (fontSize * 1.0)
+		if want > delimScale {
+			delimScale = want
+		}
 	}
 	begBox := r.mathTextBox(beg, fontSize*delimScale)
 	endBox := r.mathTextBox(end, fontSize*delimScale)
@@ -560,6 +823,126 @@ func (r *renderer) mathLimBox(n *docx.MathNode, lim *docx.MathNode, low bool, fo
 			}
 			if limBox.draw != nil {
 				limBox.draw(r, x+(w-limBox.w)/2, baseline-base.ascent-1-limBox.descent)
+			}
+		},
+	}
+}
+
+// mathBorderBoxBox draws a rectangle around its base. Padding is a small
+// fraction of fontSize on every side.
+func (r *renderer) mathBorderBoxBox(n *docx.MathNode, fontSize float64) mathBox {
+	base := r.buildMathBox(n.Base, fontSize)
+	pad := fontSize * 0.2
+	return mathBox{
+		w:       base.w + pad*2,
+		ascent:  base.ascent + pad,
+		descent: base.descent + pad,
+		draw: func(r *renderer, x, baseline float64) {
+			if base.draw != nil {
+				base.draw(r, x+pad, baseline)
+			}
+			top := baseline - base.ascent - pad
+			h := base.height() + pad*2
+			r.pdf.SetLineWidth(0.5)
+			r.pdf.SetStrokeColor(0, 0, 0)
+			r.pdf.Rectangle(x, top, x+base.w+pad*2, top+h, "D", 0, 0)
+		},
+	}
+}
+
+// mathGroupChrBox draws a stretchy character (overbrace ⏞ / underbrace ⏟
+// by default) above or below the base, sized to span the base width.
+func (r *renderer) mathGroupChrBox(n *docx.MathNode, fontSize float64) mathBox {
+	base := r.buildMathBox(n.Base, fontSize)
+	ch := n.AccChar
+	if ch == "" {
+		if n.AccUnder {
+			ch = "⏟"
+		} else {
+			ch = "⏞"
+		}
+	}
+	// Scale the group char so its visual width approximates the base
+	// width. We use the natural glyph width at fontSize as a starting
+	// reference; the renderer paints it as a single glyph (no path
+	// stretching) so the result is decorative more than metric-perfect.
+	natural := r.mathTextBox(ch, fontSize)
+	scale := 1.0
+	if natural.w > 0 && base.w > natural.w {
+		scale = base.w / natural.w
+		if scale > 3.0 {
+			scale = 3.0
+		}
+	}
+	chBox := r.mathTextBox(ch, fontSize*scale)
+	gap := fontSize * 0.1
+	if n.AccUnder {
+		return mathBox{
+			w:       base.w,
+			ascent:  base.ascent,
+			descent: base.descent + chBox.height() + gap,
+			draw: func(r *renderer, x, baseline float64) {
+				if base.draw != nil {
+					base.draw(r, x, baseline)
+				}
+				if chBox.draw != nil {
+					chBox.draw(r, x+(base.w-chBox.w)/2, baseline+base.descent+gap+chBox.ascent)
+				}
+			},
+		}
+	}
+	return mathBox{
+		w:       base.w,
+		ascent:  base.ascent + chBox.height() + gap,
+		descent: base.descent,
+		draw: func(r *renderer, x, baseline float64) {
+			if base.draw != nil {
+				base.draw(r, x, baseline)
+			}
+			if chBox.draw != nil {
+				chBox.draw(r, x+(base.w-chBox.w)/2, baseline-base.ascent-gap-chBox.descent)
+			}
+		},
+	}
+}
+
+// mathEqArrBox renders m:eqArr — a vertical stack of equations centered
+// on each other. Used for systems of equations.
+func (r *renderer) mathEqArrBox(n *docx.MathNode, fontSize float64) mathBox {
+	rows := []mathBox{}
+	maxW := 0.0
+	for _, c := range n.Children {
+		if c.Kind == "e" {
+			b := r.buildMathBox(c, fontSize)
+			rows = append(rows, b)
+			if b.w > maxW {
+				maxW = b.w
+			}
+		}
+	}
+	if len(rows) == 0 {
+		return mathBox{}
+	}
+	const rowGap = 2.0
+	totalH := 0.0
+	for _, b := range rows {
+		totalH += b.height() + rowGap
+	}
+	if totalH > 0 {
+		totalH -= rowGap
+	}
+	return mathBox{
+		w:       maxW,
+		ascent:  totalH / 2,
+		descent: totalH / 2,
+		draw: func(r *renderer, x, baseline float64) {
+			y := baseline - totalH/2
+			for _, b := range rows {
+				if b.draw != nil {
+					// Center each row in the column.
+					b.draw(r, x+(maxW-b.w)/2, y+b.ascent)
+				}
+				y += b.height() + rowGap
 			}
 		},
 	}

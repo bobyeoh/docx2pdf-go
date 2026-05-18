@@ -60,6 +60,7 @@ func Parse(r io.ReaderAt, size int64) (*Document, error) {
 	doc := &Document{
 		Images:      map[string]image.Image{},
 		Hyperlink:   map[string]string{},
+		RelTargets:  map[string]string{},
 		Styles:      map[string]ParagraphStyle{},
 		CharStyles:  map[string]RunProps{},
 		TableStyles: map[string]TableStyle{},
@@ -130,6 +131,9 @@ func Parse(r io.ReaderAt, size int64) (*Document, error) {
 	// Categorize relationships by mode. External targets are hyperlink URLs;
 	// internal targets resolve to package parts (e.g. media/image1.png).
 	for rid, e := range rels {
+		if !e.External {
+			doc.RelTargets[rid] = e.Target
+		}
 		switch {
 		case e.External:
 			doc.Hyperlink[rid] = e.Target
@@ -137,6 +141,16 @@ func Parse(r io.ReaderAt, size int64) (*Document, error) {
 			full := "word/" + e.Target
 			zf, ok := files[full]
 			if !ok {
+				continue
+			}
+			if strings.HasSuffix(strings.ToLower(e.Target), ".svg") {
+				if img, err := rasterizeSVGAsset(zf); err == nil {
+					doc.Images[rid] = img
+				} else if doc.UnsupportedMedia == nil {
+					doc.UnsupportedMedia = map[string]string{rid: "SVG"}
+				} else {
+					doc.UnsupportedMedia[rid] = "SVG"
+				}
 				continue
 			}
 			if label, ok := vectorMediaFormat(e.Target, zf); ok {
@@ -182,6 +196,9 @@ func Parse(r io.ReaderAt, size int64) (*Document, error) {
 	}
 	if f, ok := files["word/commentsExtended.xml"]; ok {
 		_ = parseCommentsExtended(f, doc)
+	}
+	if f, ok := files["word/commentsIds.xml"]; ok {
+		_ = parseCommentsIds(f, doc)
 	}
 	if f, ok := files["word/people.xml"]; ok {
 		_ = parsePeople(f, doc)
@@ -271,6 +288,17 @@ func Parse(r io.ReaderAt, size int64) (*Document, error) {
 						doc.DiagramShapes = map[string]*VMLShape{}
 					}
 					doc.DiagramShapes[rid] = sh
+				}
+			}
+			// Stash the SmartArt layout family (cycle / hierarchy / list
+			// / pyramid / matrix / process) so the renderer can synthesize
+			// the right shape tree when Word didn't pre-render one.
+			if layoutZF := diagramSiblingLayout(files, e.Target); layoutZF != nil {
+				if kind := extractDiagramLayoutKind(layoutZF); kind != "" {
+					if doc.DiagramLayouts == nil {
+						doc.DiagramLayouts = map[string]string{}
+					}
+					doc.DiagramLayouts[rid] = kind
 				}
 			}
 		}
@@ -443,6 +471,26 @@ func decodeFontScheme(dec *xml.Decoder, start xml.StartElement, theme *Theme) er
 			case "ea":
 				if currentGroup != "" {
 					theme.Fonts[currentGroup+"EastAsia"] = attr(t, "typeface")
+				}
+				_ = dec.Skip()
+			case "cs":
+				// Complex-script slot (Arabic, Hebrew, Bidi). Word's
+				// font-selection algorithm picks this when a run carries
+				// w:rFonts/@cs or the script type is RTL.
+				if currentGroup != "" {
+					theme.Fonts[currentGroup+"Bidi"] = attr(t, "typeface")
+					theme.Fonts[currentGroup+"CS"] = attr(t, "typeface")
+				}
+				_ = dec.Skip()
+			case "font":
+				// Per-script fallback chain entry, e.g.
+				// <a:font script="Arab" typeface="Arial"/>.
+				if currentGroup != "" {
+					script := attr(t, "script")
+					face := attr(t, "typeface")
+					if script != "" && face != "" {
+						theme.Fonts[currentGroup+"Script:"+script] = face
+					}
 				}
 				_ = dec.Skip()
 			default:
@@ -631,8 +679,60 @@ func parseSettings(f *zip.File, doc *Document) error {
 		case "doNotHyphenateCaps":
 			s.DoNotHyphenateCaps = onOffValAttr(se)
 			_ = dec.Skip()
+		case "trackChangeNumbering":
+			s.TrackChangeNumbering = onOffValAttr(se)
+			_ = dec.Skip()
+		case "trackChanges":
+			s.TrackChanges = onOffValAttr(se)
+			_ = dec.Skip()
+		case "mathPr":
+			if err := decodeMathPr(dec, se, &s.MathProps); err != nil {
+				return err
+			}
+		case "revisionView":
+			// Each attribute defaults to 0 ("show") and is set to 1 to
+			// hide. Invert so RevisionView.X == true means "show X".
+			s.RevisionView.Markup = attr(se, "markup") != "1"
+			s.RevisionView.Comments = attr(se, "comments") != "1"
+			s.RevisionView.InsDel = attr(se, "insDel") != "1"
+			s.RevisionView.Formatting = attr(se, "formatting") != "1"
+			s.RevisionView.InkAnnotations = attr(se, "inkAnnotations") != "1"
+			_ = dec.Skip()
+		case "strictFirstAndLastChars":
+			s.StrictFirstAndLastChars = onOffValAttr(se)
+			_ = dec.Skip()
+		case "noLineBreaksAfter":
+			lang := attr(se, "lang")
+			val := attr(se, "val")
+			if lang != "" {
+				if s.NoLineBreaksAfter == nil {
+					s.NoLineBreaksAfter = map[string]string{}
+				}
+				s.NoLineBreaksAfter[lang] = val
+			}
+			_ = dec.Skip()
+		case "noLineBreaksBefore":
+			lang := attr(se, "lang")
+			val := attr(se, "val")
+			if lang != "" {
+				if s.NoLineBreaksBefore == nil {
+					s.NoLineBreaksBefore = map[string]string{}
+				}
+				s.NoLineBreaksBefore[lang] = val
+			}
+			_ = dec.Skip()
 		case "characterSpacingControl":
 			s.CharacterSpacingControl = attr(se, "val")
+			_ = dec.Skip()
+		case "decimalSymbol":
+			if v := attr(se, "val"); v != "" {
+				s.DecimalSymbol = v
+			}
+			_ = dec.Skip()
+		case "listSeparator":
+			if v := attr(se, "val"); v != "" {
+				s.ListSeparator = v
+			}
 			_ = dec.Skip()
 		case "compat":
 			if err := decodeCompat(dec, se, s); err != nil {
@@ -781,6 +881,11 @@ func parseNoteBody(dec *xml.Decoder, start xml.StartElement, pctx *parseDocConte
 					return nil, err
 				}
 				blocks = append(blocks, inner...)
+			case "permStart":
+				recordPermStart(pctx, t)
+				_ = dec.Skip()
+			case "permEnd":
+				_ = dec.Skip()
 			default:
 				_ = dec.Skip()
 			}
@@ -790,6 +895,33 @@ func parseNoteBody(dec *xml.Decoder, start xml.StartElement, pctx *parseDocConte
 			}
 		}
 	}
+}
+
+// recordPermStart stores a w:permStart range marker on the doc's
+// PermissionRanges map. The companion w:permEnd carries only the id and
+// is a no-op for AST capture purposes.
+func recordPermStart(pctx *parseDocContext, t xml.StartElement) {
+	if pctx == nil || pctx.doc == nil {
+		return
+	}
+	var pr PermissionRange
+	for _, a := range t.Attr {
+		switch a.Name.Local {
+		case "id":
+			pr.ID = a.Value
+		case "edGrp":
+			pr.EditorGroup = a.Value
+		case "ed":
+			pr.Editor = a.Value
+		}
+	}
+	if pr.ID == "" {
+		return
+	}
+	if pctx.doc.PermissionRanges == nil {
+		pctx.doc.PermissionRanges = map[string]PermissionRange{}
+	}
+	pctx.doc.PermissionRanges[pr.ID] = pr
 }
 
 // parseHeaderFooter parses a w:hdr or w:ftr XML part into a slice of blocks
@@ -859,35 +991,86 @@ func loadImage(zf *zip.File) (image.Image, error) {
 }
 
 // vectorMediaFormat detects EMF and WMF metafiles by extension or magic
-// bytes. Returns a label for the placeholder.
+// bytes. Returns a label for the placeholder. The label includes the
+// intrinsic dimensions extracted from the file header when available so
+// the placeholder reads "EMF 320×240" rather than just "EMF" — this
+// preserves at least the layout shape even when the file's pixels are
+// unreachable.
 func vectorMediaFormat(target string, zf *zip.File) (string, bool) {
 	lower := strings.ToLower(target)
-	switch {
-	case strings.HasSuffix(lower, ".emf"):
-		return "EMF", true
-	case strings.HasSuffix(lower, ".wmf"):
-		return "WMF", true
-	}
 	rc, err := zf.Open()
-	if err != nil {
+	if err == nil {
+		defer rc.Close()
+	}
+	var head [40]byte
+	if rc != nil {
+		_, _ = io.ReadFull(rc, head[:])
+	}
+	kind := ""
+	switch {
+	case strings.HasSuffix(lower, ".emf"),
+		(head[0] == 0x01 && head[1] == 0x00 && head[2] == 0x00 && head[3] == 0x00 && head[40-1] != 0 || false):
+		// Light heuristic: EMR_HEADER record type 1 + size in next dword.
+		if strings.HasSuffix(lower, ".emf") || (head[0] == 0x01 && head[1] == 0x00 && head[2] == 0x00 && head[3] == 0x00) {
+			kind = "EMF"
+		}
+	case strings.HasSuffix(lower, ".wmf"),
+		head[0] == 0xD7 && head[1] == 0xCD && head[2] == 0xC6 && head[3] == 0x9A,
+		head[0] == 0x01 && head[1] == 0x00 && head[2] == 0x09 && head[3] == 0x00:
+		kind = "WMF"
+	}
+	if kind == "" {
 		return "", false
 	}
-	defer rc.Close()
-	var head [8]byte
-	n, _ := io.ReadFull(rc, head[:])
-	if n < 4 {
-		return "", false
+	if w, h, ok := emfWmfDimensions(kind, head[:]); ok {
+		return kind + " " + strconv.Itoa(w) + "×" + strconv.Itoa(h), true
 	}
-	if head[0] == 0x01 && head[1] == 0x00 && head[2] == 0x00 && head[3] == 0x00 {
-		return "EMF", true
+	return kind, true
+}
+
+// emfWmfDimensions extracts intrinsic pixel dimensions from an EMF or WMF
+// file header. For EMF the bounds rect is in the EMR_HEADER record
+// (offset 8..23, four 32-bit signed integers: left/top/right/bottom in
+// device units). For WMF placeable files the dimensions are at offset
+// 6..13. Returns (0, 0, false) on parse error or non-placeable WMF.
+func emfWmfDimensions(kind string, head []byte) (int, int, bool) {
+	read32 := func(off int) int32 {
+		if off+4 > len(head) {
+			return 0
+		}
+		return int32(head[off]) | int32(head[off+1])<<8 | int32(head[off+2])<<16 | int32(head[off+3])<<24
 	}
-	if head[0] == 0xD7 && head[1] == 0xCD && head[2] == 0xC6 && head[3] == 0x9A {
-		return "WMF", true
+	read16 := func(off int) int16 {
+		if off+2 > len(head) {
+			return 0
+		}
+		return int16(head[off]) | int16(head[off+1])<<8
 	}
-	if head[0] == 0x01 && head[1] == 0x00 && head[2] == 0x09 && head[3] == 0x00 {
-		return "WMF", true
+	switch kind {
+	case "EMF":
+		// Bounds rect immediately follows the 8-byte EMR_HEADER prefix.
+		left := int(read32(8))
+		top := int(read32(12))
+		right := int(read32(16))
+		bottom := int(read32(20))
+		w, h := right-left, bottom-top
+		if w > 0 && h > 0 {
+			return w, h, true
+		}
+	case "WMF":
+		// Placeable WMF: header is 22 bytes, with a BoundingBox at offset 6.
+		if head[0] == 0xD7 && head[1] == 0xCD {
+			left := int(read16(6))
+			top := int(read16(8))
+			right := int(read16(10))
+			bottom := int(read16(12))
+			w, h := right-left, bottom-top
+			if w > 0 && h > 0 {
+				return w, h, true
+			}
+		}
 	}
-	return "", false
+	return 0, 0, false
 }
 
 // resolveNumStyleLinks rewrites every abstractNum that carries a
@@ -938,18 +1121,62 @@ type xmlStyles struct {
 			PPr xmlStylePPr `xml:"pPr"`
 		} `xml:"pPrDefault"`
 	} `xml:"docDefaults"`
-	Styles []xmlStyle `xml:"style"`
+	// LatentStyles captures w:latentStyles — the document-level table that
+	// Word writes to remember UI metadata (uiPriority, qFormat, semiHidden,
+	// hidden, unhideWhenUsed, locked) for built-in styles that aren't
+	// otherwise instantiated in this document.
+	LatentStyles *xmlLatentStyles `xml:"latentStyles"`
+	Styles       []xmlStyle       `xml:"style"`
+}
+
+type xmlLatentStyles struct {
+	DefLockedState    string                `xml:"defLockedState,attr"`
+	DefUIPriority     string                `xml:"defUIPriority,attr"`
+	DefSemiHidden     string                `xml:"defSemiHidden,attr"`
+	DefUnhideWhenUsed string                `xml:"defUnhideWhenUsed,attr"`
+	DefQFormat        string                `xml:"defQFormat,attr"`
+	Count             string                `xml:"count,attr"`
+	Exceptions        []xmlLsdException     `xml:"lsdException"`
+}
+
+type xmlLsdException struct {
+	Name            string `xml:"name,attr"`
+	UIPriority      string `xml:"uiPriority,attr"`
+	SemiHidden      string `xml:"semiHidden,attr"`
+	UnhideWhenUsed  string `xml:"unhideWhenUsed,attr"`
+	QFormat         string `xml:"qFormat,attr"`
+	Locked          string `xml:"locked,attr"`
+	PrimaryStyle    string `xml:"primaryStyle,attr"`
 }
 
 type xmlStyle struct {
-	Type    string `xml:"type,attr"`
-	StyleID string `xml:"styleId,attr"`
+	Type         string `xml:"type,attr"`
+	StyleID      string `xml:"styleId,attr"`
+	Default      string `xml:"default,attr"`
+	CustomStyle  string `xml:"customStyle,attr"`
+	Name         *struct {
+		Val string `xml:"val,attr"`
+	} `xml:"name"`
+	Aliases *struct {
+		Val string `xml:"val,attr"`
+	} `xml:"aliases"`
 	BasedOn *struct {
 		Val string `xml:"val,attr"`
 	} `xml:"basedOn"`
+	Next *struct {
+		Val string `xml:"val,attr"`
+	} `xml:"next"`
 	Link *struct {
 		Val string `xml:"val,attr"`
 	} `xml:"link"`
+	UIPriority *struct {
+		Val string `xml:"val,attr"`
+	} `xml:"uiPriority"`
+	Hidden         *struct{} `xml:"hidden"`
+	SemiHidden     *struct{} `xml:"semiHidden"`
+	UnhideWhenUsed *struct{} `xml:"unhideWhenUsed"`
+	QFormat        *struct{} `xml:"qFormat"`
+	Locked         *struct{} `xml:"locked"`
 	PPr   *xmlStylePPr   `xml:"pPr"`
 	RPr   *xmlRPr        `xml:"rPr"`
 	TblPr *xmlStyleTblPr `xml:"tblPr"`
@@ -1000,6 +1227,14 @@ type xmlStylePPr struct {
 		Line     string `xml:"line,attr"`
 		LineRule string `xml:"lineRule,attr"`
 	} `xml:"spacing"`
+	NumPr *struct {
+		Ilvl *struct {
+			Val string `xml:"val,attr"`
+		} `xml:"ilvl"`
+		NumID *struct {
+			Val string `xml:"val,attr"`
+		} `xml:"numId"`
+	} `xml:"numPr"`
 }
 
 func parseStyles(f *zip.File, doc *Document) error {
@@ -1018,6 +1253,36 @@ func parseStyles(f *zip.File, doc *Document) error {
 	}
 	doc.Defaults = rPrToProps(s.DocDefaults.RPrDefault.RPr, RunProps{})
 	doc.ParaDefaults = pPrDefaultsFromStyle(s.DocDefaults.PPrDefault.PPr)
+
+	// latentStyles: capture UI metadata for styles that aren't materialized.
+	if s.LatentStyles != nil {
+		ls := LatentStylesInfo{Exceptions: map[string]LatentStyle{}}
+		ls.DefLockedState = s.LatentStyles.DefLockedState == "1" || s.LatentStyles.DefLockedState == "true"
+		if v, err := strconv.Atoi(s.LatentStyles.DefUIPriority); err == nil {
+			ls.DefUIPriority = v
+		}
+		ls.DefSemiHidden = s.LatentStyles.DefSemiHidden == "1"
+		ls.DefUnhideWhenUsed = s.LatentStyles.DefUnhideWhenUsed == "1"
+		ls.DefQFormat = s.LatentStyles.DefQFormat == "1"
+		if v, err := strconv.Atoi(s.LatentStyles.Count); err == nil {
+			ls.Count = v
+		}
+		for _, ex := range s.LatentStyles.Exceptions {
+			le := LatentStyle{Name: ex.Name}
+			if v, err := strconv.Atoi(ex.UIPriority); err == nil {
+				le.UIPriority = v
+			} else {
+				le.UIPriority = ls.DefUIPriority
+			}
+			le.SemiHidden = ex.SemiHidden == "1" || (ex.SemiHidden == "" && ls.DefSemiHidden)
+			le.UnhideWhenUsed = ex.UnhideWhenUsed == "1" || (ex.UnhideWhenUsed == "" && ls.DefUnhideWhenUsed)
+			le.QFormat = ex.QFormat == "1" || (ex.QFormat == "" && ls.DefQFormat)
+			le.Locked = ex.Locked == "1" || (ex.Locked == "" && ls.DefLockedState)
+			le.PrimaryStyle = ex.PrimaryStyle == "1"
+			ls.Exceptions[ex.Name] = le
+		}
+		doc.LatentStyles = ls
+	}
 
 	// Character styles — flat map of styleId → RunProps with basedOn flattened.
 	rawChar := map[string]struct {
@@ -1102,10 +1367,43 @@ func parseStyles(f *zip.File, doc *Document) error {
 		if xs.Link != nil {
 			ps.LinkedCharStyle = xs.Link.Val
 		}
+		if xs.Name != nil {
+			ps.Name = xs.Name.Val
+		}
+		if xs.Aliases != nil {
+			ps.Aliases = xs.Aliases.Val
+		}
+		if xs.Next != nil {
+			ps.NextStyleID = xs.Next.Val
+		}
+		ps.IsDefault = xs.Default == "1" || xs.Default == "true"
+		ps.IsCustom = xs.CustomStyle == "1" || xs.CustomStyle == "true"
+		if xs.UIPriority != nil {
+			if v, err := strconv.Atoi(xs.UIPriority.Val); err == nil {
+				ps.UIPriority = v
+			}
+		}
+		ps.Hidden = xs.Hidden != nil
+		ps.SemiHidden = xs.SemiHidden != nil
+		ps.UnhideWhenUsed = xs.UnhideWhenUsed != nil
+		ps.QFormat = xs.QFormat != nil
+		ps.Locked = xs.Locked != nil
 		if xs.RPr != nil {
 			ps.Run = rPrToProps(*xs.RPr, RunProps{})
 		}
 		if xs.PPr != nil {
+			if xs.PPr.NumPr != nil {
+				if xs.PPr.NumPr.NumID != nil {
+					if x, err := strconv.Atoi(xs.PPr.NumPr.NumID.Val); err == nil && x > 0 {
+						ps.NumPr.NumID = x
+					}
+				}
+				if xs.PPr.NumPr.Ilvl != nil {
+					if x, err := strconv.Atoi(xs.PPr.NumPr.Ilvl.Val); err == nil {
+						ps.NumPr.Level = x
+					}
+				}
+			}
 			if xs.PPr.Jc != nil {
 				ps.Alignment = jcToAlignment(xs.PPr.Jc.Val)
 				ps.HasAlignment = true
@@ -1190,6 +1488,9 @@ func mergeStyles(parent, child ParagraphStyle) ParagraphStyle {
 	if child.LinkedCharStyle != "" {
 		out.LinkedCharStyle = child.LinkedCharStyle
 	}
+	if child.NumPr.NumID != 0 {
+		out.NumPr = child.NumPr
+	}
 	return out
 }
 
@@ -1208,8 +1509,17 @@ func MergeRunProps(parent, child RunProps) RunProps {
 	if child.Underline {
 		out.Underline = true
 	}
+	if child.UnderlineStyle != "" {
+		out.UnderlineStyle = child.UnderlineStyle
+	}
 	if child.Strike {
 		out.Strike = true
+	}
+	if child.DStrike {
+		out.DStrike = true
+	}
+	if child.W14Has3D {
+		out.W14Has3D = true
 	}
 	if child.Caps {
 		out.Caps = true
@@ -1629,6 +1939,18 @@ func decodeAbstractNum(dec *xml.Decoder, start xml.StartElement) (AbstractNum, e
 			case "numStyleLink":
 				an.NumStyleLink = attr(t, "val")
 				_ = dec.Skip()
+			case "multiLevelType":
+				an.MultiLevelType = attr(t, "val")
+				_ = dec.Skip()
+			case "tmpl":
+				an.Tmpl = attr(t, "val")
+				_ = dec.Skip()
+			case "nsid":
+				an.Nsid = attr(t, "val")
+				_ = dec.Skip()
+			case "name":
+				an.Name = attr(t, "val")
+				_ = dec.Skip()
 			default:
 				_ = dec.Skip()
 			}
@@ -1698,6 +2020,22 @@ func decodeLevel(dec *xml.Decoder, start xml.StartElement) (NumLevel, error) {
 				_ = dec.Skip()
 			case "numFmt":
 				lv.Format = attr(t, "val")
+				if lv.Format == "custom" {
+					lv.CustomFmt = attr(t, "format")
+				}
+				_ = dec.Skip()
+			case "hideParent":
+				lv.HideParent = true
+				_ = dec.Skip()
+			case "legacy":
+				if v := attr(t, "legacyIndent"); v != "" {
+					if x, err := strconv.Atoi(v); err == nil {
+						lv.LegacyIndent = x
+					}
+				}
+				if lv.LegacyIndent == 0 {
+					lv.LegacyIndent = -1 // mark presence even with no indent
+				}
 				_ = dec.Skip()
 			case "lvlText":
 				lv.Text = attr(t, "val")
@@ -1729,12 +2067,59 @@ func decodeLevel(dec *xml.Decoder, start xml.StartElement) (NumLevel, error) {
 					}
 				}
 				_ = dec.Skip()
+			case "lvlJc":
+				lv.MarkerJc = attr(t, "val")
+				_ = dec.Skip()
+			case "rPr":
+				// We only need the w:rFonts hint for bullet glyph
+				// rendering — skip everything else.
+				if err := decodeLevelRPr(dec, t, &lv); err != nil {
+					return lv, err
+				}
 			default:
 				_ = dec.Skip()
 			}
 		case xml.EndElement:
 			if t.Name.Local == start.Name.Local {
 				return lv, nil
+			}
+		}
+	}
+}
+
+// decodeLevelRPr extracts only the bullet-font hint from a level's
+// w:rPr. Most attributes inside a level rPr (color, size, bold) are
+// irrelevant to PDF list-marker rendering — those are inherited from the
+// paragraph's run properties — but the font family matters because legacy
+// bullets are private-area Symbol / Wingdings glyphs that fall back to
+// tofu in the default text font.
+func decodeLevelRPr(dec *xml.Decoder, start xml.StartElement, lv *NumLevel) error {
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			if t.Name.Local == "rFonts" {
+				// Prefer w:ascii, fall back to w:hAnsi, then w:cs.
+				for _, a := range t.Attr {
+					switch a.Name.Local {
+					case "ascii", "hAnsi":
+						if lv.MarkerFontFamily == "" {
+							lv.MarkerFontFamily = a.Value
+						}
+					case "cs":
+						if lv.MarkerFontFamily == "" {
+							lv.MarkerFontFamily = a.Value
+						}
+					}
+				}
+			}
+			_ = dec.Skip()
+		case xml.EndElement:
+			if t.Name.Local == start.Name.Local {
+				return nil
 			}
 		}
 	}
@@ -1865,10 +2250,17 @@ type xmlRPr struct {
 	ICs       *struct{}   `xml:"iCs"`
 	U         *xmlValAttr `xml:"u"`
 	Strike    *struct{}   `xml:"strike"`
+	DStrike   *struct{}   `xml:"dstrike"` // double strikethrough
 	Caps      *struct{}   `xml:"caps"`
 	SmallCaps *struct{}   `xml:"smallCaps"`
 	Vanish    *struct{}   `xml:"vanish"`
-	WebHidden *struct{}   `xml:"webHidden"`
+	// SpecVanish marks the run as hidden until a specific TOC/INDEX
+	// build-step expands it (Word uses it for "Mark Entry" markers).
+	// At render time it behaves the same as vanish — the marker text
+	// stays out of the body and only appears when the field that
+	// consumes it is laid out.
+	SpecVanish *struct{}   `xml:"specVanish"`
+	WebHidden  *struct{}   `xml:"webHidden"`
 	NoProof   *struct{}   `xml:"noProof"`
 	CS        *struct{}   `xml:"cs"`  // complex-script run
 	RTL       *struct{}   `xml:"rtl"` // right-to-left
@@ -1936,6 +2328,12 @@ type xmlRPr struct {
 	W14CntxtAlts   *xmlValAttr `xml:"cntxtAlts"`
 	W14Shadow      *xmlW14Fill `xml:"shadow"`
 	W14TextOutline *xmlW14Fill `xml:"textOutline"`
+	// W14Scene3D / W14Props3D mark the run as having WordprocessingML
+	// 2010+ 3D text effects. We capture only presence (Word stores a
+	// rich scene/material tree we can't actually project in 2D); the
+	// renderer paints a depth-shadow approximation when present.
+	W14Scene3D *struct{} `xml:"scene3d"`
+	W14Props3D *struct{} `xml:"props3d"`
 	// RPrChange records w:rPrChange — tracked-change of run properties.
 	// We capture author/id/date attributes; the inner <w:rPr> is the
 	// pre-edit history and is intentionally ignored.
@@ -1977,6 +2375,39 @@ func readPrChangeAttrs(t xml.StartElement, kind string) *PrChange {
 	return pc
 }
 
+// readPrChangeWithSnapshot is readPrChangeAttrs plus a serialized
+// snapshot of the pre-change property tree (the children of the
+// w:*Change element). Drives PrChange.SnapshotXML so audit consumers
+// can reconstruct what changed. The decoder is positioned at `start`
+// and is advanced through the matching end-element on return.
+func readPrChangeWithSnapshot(dec *xml.Decoder, t xml.StartElement, kind string) (*PrChange, error) {
+	pc := readPrChangeAttrs(t, kind)
+	var b strings.Builder
+	enc := xml.NewEncoder(&strBuilderWriter{&b})
+	depth := 1
+	for depth > 0 {
+		tok, err := dec.Token()
+		if err != nil {
+			return pc, err
+		}
+		if err := enc.EncodeToken(tok); err != nil {
+			return pc, err
+		}
+		switch tok.(type) {
+		case xml.StartElement:
+			depth++
+		case xml.EndElement:
+			depth--
+		}
+	}
+	if err := enc.Flush(); err != nil {
+		return pc, err
+	}
+	// The encoder appends the matching end-tag, so trim it back off.
+	pc.SnapshotXML = strings.TrimSpace(b.String())
+	return pc, nil
+}
+
 // xmlW14Fill captures the w14:solidFill > w14:srgbClr nested chain that
 // Word 2010+ uses for text-effect colors.
 type xmlW14Fill struct {
@@ -2008,9 +2439,13 @@ func rPrToProps(r xmlRPr, base RunProps) RunProps {
 	}
 	if r.U != nil && r.U.Val != "" && r.U.Val != "none" {
 		p.Underline = true
+		p.UnderlineStyle = r.U.Val
 	}
 	if r.Strike != nil {
 		p.Strike = true
+	}
+	if r.DStrike != nil {
+		p.DStrike = true
 	}
 	if r.Caps != nil {
 		p.Caps = true
@@ -2030,7 +2465,7 @@ func rPrToProps(r xmlRPr, base RunProps) RunProps {
 	if r.VertAlign != nil {
 		p.VertAlign = r.VertAlign.Val
 	}
-	if r.Vanish != nil {
+	if r.Vanish != nil || r.SpecVanish != nil {
 		p.Vanish = true
 	}
 	if r.Position != nil && r.Position.Val != "" {
@@ -2065,6 +2500,9 @@ func rPrToProps(r xmlRPr, base RunProps) RunProps {
 				p.LumOff = float64(255-v) / 255.0
 			}
 		}
+	}
+	if r.W14Scene3D != nil || r.W14Props3D != nil {
+		p.W14Has3D = true
 	}
 	if r.Emboss != nil {
 		p.TextEffect = "emboss"
@@ -2282,8 +2720,9 @@ func parseDocument(f *zip.File, pctx *parseDocContext) error {
 			}
 		case "oMathPara":
 			// Display math: a body-level equation. Best-effort — extract
-			// the visible text and emit it as a centered, italic paragraph.
-			// Loses the structural typesetting but keeps the content.
+			// the visible text and emit it as a styled paragraph. The
+			// m:oMathParaPr/m:jc alignment hint is honored when present,
+			// defaulting to centered (Word's display-math default).
 			tree, txt, err := ExtractMathTree(dec, se)
 			if err != nil {
 				return err
@@ -2291,8 +2730,19 @@ func parseDocument(f *zip.File, pctx *parseDocContext) error {
 			if txt != "" || tree != nil {
 				run := mathRun(txt, doc.Defaults)
 				run.Math = tree
+				align := AlignCenter
+				if tree != nil {
+					switch tree.Align {
+					case "left":
+						align = AlignLeft
+					case "right":
+						align = AlignRight
+					case "centerGroup", "center":
+						align = AlignCenter
+					}
+				}
 				p := Paragraph{
-					Alignment: AlignCenter,
+					Alignment: align,
 					Runs:      []Run{run},
 				}
 				pctx.curSection.Blocks = append(pctx.curSection.Blocks, p)
@@ -2438,6 +2888,22 @@ func decodeParagraph(dec *xml.Decoder, start xml.StartElement, pctx *parseDocCon
 				if err := decodeWrapperWithRev(dec, t, &p, paraRPr, pctx, false, t.Name.Local, author); err != nil {
 					return p, err
 				}
+			case "customXmlInsRangeStart", "customXmlInsRangeEnd",
+				"customXmlDelRangeStart", "customXmlDelRangeEnd",
+				"customXmlMoveFromRangeStart", "customXmlMoveFromRangeEnd",
+				"customXmlMoveToRangeStart", "customXmlMoveToRangeEnd":
+				// Range markers track edits to custom XML wrappers. They
+				// have no visible content; preserving the markup is only
+				// useful for round-tripping. We skip them — the surrounded
+				// inner runs already carry their own RevisionType.
+				_ = dec.Skip()
+			case "moveFromRangeStart", "moveFromRangeEnd",
+				"moveToRangeStart", "moveToRangeEnd":
+				// Word's move-range markers (companion to w:moveFrom /
+				// w:moveTo). The inner runs already carry revision type,
+				// so the empty range markers are skipped without losing
+				// information.
+				_ = dec.Skip()
 			case "smartTag", "customXml":
 				// Auto-recognized text / structured-doc wrapper. The wrapper
 				// itself has no rendering effect — recurse into its child
@@ -2445,6 +2911,42 @@ func decodeParagraph(dec *xml.Decoder, start xml.StartElement, pctx *parseDocCon
 				if err := decodeWrapper(dec, t, &p, paraRPr, pctx, false); err != nil {
 					return p, err
 				}
+			case "dir", "bdo":
+				// Bidi direction override (UAX#9 LRO/RLO/PDF). The w:val
+				// attribute carries "ltr" or "rtl"; we stamp every inner
+				// run so the renderer's reorderBidi pass treats them as
+				// if they live inside a hard directional override.
+				val := strings.ToLower(attr(t, "val"))
+				before := len(p.Runs)
+				if err := decodeWrapper(dec, t, &p, paraRPr, pctx, false); err != nil {
+					return p, err
+				}
+				if val == "ltr" || val == "rtl" {
+					for i := before; i < len(p.Runs); i++ {
+						if p.Runs[i].DirOverride == "" {
+							p.Runs[i].DirOverride = val
+						}
+					}
+				}
+			case "subDoc":
+				// Master-document sub-document reference. We can't pull
+				// the external file at parse time, but surfacing a
+				// labeled placeholder beats silently dropping the
+				// pointer (Word/docx4j both round-trip these).
+				rid := ""
+				for _, a := range t.Attr {
+					if a.Name.Local == "id" && (a.Name.Space == "" || strings.Contains(a.Name.Space, "relationships")) {
+						rid = a.Value
+					}
+				}
+				label := "[Sub-document]"
+				if rid != "" {
+					if target := pctx.doc.RelTargets[rid]; target != "" {
+						label = "[Sub-document: " + target + "]"
+					}
+				}
+				p.Runs = append(p.Runs, Run{Text: label, Props: paraRPr})
+				_ = dec.Skip()
 			case "sdt":
 				// Inline content control: the actual runs live one level
 				// deeper, inside <w:sdtContent>. decodeInlineSdt unwraps
@@ -2486,6 +2988,10 @@ func decodeParagraph(dec *xml.Decoder, start xml.StartElement, pctx *parseDocCon
 				p.Runs = append(p.Runs, runs...)
 			case "commentRangeStart", "commentRangeEnd", "commentReference":
 				// Comments are out-of-flow; we skip the inline markers.
+				_ = dec.Skip()
+			case "proofErr":
+				// Proofing-error span markers (Word's spelling/grammar
+				// underlines). Strictly authoring metadata; drop.
 				_ = dec.Skip()
 			default:
 				if err := dec.Skip(); err != nil {
@@ -2636,13 +3142,19 @@ func decodeWrapperWithRev(dec *xml.Decoder, start xml.StartElement, p *Paragraph
 func decodeHyperlink(dec *xml.Decoder, start xml.StartElement, p *Paragraph, paraRPr RunProps, pctx *parseDocContext) error {
 	// w:hyperlink has either r:id (external URL via rels) or w:anchor
 	// (internal bookmark name). The renderer treats them differently.
-	rid, anchor := "", ""
+	// Word also carries w:tooltip and w:tgtFrame attributes; we capture
+	// w:tooltip on each run for callers that introspect the AST. PDF
+	// has no native equivalent so we don't render a tooltip surface,
+	// but recording it round-trips the metadata.
+	rid, anchor, tooltip := "", "", ""
 	for _, a := range start.Attr {
 		switch a.Name.Local {
 		case "id":
 			rid = a.Value
 		case "anchor":
 			anchor = a.Value
+		case "tooltip":
+			tooltip = a.Value
 		}
 	}
 	for {
@@ -2663,6 +3175,9 @@ func decodeHyperlink(dec *xml.Decoder, start xml.StartElement, p *Paragraph, par
 					}
 					if anchor != "" {
 						runs[i].LinkAnchor = anchor
+					}
+					if tooltip != "" {
+						runs[i].LinkTooltip = tooltip
 					}
 				}
 				p.Runs = append(p.Runs, runs...)
@@ -2757,6 +3272,13 @@ func decodePPr(dec *xml.Decoder, start xml.StartElement, p *Paragraph, paraRPr *
 						}
 						if st.LineHeight.Rule != "" {
 							p.LineHeight = st.LineHeight
+						}
+						// pStyle→numPr inheritance: a style with a
+						// numPr makes paragraphs of that style auto-list.
+						// Paragraph-level numPr (decoded later) wins.
+						if st.NumPr.NumID > 0 && p.List == nil {
+							li := st.NumPr
+							p.List = &li
 						}
 					}
 				}
@@ -2889,6 +3411,12 @@ func decodePPr(dec *xml.Decoder, start xml.StartElement, p *Paragraph, paraRPr *
 				v := onOff(t)
 				p.AutoSpaceDN = &v
 				_ = dec.Skip()
+			case "suppressLineNumbers":
+				p.SuppressLineNumbers = onOff(t)
+				_ = dec.Skip()
+			case "suppressAutoHyphens":
+				p.SuppressAutoHyphens = onOff(t)
+				_ = dec.Skip()
 			case "tabs":
 				if err := decodeTabs(dec, t, p); err != nil {
 					return err
@@ -2955,10 +3483,39 @@ func decodePPr(dec *xml.Decoder, start xml.StartElement, p *Paragraph, paraRPr *
 				// Word stores firstLine as a positive offset and hanging as a
 				// positive value with the opposite sign — we collapse to one
 				// signed IndentFirstLinePt (positive = first-line indent,
-				// negative = hanging indent).
+				// negative = hanging indent). The *Chars variants
+				// (firstLineChars / leftChars / hangingChars / startChars /
+				// endChars / rightChars) are in 1/100 of a character: with
+				// the doc-default font size S (points), 100 char-units = S
+				// points of width (CJK characters being roughly square).
+				defFontPt := 10.5
+				if doc != nil && doc.Defaults.FontSize > 0 {
+					defFontPt = doc.Defaults.FontSize
+				}
+				charsToPt := func(v string) (float64, bool) {
+					x, err := strconv.Atoi(v)
+					if err != nil {
+						return 0, false
+					}
+					return float64(x) * defFontPt / 100.0, true
+				}
 				if v := attr(t, "left"); v != "" {
 					if x, err := strconv.Atoi(v); err == nil {
 						p.IndentLeftPt = float64(x) / 20.0
+					}
+				} else if v := attr(t, "start"); v != "" {
+					// w:start is the bidi-neutral alias for w:left.
+					if x, err := strconv.Atoi(v); err == nil {
+						p.IndentLeftPt = float64(x) / 20.0
+					}
+				}
+				if v := attr(t, "leftChars"); v != "" {
+					if pt, ok := charsToPt(v); ok {
+						p.IndentLeftPt = pt
+					}
+				} else if v := attr(t, "startChars"); v != "" {
+					if pt, ok := charsToPt(v); ok {
+						p.IndentLeftPt = pt
 					}
 				}
 				if v := attr(t, "firstLine"); v != "" {
@@ -2966,11 +3523,24 @@ func decodePPr(dec *xml.Decoder, start xml.StartElement, p *Paragraph, paraRPr *
 						p.IndentFirstLinePt = float64(x) / 20.0
 					}
 				}
+				if v := attr(t, "firstLineChars"); v != "" {
+					if pt, ok := charsToPt(v); ok {
+						p.IndentFirstLinePt = pt
+					}
+				}
 				if v := attr(t, "hanging"); v != "" {
 					if x, err := strconv.Atoi(v); err == nil {
 						p.IndentFirstLinePt = -float64(x) / 20.0
 					}
 				}
+				if v := attr(t, "hangingChars"); v != "" {
+					if pt, ok := charsToPt(v); ok {
+						p.IndentFirstLinePt = -pt
+					}
+				}
+				// w:right / w:rightChars / w:end / w:endChars are parsed
+				// only to be silently consumed — the layout currently uses
+				// IndentLeftPt + paragraph width without a right indent.
 				_ = dec.Skip()
 			case "rPr":
 				// <w:pPr><w:rPr> styles the paragraph mark glyph (¶)
@@ -3044,6 +3614,48 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 			case "tab":
 				atoms = append(atoms, Run{Text: "\t", Props: rp})
 				_ = dec.Skip()
+			case "ptab":
+				// Positional tab — stop is computed at layout time from
+				// alignment + relativeTo. Encode as a regular "\t" so the
+				// renderer's tab path picks it up; the PtabInfo overrides
+				// the stop lookup.
+				pt := &PtabInfo{
+					Alignment:  attr(t, "alignment"),
+					RelativeTo: attr(t, "relativeTo"),
+					Leader:     attr(t, "leader"),
+				}
+				atoms = append(atoms, Run{Text: "\t", Props: rp, Ptab: pt})
+				_ = dec.Skip()
+			case "pgNum", "dayLong", "dayShort", "monthLong", "monthShort", "yearLong", "yearShort":
+				// Run-internal date / page placeholders. Word emits these
+				// as standalone child elements (separate from PAGE / DATE
+				// field markers). We rewrite them as a synthetic simple-
+				// field marker stream so flattenFields handles them with
+				// the same code path that resolves PAGE and DATE.
+				instr := ""
+				switch t.Name.Local {
+				case "pgNum":
+					instr = "PAGE"
+				case "yearLong":
+					instr = `DATE \@ "yyyy"`
+				case "yearShort":
+					instr = `DATE \@ "yy"`
+				case "monthLong":
+					instr = `DATE \@ "MMMM"`
+				case "monthShort":
+					instr = `DATE \@ "MMM"`
+				case "dayLong":
+					instr = `DATE \@ "dddd"`
+				case "dayShort":
+					instr = `DATE \@ "ddd"`
+				}
+				atoms = append(atoms,
+					Run{FieldBegin: true, Props: rp, InlineDateKind: t.Name.Local},
+					Run{InstrText: instr, Props: rp},
+					Run{FieldSep: true, Props: rp},
+					Run{FieldEnd: true, Props: rp},
+				)
+				_ = dec.Skip()
 			case "br":
 				kind := attr(t, "type")
 				if kind == "page" {
@@ -3072,11 +3684,20 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 				if id != "" {
 					srp := rp
 					srp.VertAlign = "superscript"
+					customMark := ""
+					if v := attr(t, "customMarkFollows"); v == "1" || v == "true" {
+						// Word's convention: the next w:t in the
+						// same run carries the literal mark glyph.
+						// We mark the reference so the renderer can
+						// pick it up when laying out the marker.
+						customMark = "custom"
+					}
 					atoms = append(atoms, Run{
-						Text:       "[" + id + "]",
-						Props:      srp,
-						FootnoteID: id,
-						IsEndnote:  t.Name.Local == "endnoteReference",
+						Text:          "[" + id + "]",
+						Props:         srp,
+						FootnoteID:    id,
+						IsEndnote:     t.Name.Local == "endnoteReference",
+						CustomRefMark: customMark,
 					})
 				}
 				_ = dec.Skip()
@@ -3112,12 +3733,14 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 			case "sym":
 				// <w:sym w:font="Wingdings" w:char="F0E0"/> — code point in the
 				// referenced font. Best-effort: convert the hex code to a rune
-				// and render with the default font (the symbol font itself is
-				// not registered, but for common math/arrow chars in the BMP
-				// area the rune is meaningful enough).
+				// and translate from the legacy private-use range (F020-F0FF)
+				// to a canonical Unicode equivalent when w:font names Symbol
+				// or Wingdings (the docs we ship can't embed the actual font
+				// metric data, so PUA glyphs would render as tofu otherwise).
 				if v := attr(t, "char"); v != "" {
 					if cp, err := strconv.ParseUint(v, 16, 32); err == nil {
-						atoms = append(atoms, Run{Text: string(rune(cp)), Props: rp})
+						mapped := mapSymbolGlyph(attr(t, "font"), rune(cp))
+						atoms = append(atoms, Run{Text: string(mapped), Props: rp})
 					}
 				}
 				_ = dec.Skip()
@@ -3159,41 +3782,88 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 				}
 				if di.RID != "" {
 					atoms = append(atoms, Run{
-						ImageID:         di.RID,
-						ImageWidthPt:    di.WPt,
-						ImageHeightPt:   di.HPt,
-						CropTopPct:      di.CropT,
-						CropBottomPct:   di.CropB,
-						CropLeftPct:     di.CropL,
-						CropRightPct:    di.CropR,
-						ImageEffects:    di.ImageEffects,
+						ImageID:                di.RID,
+						ImageWidthPt:           di.WPt,
+						ImageHeightPt:          di.HPt,
+						ImageRotationDeg:       di.RotationDeg,
+						ImageFlipH:             di.FlipH,
+						ImageFlipV:             di.FlipV,
+						CropTopPct:             di.CropT,
+						CropBottomPct:          di.CropB,
+						CropLeftPct:            di.CropL,
+						CropRightPct:           di.CropR,
+						ImageEffects:           di.ImageEffects,
+						ImageAnchored:          di.IsAnchor,
+						AnchorAlignH:           di.PosH.Align,
+						AnchorAlignV:           di.PosV.Align,
+						AnchorOffsetXPt:        di.PosH.OffsetPt(),
+						AnchorOffsetYPt:        di.PosV.OffsetPt(),
+						AnchorWrap:             di.WrapType,
+						AnchorWrapPolygon:      di.WrapPolygon,
+						AnchorSimplePosUsed:    di.SimplePosUsed,
+						AnchorSimplePosXPt:     di.SimplePosXPt,
+						AnchorSimplePosYPt:     di.SimplePosYPt,
+						AltText:                di.AltText,
+						Props:                  rp,
+					})
+				} else if di.IsGroup && di.GroupChildShapeCount > 1 && di.ShapePrst == "" && di.CustPath == "" {
+					// Group drawing whose children were heterogeneous enough
+					// that findDrawingInfo couldn't collapse them into a
+					// single shape. Surface a labeled placeholder so the
+					// reader sees something at the source's footprint.
+					sh := &VMLShape{
+						Kind:           "rect",
+						WidthPt:        di.WPt,
+						HeightPt:       di.HPt,
+						StrokeColor:    "808080",
+						StrokeWeightPt: 0.5,
+						TextBox:        fmt.Sprintf("[Group: %d shapes]", di.GroupChildShapeCount),
+					}
+					if sh.WidthPt <= 0 {
+						sh.WidthPt = 192
+					}
+					if sh.HeightPt <= 0 {
+						sh.HeightPt = 96
+					}
+					atoms = append(atoms, Run{
+						VMLShape:        sh,
+						AltText:         di.AltText,
 						ImageAnchored:   di.IsAnchor,
 						AnchorAlignH:    di.PosH.Align,
 						AnchorAlignV:    di.PosV.Align,
 						AnchorOffsetXPt: di.PosH.OffsetPt(),
 						AnchorOffsetYPt: di.PosV.OffsetPt(),
 						AnchorWrap:      di.WrapType,
-						AltText:         di.AltText,
 						Props:           rp,
 					})
+					di.TxbxText = ""
 				} else if di.ShapePrst != "" || di.CustPath != "" {
 					// DrawingML vector shape (no image). Synthesize a
 					// VMLShape so the renderer's shape path draws it.
 					sh := &VMLShape{
-						Kind:           shapeKindForPrst(di.ShapePrst),
-						WidthPt:        di.WPt,
-						HeightPt:       di.HPt,
-						FillColor:      di.ShapeFill,
-						StrokeColor:    di.ShapeStroke,
-						StrokeWeightPt: di.ShapeStrokeWeightPt,
-						CustomPath:     di.CustPath,
-						GradientKind:   di.ShapeGradientKind,
-						GradientAngle:  di.ShapeGradientAngle,
-						GradientStops:  di.ShapeGradientStops,
-						Shadow:         di.ShapeShadow,
-						Pattern:        di.ShapePattern,
-						TextBox:        di.TxbxText,
-						TextBoxBlocks:  di.TxbxBlocks,
+						Kind:              shapeKindForPrst(di.ShapePrst),
+						WidthPt:           di.WPt,
+						HeightPt:          di.HPt,
+						FillColor:         di.ShapeFill,
+						StrokeColor:       di.ShapeStroke,
+						StrokeWeightPt:    di.ShapeStrokeWeightPt,
+						CustomPath:        di.CustPath,
+						GradientKind:      di.ShapeGradientKind,
+						GradientAngle:     di.ShapeGradientAngle,
+						GradientStops:     di.ShapeGradientStops,
+						Shadow:            di.ShapeShadow,
+						Pattern:           di.ShapePattern,
+						TextBox:           di.TxbxText,
+						TextBoxBlocks:     di.TxbxBlocks,
+						HeadEnd:           di.ShapeHeadEnd,
+						TailEnd:           di.ShapeTailEnd,
+						TextAnchor:        di.TextAnchor,
+						TextLeftInsetPt:   di.TextLeftInsetPt,
+						TextTopInsetPt:    di.TextTopInsetPt,
+						TextRightInsetPt:  di.TextRightInsetPt,
+						TextBottomInsetPt: di.TextBottomInsetPt,
+						TextVertical:      di.TextVertical,
+						TextAutoFit:       di.TextAutoFit,
 					}
 					if sh.WidthPt <= 0 {
 						sh.WidthPt = 96
@@ -3201,7 +3871,21 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 					if sh.HeightPt <= 0 {
 						sh.HeightPt = 48
 					}
-					atoms = append(atoms, Run{VMLShape: sh, AltText: di.AltText, Props: rp})
+					atoms = append(atoms, Run{
+						VMLShape:               sh,
+						AltText:                di.AltText,
+						ImageAnchored:          di.IsAnchor,
+						AnchorAlignH:           di.PosH.Align,
+						AnchorAlignV:           di.PosV.Align,
+						AnchorOffsetXPt:        di.PosH.OffsetPt(),
+						AnchorOffsetYPt:        di.PosV.OffsetPt(),
+						AnchorWrap:             di.WrapType,
+						AnchorWrapPolygon:      di.WrapPolygon,
+						AnchorSimplePosUsed:    di.SimplePosUsed,
+						AnchorSimplePosXPt:     di.SimplePosXPt,
+						AnchorSimplePosYPt:     di.SimplePosYPt,
+						Props:                  rp,
+					})
 					// Done — text-box content is carried by the shape
 					// itself, no separate inline italic dump needed.
 					di.TxbxText = ""
@@ -3282,7 +3966,7 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 							scaled.HeightPt = 200
 						}
 						sh = &scaled
-					} else if synth := synthesizeSmartArtLayout(txt, di.WPt, di.HPt); synth != nil {
+					} else if synth := synthesizeSmartArtLayoutKind(txt, doc.DiagramLayouts[di.DiagramRID], di.WPt, di.HPt); synth != nil {
 						sh = synth
 					} else {
 						sh = &VMLShape{
@@ -3359,6 +4043,33 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 						continue
 					}
 				}
+				// OLE-type-specific fallback labels: when no preview image
+				// or shape is available, pick a label that reflects the
+				// embed kind so the result isn't a generic "[Embedded object]"
+				// (which is uninformative when, say, an old MathType
+				// equation surfaces as a blank in the PDF).
+				oleLabel := func(progID string) string {
+					switch {
+					case strings.HasPrefix(progID, "Equation.DSMT"):
+						return "[MathType equation — original markup not preserved]"
+					case progID == "Equation.3":
+						return "[Legacy equation — original markup not preserved]"
+					case strings.HasPrefix(progID, "Excel."):
+						return "[Embedded spreadsheet]"
+					case strings.HasPrefix(progID, "PowerPoint."):
+						return "[Embedded presentation]"
+					case strings.HasPrefix(progID, "Visio."):
+						return "[Embedded Visio diagram]"
+					case strings.HasPrefix(progID, "Word."):
+						return "[Embedded Word document]"
+					case strings.HasPrefix(progID, "Package"):
+						return "[Embedded file]"
+					case progID == "":
+						return "[Embedded object]"
+					default:
+						return "[Embedded " + progID + " object]"
+					}
+				}
 				switch {
 				case vi.RID != "":
 					atoms = append(atoms, Run{
@@ -3370,7 +4081,7 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 				case vi.Shape != nil:
 					atoms = append(atoms, Run{VMLShape: vi.Shape, Props: rp})
 				default:
-					atoms = append(atoms, Run{Text: "[Embedded object]", Props: rp})
+					atoms = append(atoms, Run{Text: oleLabel(vi.OLEProgID), Props: rp})
 				}
 			case "ruby":
 				ruby, base, err := decodeRuby(dec, t)
@@ -3384,6 +4095,11 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 				// w14:ink — we can't rasterize the stroke data, emit a
 				// placeholder so the marker isn't lost.
 				atoms = append(atoms, Run{Text: "[Ink]", InkPlaceholder: true, Props: rp})
+				_ = dec.Skip()
+			case "lastRenderedPageBreak":
+				// Word's cached pagination hint — purely informational
+				// (the renderer paginates itself). Drop silently so the
+				// element doesn't fall through default-skip with noise.
 				_ = dec.Skip()
 			default:
 				_ = dec.Skip()
@@ -3546,6 +4262,17 @@ type drawingInfo struct {
 	ShapeFill          string
 	ShapeStroke        string
 	ShapeStrokeWeightPt float64
+	// ShapeHeadEnd / ShapeTailEnd carry the <a:headEnd type="..."/> and
+	// <a:tailEnd type="..."/> values when the line declares arrows.
+	ShapeHeadEnd string
+	ShapeTailEnd string
+	// ShapeDashStyle / ShapeCapStyle / ShapeCompoundLn mirror the rest of
+	// <a:ln>: dash preset, cap (flat/rnd/sq), and compound line (sng/dbl
+	// /thickThin/thinThick/tri). When empty the renderer treats the line
+	// as solid / flat / single.
+	ShapeDashStyle  string
+	ShapeCapStyle   string
+	ShapeCompoundLn string
 	// ShapeGradientKind / ShapeGradientAngle / ShapeGradientStops capture
 	// <a:gradFill> when the shape uses a gradient instead of solid fill.
 	ShapeGradientKind  string
@@ -3577,6 +4304,64 @@ type drawingInfo struct {
 	// ImageEffects lists per-pixel filters captured from <a:blip>'s effect
 	// children (alphaModFix / lum / biLevel / duotone / grayscl / blur).
 	ImageEffects []ImageEffect
+	// RotationDeg / FlipH / FlipV mirror the a:xfrm attributes — degrees
+	// clockwise + axis-flip flags applied to the drawing as a whole.
+	RotationDeg float64
+	FlipH       bool
+	FlipV       bool
+	// TextAnchor / TextInset* / TextVertical / TextAutoFit mirror
+	// <a:bodyPr> attributes. Captured per-drawing so VMLShape carries
+	// them onto the rendered shape.
+	TextAnchor        string
+	TextLeftInsetPt   float64
+	TextTopInsetPt    float64
+	TextRightInsetPt  float64
+	TextBottomInsetPt float64
+	TextVertical      string
+	TextAutoFit       string
+	// WrapPolygon carries the wp:wrapPolygon vertices when wrapTight /
+	// wrapThrough specifies a custom contour. Empty when wrap is
+	// rectangular.
+	WrapPolygon []WrapPathPoint
+	// IsGroup reports that the drawing's a:graphicData wrapped a
+	// wpg:wgp / a:grpSp / wpc:wpc container — a grouped collection of
+	// child shapes. The renderer treats group drawings as a single
+	// labeled placeholder when no single child shape's geometry was
+	// captured.
+	IsGroup bool
+	// GroupChildShapeCount is the number of immediate wsp/sp/pic/cxnSp
+	// children discovered inside a wgp/grpSp container. The renderer
+	// uses it to label the placeholder box ("[Group: N shapes]").
+	GroupChildShapeCount int
+	// SimplePosUsed reflects the wp:anchor@simplePos attribute. When true,
+	// SimplePosXPt / SimplePosYPt are absolute page-relative coordinates
+	// pulled from <wp:simplePos> instead of positionH/positionV.
+	SimplePosUsed              bool
+	SimplePosXPt, SimplePosYPt float64
+	// AllowOverlap mirrors wp:anchor@allowOverlap. When false, the
+	// drawing must not overlap other floating drawings on the same
+	// page. (Renderer currently treats this as a layering hint only.)
+	AllowOverlap bool
+	// BehindDoc mirrors wp:anchor@behindDoc — when true the drawing is
+	// painted *behind* the text layer. Watermarks set this.
+	BehindDoc bool
+	// LayoutInCell is wp:anchor@layoutInCell — when true a drawing
+	// anchored inside a table cell respects the cell boundaries.
+	LayoutInCell bool
+	// LockedAnchor is wp:anchor@locked — anchor cannot be moved by the
+	// user. Pure metadata for renderers.
+	LockedAnchor bool
+	// RelativeHeight is wp:anchor@relativeHeight — the Z-ordering key
+	// among overlapping anchors; larger wins.
+	RelativeHeight int
+	// WrapDistT / B / L / R store the inter-text distance attributes
+	// wp:anchor@distT/distB/distL/distR — extra space (in EMU, kept as
+	// pt) text keeps around the drawing when wrap is square / tight.
+	WrapDistTPt, WrapDistBPt, WrapDistLPt, WrapDistRPt float64
+	// WrapSide stores wp:wrapSquare/@wrapText — "bothSides", "leftOnly",
+	// "rightOnly", or "largest" — controlling which side(s) of the
+	// drawing text flows around.
+	WrapSide string
 }
 
 // DrawingPos mirrors wp:positionH / wp:positionV — either an absolute
@@ -3597,6 +4382,47 @@ func (d DrawingPos) OffsetPt() float64 {
 // 1 inch = 914400 EMU, 1 pt = 1/72 inch, so 1 pt = 914400/72 = 12700 EMU.
 // (The often-seen value 9525 is EMU-per-pixel-at-96dpi, not per-point.)
 const emuPerPt = 12700.0
+
+// parseWrapPolygon reads a <wp:wrapPolygon> subtree, collecting <wp:start>
+// and <wp:lineTo> vertices into a polygon. Coordinates are kept as integers
+// in the path's own coordinate space (per spec, 1/21600 of the shape's
+// bounding box). Returns the closed polygon — duplicate trailing vertex
+// matching the start is dropped so callers can wrap-iterate cleanly.
+func parseWrapPolygon(dec *xml.Decoder, start xml.StartElement) ([]WrapPathPoint, error) {
+	depth := 1
+	var pts []WrapPathPoint
+	for depth > 0 {
+		tok, err := dec.Token()
+		if err != nil {
+			return pts, err
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			depth++
+			switch t.Name.Local {
+			case "start", "lineTo":
+				var x, y int
+				if v := attr(t, "x"); v != "" {
+					if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+						x = n
+					}
+				}
+				if v := attr(t, "y"); v != "" {
+					if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+						y = n
+					}
+				}
+				pts = append(pts, WrapPathPoint{X: x, Y: y})
+			}
+		case xml.EndElement:
+			depth--
+		}
+	}
+	if len(pts) >= 2 && pts[0] == pts[len(pts)-1] {
+		pts = pts[:len(pts)-1]
+	}
+	return pts, nil
+}
 
 // findDrawingInfo walks a w:drawing subtree and pulls out the drawing info.
 // srcRect: each side is in 1/1000ths of a percent (so 10000 = 10%).
@@ -3620,6 +4446,73 @@ func findDrawingInfo(dec *xml.Decoder, start xml.StartElement, doc *Document) (i
 			switch t.Name.Local {
 			case "anchor":
 				info.IsAnchor = true
+				if v := attr(t, "simplePos"); v == "1" || v == "true" {
+					info.SimplePosUsed = true
+				}
+				if v := attr(t, "allowOverlap"); v == "1" || v == "true" {
+					info.AllowOverlap = true
+				}
+				if v := attr(t, "behindDoc"); v == "1" || v == "true" {
+					info.BehindDoc = true
+				}
+				if v := attr(t, "layoutInCell"); v == "1" || v == "true" {
+					info.LayoutInCell = true
+				}
+				if v := attr(t, "locked"); v == "1" || v == "true" {
+					info.LockedAnchor = true
+				}
+				if v := attr(t, "relativeHeight"); v != "" {
+					if x, err := strconv.Atoi(v); err == nil {
+						info.RelativeHeight = x
+					}
+				}
+				toPt := func(name string) float64 {
+					v := attr(t, name)
+					if v == "" {
+						return 0
+					}
+					x, err := strconv.ParseInt(v, 10, 64)
+					if err != nil {
+						return 0
+					}
+					return float64(x) / emuPerPt
+				}
+				info.WrapDistTPt = toPt("distT")
+				info.WrapDistBPt = toPt("distB")
+				info.WrapDistLPt = toPt("distL")
+				info.WrapDistRPt = toPt("distR")
+			case "simplePos":
+				// wp:simplePos (legacy Word 2003 absolute positioning).
+				// Only honored when the enclosing wp:anchor declared
+				// simplePos="1"; otherwise it's a hint Word ignores.
+				if v := attr(t, "x"); v != "" {
+					if x, err := strconv.ParseInt(v, 10, 64); err == nil {
+						info.SimplePosXPt = float64(x) / emuPerPt
+					}
+				}
+				if v := attr(t, "y"); v != "" {
+					if y, err := strconv.ParseInt(v, 10, 64); err == nil {
+						info.SimplePosYPt = float64(y) / emuPerPt
+					}
+				}
+			case "wrapPolygon":
+				poly, err := parseWrapPolygon(dec, t)
+				if err != nil {
+					return info, err
+				}
+				info.WrapPolygon = poly
+				depth--
+			case "wgp", "grpSp", "wpc":
+				// wpg:wgp / a:grpSp / wpc:wpc — grouped shapes container.
+				// We still walk into it so any single nested geometry can
+				// surface, but flag the drawing so the renderer can label
+				// the placeholder rather than silently rendering only the
+				// last child whose prstGeom/blip we happened to capture.
+				info.IsGroup = true
+			case "wsp", "sp", "cxnSp", "pic":
+				if info.IsGroup {
+					info.GroupChildShapeCount++
+				}
 			case "positionH":
 				posTarget = "H"
 				info.PosH.RelativeFrom = attr(t, "relativeFrom")
@@ -3650,10 +4543,19 @@ func findDrawingInfo(dec *xml.Decoder, start xml.StartElement, doc *Document) (i
 				info.WrapType = "none"
 			case "wrapSquare":
 				info.WrapType = "square"
+				if v := attr(t, "wrapText"); v != "" {
+					info.WrapSide = v
+				}
 			case "wrapTight":
 				info.WrapType = "tight"
+				if v := attr(t, "wrapText"); v != "" {
+					info.WrapSide = v
+				}
 			case "wrapThrough":
 				info.WrapType = "through"
+				if v := attr(t, "wrapText"); v != "" {
+					info.WrapSide = v
+				}
 			case "wrapTopAndBottom":
 				info.WrapType = "topAndBottom"
 			case "docPr":
@@ -3662,6 +4564,20 @@ func findDrawingInfo(dec *xml.Decoder, start xml.StartElement, doc *Document) (i
 					info.AltText = v
 				} else if v := attr(t, "title"); v != "" {
 					info.AltText = v
+				}
+			case "xfrm":
+				// a:xfrm carries rotation + flip flags for the entire
+				// drawing. rot is in 60000ths of a degree per DrawingML.
+				if v := attr(t, "rot"); v != "" {
+					if x, err := strconv.ParseInt(v, 10, 64); err == nil && x != 0 {
+						info.RotationDeg = float64(x) / 60000.0
+					}
+				}
+				if v := attr(t, "flipH"); v == "1" || v == "true" {
+					info.FlipH = true
+				}
+				if v := attr(t, "flipV"); v == "1" || v == "true" {
+					info.FlipV = true
 				}
 			case "prstGeom":
 				if v := attr(t, "prst"); v != "" {
@@ -3738,31 +4654,83 @@ func findDrawingInfo(dec *xml.Decoder, start xml.StartElement, doc *Document) (i
 				if effs.InnerShadow != nil && info.ShapeInnerShadow == nil {
 					info.ShapeInnerShadow = effs.InnerShadow
 				}
+			case "fillRef":
+				// DrawingML style-matrix reference. We don't resolve the
+				// full a:fillStyleLst entry (which can be a gradient or
+				// blip fill), but the embedded schemeClr/srgbClr child
+				// gives us the placeholder color (Word's `phClr` slot)
+				// that would have been substituted. Use it as the
+				// shape's fill when nothing more specific was supplied.
+				if c := scanSolidFillColorTheme(dec, t, themeFor(doc)); c != "" && info.ShapeFill == "" {
+					info.ShapeFill = c
+				}
+				depth--
+			case "lnRef":
+				if c := scanSolidFillColorTheme(dec, t, themeFor(doc)); c != "" && info.ShapeStroke == "" {
+					info.ShapeStroke = c
+				}
+				depth--
+			case "effectRef":
+				// Style-matrix effect reference — typically points to a
+				// drop-shadow entry. We pull the embedded color so any
+				// downstream effect can pick it up; without resolving the
+				// effect list itself, we don't synthesize a shadow.
+				_ = scanSolidFillColorTheme(dec, t, themeFor(doc))
+				depth--
 			case "ln":
 				// DrawingML <a:ln w="…"> line weight (in EMU). Scrape
-				// stroke color from nested solidFill (theme-aware).
+				// stroke color from nested solidFill (theme-aware), plus
+				// headEnd / tailEnd arrow decorations.
 				if v := attr(t, "w"); v != "" {
 					if x, err := strconv.ParseInt(v, 10, 64); err == nil {
 						info.ShapeStrokeWeightPt = float64(x) / emuPerPt
 					}
 				}
-				if c := scanSolidFillColorTheme(dec, t, themeFor(doc)); c != "" {
-					info.ShapeStroke = c
+				props := parseLinePropsExt(dec, t, themeFor(doc))
+				if props.Color != "" {
+					info.ShapeStroke = props.Color
+				}
+				if props.HeadEnd != "" {
+					info.ShapeHeadEnd = props.HeadEnd
+				}
+				if props.TailEnd != "" {
+					info.ShapeTailEnd = props.TailEnd
+				}
+				if props.DashStyle != "" {
+					info.ShapeDashStyle = props.DashStyle
+				}
+				if props.CapStyle != "" {
+					info.ShapeCapStyle = props.CapStyle
+				}
+				if props.CompoundLn != "" {
+					info.ShapeCompoundLn = props.CompoundLn
 				}
 				depth--
 			case "blip":
+				rasterRID := ""
 				for _, a := range t.Attr {
 					if a.Name.Local == "embed" {
-						info.RID = a.Value
+						rasterRID = a.Value
 					}
 				}
 				// Drain a:blip's effect children (alphaModFix / lum / biLevel /
-				// duotone / clrChange / grayscl / blur). Word writes them as
-				// peer elements inside <a:blip>; we collect them so the
-				// renderer can post-process the raster.
-				effs := parseBlipEffects(dec, t, themeFor(doc))
+				// duotone / clrChange / grayscl / blur) AND scan a:extLst for
+				// the asvg:svgBlip extension. Word writes both a raster
+				// preview rId and an SVG rId; we prefer the SVG when one is
+				// present so vector graphics render sharply, falling back to
+				// the raster rId if SVG parsing failed at load time.
+				effs, svgRID := parseBlipEffects(dec, t, themeFor(doc))
 				if len(effs) > 0 {
 					info.ImageEffects = append(info.ImageEffects, effs...)
+				}
+				if svgRID != "" {
+					if _, ok := doc.Images[svgRID]; ok {
+						info.RID = svgRID
+					} else {
+						info.RID = rasterRID
+					}
+				} else {
+					info.RID = rasterRID
 				}
 				depth--
 			case "extent":
@@ -3829,6 +4797,55 @@ func findDrawingInfo(dec *xml.Decoder, start xml.StartElement, doc *Document) (i
 				// undo the +1 we did at the top of this StartElement
 				// branch — otherwise depth never returns to 0.
 				depth--
+			case "bodyPr":
+				// <a:bodyPr> — text-frame attributes for the shape's
+				// txbxContent. Captures anchor + insets + vertical text +
+				// autoFit hints; the renderer applies them at draw time
+				// in vmlshape.go's textbox-content path.
+				for _, a := range t.Attr {
+					switch a.Name.Local {
+					case "anchor":
+						info.TextAnchor = a.Value
+					case "lIns":
+						if x, e := strconv.ParseFloat(a.Value, 64); e == nil {
+							info.TextLeftInsetPt = x / emuPerPt
+						}
+					case "tIns":
+						if x, e := strconv.ParseFloat(a.Value, 64); e == nil {
+							info.TextTopInsetPt = x / emuPerPt
+						}
+					case "rIns":
+						if x, e := strconv.ParseFloat(a.Value, 64); e == nil {
+							info.TextRightInsetPt = x / emuPerPt
+						}
+					case "bIns":
+						if x, e := strconv.ParseFloat(a.Value, 64); e == nil {
+							info.TextBottomInsetPt = x / emuPerPt
+						}
+					case "vert":
+						info.TextVertical = a.Value
+					}
+				}
+				// Walk children for normAutofit / spAutoFit / noAutofit —
+				// they're empty elements but exist as children of bodyPr.
+				bpDepth := 1
+				for bpDepth > 0 {
+					innerTok, err := dec.Token()
+					if err != nil {
+						break
+					}
+					switch it := innerTok.(type) {
+					case xml.StartElement:
+						bpDepth++
+						switch it.Name.Local {
+						case "normAutofit", "spAutoFit":
+							info.TextAutoFit = it.Name.Local
+						}
+					case xml.EndElement:
+						bpDepth--
+					}
+				}
+				depth-- // we consumed the EndElement ourselves
 			}
 		case xml.EndElement:
 			depth--
@@ -3945,6 +4962,16 @@ func shapeKindForPrst(prst string) string {
 		return "oval"
 	case "line", "straightConnector1":
 		return "line"
+	case "bentConnector2", "bentConnector3", "bentConnector4", "bentConnector5":
+		// Elbow connectors degrade to a straight line — we'd need the
+		// per-connector geometry handles to plot the actual bend, which
+		// require the avLst's adjustments table. A straight line keeps
+		// the "X is linked to Y" intent visible at the correct endpoints.
+		return "line"
+	case "curvedConnector2", "curvedConnector3", "curvedConnector4", "curvedConnector5":
+		// Curved connectors approximate with a straight line for the
+		// same reason as the bent variants.
+		return "line"
 	case "triangle":
 		return "triangle"
 	case "rtTriangle":
@@ -4057,6 +5084,87 @@ func scanSolidFillColor(dec *xml.Decoder, start xml.StartElement) string {
 // (lumMod/lumOff/satMod/satOff/tint/shade) that sits under the color leaf.
 func scanSolidFillColorTheme(dec *xml.Decoder, start xml.StartElement, theme Theme) string {
 	return ScanColor(dec, start, theme)
+}
+
+// parseLineProps walks an <a:ln> subtree, capturing the stroke color from
+// a nested <a:solidFill> plus the head/tail arrow types from <a:headEnd>
+// and <a:tailEnd>. Coordinates inside the line are not consumed — only the
+// attribute values we honor. On return the decoder has consumed up through
+// </a:ln>.
+func parseLineProps(dec *xml.Decoder, start xml.StartElement, theme Theme) (color, headEnd, tailEnd string) {
+	props := parseLinePropsExt(dec, start, theme)
+	return props.Color, props.HeadEnd, props.TailEnd
+}
+
+// LineProps mirrors a DrawingML <a:ln> block: stroke color, the head/tail
+// arrow types, dash style, line cap and compound. Used by shape renderers
+// to translate OOXML stroke semantics to PDF graphics state.
+type LineProps struct {
+	Color       string
+	HeadEnd     string // none/triangle/stealth/diamond/oval/arrow
+	TailEnd     string
+	DashStyle   string // prstDash w:val: solid/dash/dashDot/lgDash/lgDashDot/lgDashDotDot/sysDash/sysDashDot/sysDashDotDot/sysDot/dot
+	CapStyle    string // a:ln@cap: flat/rnd/sq
+	CompoundLn  string // a:ln@cmpd: sng/dbl/thickThin/thinThick/tri
+}
+
+// parseLinePropsExt is the modern entry point; parseLineProps is kept as
+// a thin shim because many call sites only want color + arrow ends.
+func parseLinePropsExt(dec *xml.Decoder, start xml.StartElement, theme Theme) LineProps {
+	out := LineProps{}
+	for _, a := range start.Attr {
+		switch a.Name.Local {
+		case "cap":
+			out.CapStyle = a.Value
+		case "cmpd":
+			out.CompoundLn = a.Value
+		}
+	}
+	depth := 1
+	for depth > 0 {
+		tok, err := dec.Token()
+		if err != nil {
+			return out
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			switch t.Name.Local {
+			case "solidFill":
+				if c := scanSolidFillColorTheme(dec, t, theme); c != "" && out.Color == "" {
+					out.Color = c
+				}
+				depth--
+			case "headEnd":
+				if v := attr(t, "type"); v != "" {
+					out.HeadEnd = v
+				}
+				_ = dec.Skip()
+			case "tailEnd":
+				if v := attr(t, "type"); v != "" {
+					out.TailEnd = v
+				}
+				_ = dec.Skip()
+			case "prstDash":
+				if v := attr(t, "val"); v != "" {
+					out.DashStyle = v
+				}
+				_ = dec.Skip()
+			case "custDash":
+				// A custom dash pattern. We map it to "dash" generically;
+				// renderers that want true custom stops can re-parse the
+				// nested ds elements.
+				if out.DashStyle == "" {
+					out.DashStyle = "dash"
+				}
+				_ = dec.Skip()
+			default:
+				depth++
+			}
+		case xml.EndElement:
+			depth--
+		}
+	}
+	return out
 }
 
 // flattenCustGeomPath walks an <a:custGeom>/<a:pathLst>/<a:path> subtree
@@ -4459,6 +5567,19 @@ func decodeVMLShape(dec *xml.Decoder, start xml.StartElement, doc *Document) (*V
 					sh.TextBoxBlocks = append(sh.TextBoxBlocks, blocks...)
 				}
 				continue
+			case "textpath":
+				// Legacy WordArt: <v:textpath string="..."/>. We extract the
+				// text and append it to the shape's TextBox; the surrounding
+				// curved-path rendering is lost (we'd need a path-aware glyph
+				// drawer), but the readable content survives.
+				if s := attr(t, "string"); s != "" {
+					if sh.TextBox != "" {
+						sh.TextBox += " "
+					}
+					sh.TextBox += s
+				}
+				_ = dec.Skip()
+				continue
 			}
 			depth++
 		case xml.EndElement:
@@ -4600,6 +5721,16 @@ func decodeTable(dec *xml.Decoder, start xml.StartElement, pctx *parseDocContext
 					return tbl, err
 				}
 				tbl.Rows = append(tbl.Rows, row)
+			case "sdt":
+				// w:sdtRow / w:sdtBlock wrapped around table rows. Word
+				// uses this for row-level content controls (typically
+				// w15:repeatingSection inside a sdtPr). We unwrap the
+				// sdtContent and pick up the contained tr elements.
+				rows, err := decodeSdtRowsInTable(dec, t, pctx)
+				if err != nil {
+					return tbl, err
+				}
+				tbl.Rows = append(tbl.Rows, rows...)
 			default:
 				_ = dec.Skip()
 			}
@@ -4623,6 +5754,46 @@ func decodeTable(dec *xml.Decoder, start xml.StartElement, pctx *parseDocContext
 			}
 		}
 	}
+}
+
+// decodeSdtRowsInTable unwraps a w:sdt that sits between rows of a table
+// (the row-level content control). We walk down through w:sdtContent to
+// pick out the w:tr children, decoding them as normal rows. w:sdtPr is
+// skipped — the styling metadata it carries isn't visualized for PDF
+// export. When the sdt is a w15:repeatingSection we still produce only
+// the literal rows it contains; the OpenDoPE path duplicates rows
+// data-bound elsewhere.
+func decodeSdtRowsInTable(dec *xml.Decoder, start xml.StartElement, pctx *parseDocContext) ([]TableRow, error) {
+	var rows []TableRow
+	depth := 1
+	for depth > 0 {
+		tok, err := dec.Token()
+		if err != nil {
+			return rows, err
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			switch t.Name.Local {
+			case "tr":
+				row, err := decodeRow(dec, t, pctx)
+				if err != nil {
+					return rows, err
+				}
+				rows = append(rows, row)
+			case "sdtContent", "sdt":
+				// Recurse: nested sdt wrappers (e.g. repeatingSection holding
+				// rows that themselves contain sdt-wrapped cells) need to be
+				// unwrapped before reaching the tr nodes.
+				depth++
+				_ = t // consumed by re-entering the loop
+			default:
+				_ = dec.Skip()
+			}
+		case xml.EndElement:
+			depth--
+		}
+	}
+	return rows, nil
 }
 
 // mergeTableBorders overlays `overlay` on top of `base`: for each edge,
@@ -4659,12 +5830,31 @@ func mergeTableBorders(base, overlay TableBorders) TableBorders {
 // CellBorders says.
 func propagateTableBorders(tbl *Table) {
 	if !tbl.Borders.Has() {
-		return
+		// We may still need to apply per-row tblPrEx borders below.
+		anyEx := false
+		for ri := range tbl.Rows {
+			if tbl.Rows[ri].TblPrEx != nil && tbl.Rows[ri].TblPrEx.HasBorders {
+				anyEx = true
+				break
+			}
+		}
+		if !anyEx {
+			return
+		}
 	}
 	nRows := len(tbl.Rows)
 	totalCols := len(tbl.ColumnWidthsTwips)
 	for ri := range tbl.Rows {
 		row := &tbl.Rows[ri]
+		// Per ECMA-376 §17.4.39 precedence:
+		//   cell tcBorders > row tblPrEx > tblBorders.
+		// trPr itself has no border block, so it slots between tblPrEx
+		// and tblPr only via tblPrEx's own borders (which the row
+		// declares).
+		effective := tbl.Borders
+		if row.TblPrEx != nil && row.TblPrEx.HasBorders {
+			effective = mergeTableBorders(tbl.Borders, row.TblPrEx.Borders)
+		}
 		colIdx := 0
 		for ci := range row.Cells {
 			cell := &row.Cells[ci]
@@ -4678,30 +5868,30 @@ func propagateTableBorders(tbl *Table) {
 			lastCol := totalCols > 0 && colIdx+span >= totalCols
 			if !cell.Borders.Top.Has() {
 				if firstRow {
-					cell.Borders.Top = tbl.Borders.Top
+					cell.Borders.Top = effective.Top
 				} else {
-					cell.Borders.Top = tbl.Borders.InsideH
+					cell.Borders.Top = effective.InsideH
 				}
 			}
 			if !cell.Borders.Bottom.Has() {
 				if lastRow {
-					cell.Borders.Bottom = tbl.Borders.Bottom
+					cell.Borders.Bottom = effective.Bottom
 				} else {
-					cell.Borders.Bottom = tbl.Borders.InsideH
+					cell.Borders.Bottom = effective.InsideH
 				}
 			}
 			if !cell.Borders.Left.Has() {
 				if firstCol {
-					cell.Borders.Left = tbl.Borders.Left
+					cell.Borders.Left = effective.Left
 				} else {
-					cell.Borders.Left = tbl.Borders.InsideV
+					cell.Borders.Left = effective.InsideV
 				}
 			}
 			if !cell.Borders.Right.Has() {
 				if lastCol {
-					cell.Borders.Right = tbl.Borders.Right
+					cell.Borders.Right = effective.Right
 				} else {
-					cell.Borders.Right = tbl.Borders.InsideV
+					cell.Borders.Right = effective.InsideV
 				}
 			}
 			colIdx += span
@@ -4804,8 +5994,35 @@ func decodeTblPr(dec *xml.Decoder, start xml.StartElement, tbl *Table) error {
 				if flagSet(attr(t, "noVBand")) {
 					tbl.Look.NoVBand = true
 				}
+			case "jc":
+				tbl.Alignment = attr(t, "val")
+			case "bidiVisual":
+				v := attr(t, "val")
+				if v == "" || v == "1" || v == "true" || v == "on" {
+					tbl.BidiVisual = true
+				}
+			case "shd":
+				if v := attr(t, "fill"); v != "" && v != "auto" {
+					tbl.Shading = v
+				}
+			case "tblStyleRowBandSize":
+				if v := attr(t, "val"); v != "" {
+					if x, err := strconv.Atoi(v); err == nil && x > 0 {
+						tbl.RowBandSize = x
+					}
+				}
+			case "tblStyleColBandSize":
+				if v := attr(t, "val"); v != "" {
+					if x, err := strconv.Atoi(v); err == nil && x > 0 {
+						tbl.ColBandSize = x
+					}
+				}
 			case "tblPrChange":
 				tbl.PrChange = readPrChangeAttrs(t, "tblPr")
+			case "tblPrExChange":
+				if tbl.PrChange == nil {
+					tbl.PrChange = readPrChangeAttrs(t, "tblPrEx")
+				}
 			}
 			_ = dec.Skip()
 		case xml.EndElement:
@@ -4905,12 +6122,95 @@ func decodeRow(dec *xml.Decoder, start xml.StartElement, pctx *parseDocContext) 
 				if err := decodeTrPr(dec, t, &row); err != nil {
 					return row, err
 				}
+			case "tblPrEx":
+				ex, err := decodeTblPrEx(dec, t)
+				if err != nil {
+					return row, err
+				}
+				row.TblPrEx = ex
 			default:
 				_ = dec.Skip()
 			}
 		case xml.EndElement:
 			if t.Name.Local == start.Name.Local {
 				return row, nil
+			}
+		}
+	}
+}
+
+// decodeTblPrEx reads w:tblPrEx — per-row table-property exceptions.
+// Word writes these when a row carries property overrides that don't apply
+// to the rest of the table (typically after copy/paste from a foreign
+// table). Border conflict resolution uses these in precedence:
+//
+//	tcBorders > trPr > tblPrEx > tblPr  (per ECMA-376 §17.4.39).
+func decodeTblPrEx(dec *xml.Decoder, start xml.StartElement) (*TblPrEx, error) {
+	ex := &TblPrEx{}
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return ex, err
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			flagSet := func(a string) bool { return a == "1" || a == "true" }
+			switch t.Name.Local {
+			case "tblBorders":
+				if err := decodeTableBorders(dec, t, &ex.Borders); err != nil {
+					return ex, err
+				}
+				ex.HasBorders = true
+				continue
+			case "tblCellMar":
+				if err := decodeTblCellMar(dec, t, &ex.CellMargins); err != nil {
+					return ex, err
+				}
+				ex.HasCellMargins = true
+				continue
+			case "tblCellSpacing":
+				if v := attr(t, "w"); v != "" {
+					if x, err := strconv.Atoi(v); err == nil {
+						ex.CellSpacingTwips = x
+					}
+				}
+			case "tblInd":
+				if v := attr(t, "w"); v != "" {
+					if x, err := strconv.Atoi(v); err == nil {
+						ex.IndentTwips = x
+					}
+				}
+			case "tblLayout":
+				ex.Layout = attr(t, "type")
+			case "shd":
+				if v := attr(t, "fill"); v != "" && v != "auto" {
+					ex.Shading = v
+				}
+			case "tblLook":
+				if flagSet(attr(t, "firstRow")) {
+					ex.Look.FirstRow = true
+				}
+				if flagSet(attr(t, "lastRow")) {
+					ex.Look.LastRow = true
+				}
+				if flagSet(attr(t, "firstColumn")) {
+					ex.Look.FirstColumn = true
+				}
+				if flagSet(attr(t, "lastColumn")) {
+					ex.Look.LastColumn = true
+				}
+				if flagSet(attr(t, "noHBand")) {
+					ex.Look.NoHBand = true
+				}
+				if flagSet(attr(t, "noVBand")) {
+					ex.Look.NoVBand = true
+				}
+				ex.HasLook = true
+			}
+			_ = dec.Skip()
+		case xml.EndElement:
+			if t.Name.Local == start.Name.Local {
+				return ex, nil
 			}
 		}
 	}
@@ -4944,7 +6244,8 @@ func decodeTrPr(dec *xml.Decoder, start xml.StartElement, row *TableRow) error {
 						row.HeightTwips = x
 					}
 				}
-				if attr(t, "hRule") == "exact" {
+				row.HeightRule = attr(t, "hRule")
+				if row.HeightRule == "exact" {
 					row.HeightRuleExact = true
 				}
 			case "cantSplit":
@@ -4956,10 +6257,35 @@ func decodeTrPr(dec *xml.Decoder, start xml.StartElement, row *TableRow) error {
 				row.WBeforeTwips = parseTwips(t)
 			case "wAfter":
 				row.WAfterTwips = parseTwips(t)
+			case "gridBefore":
+				if v := attr(t, "val"); v != "" {
+					if x, err := strconv.Atoi(v); err == nil && x > 0 {
+						row.GridBefore = x
+					}
+				}
+			case "gridAfter":
+				if v := attr(t, "val"); v != "" {
+					if x, err := strconv.Atoi(v); err == nil && x > 0 {
+						row.GridAfter = x
+					}
+				}
 			case "tblCellSpacing":
 				row.CellSpacingTwips = parseTwips(t)
+			case "jc":
+				row.Alignment = attr(t, "val")
+			case "hidden":
+				v := attr(t, "val")
+				if v == "" || v == "1" || v == "true" || v == "on" {
+					row.Hidden = true
+				}
+			case "cnfStyle":
+				row.CnfStyle = parseCnfStyle(t)
 			case "trPrChange":
 				row.PrChange = readPrChangeAttrs(t, "trPr")
+			case "trPrExChange":
+				if row.PrChange == nil {
+					row.PrChange = readPrChangeAttrs(t, "trPrEx")
+				}
 			}
 			_ = dec.Skip()
 		case xml.EndElement:
@@ -5086,8 +6412,28 @@ func decodeTcPr(dec *xml.Decoder, start xml.StartElement, cell *TableCell) error
 				if err := decodeTcMar(dec, t, cell); err != nil {
 					return err
 				}
+			case "cnfStyle":
+				cell.CnfStyle = parseCnfStyle(t)
+				_ = dec.Skip()
 			case "tcPrChange":
 				cell.PrChange = readPrChangeAttrs(t, "tcPr")
+				_ = dec.Skip()
+			case "cellIns", "cellDel", "cellMerge":
+				kind := "ins"
+				switch t.Name.Local {
+				case "cellDel":
+					kind = "del"
+				case "cellMerge":
+					kind = "merge"
+				}
+				rev := &CellRevision{
+					Kind:     kind,
+					ID:       attr(t, "id"),
+					Author:   attr(t, "author"),
+					Date:     attr(t, "date"),
+					Vertical: attr(t, "vMerge"),
+				}
+				cell.CellRevision = rev
 				_ = dec.Skip()
 			default:
 				_ = dec.Skip()
@@ -5100,6 +6446,76 @@ func decodeTcPr(dec *xml.Decoder, start xml.StartElement, cell *TableCell) error
 	}
 }
 
+// parseCnfStyle reads a w:cnfStyle element. Per ECMA-376 the field is
+// either a 12-character binary string in w:val (firstRow / lastRow /
+// firstColumn / lastColumn / band1Vert / band2Vert / band1Horz / band2Horz
+// / nwCell / neCell / swCell / seCell, leftmost = firstRow) or a set of
+// individual on/off attributes. We support both since both occur in real
+// documents.
+func parseCnfStyle(t xml.StartElement) CnfStyle {
+	flagOn := func(a string) bool {
+		switch a {
+		case "1", "true", "on":
+			return true
+		}
+		return false
+	}
+	c := CnfStyle{
+		FirstRow:    flagOn(attr(t, "firstRow")),
+		LastRow:     flagOn(attr(t, "lastRow")),
+		FirstColumn: flagOn(attr(t, "firstColumn")),
+		LastColumn:  flagOn(attr(t, "lastColumn")),
+		Band1Vert:   flagOn(attr(t, "oddVBand")) || flagOn(attr(t, "band1Vert")),
+		Band2Vert:   flagOn(attr(t, "evenVBand")) || flagOn(attr(t, "band2Vert")),
+		Band1Horz:   flagOn(attr(t, "oddHBand")) || flagOn(attr(t, "band1Horz")),
+		Band2Horz:   flagOn(attr(t, "evenHBand")) || flagOn(attr(t, "band2Horz")),
+		NWCell:      flagOn(attr(t, "firstRowFirstColumn")) || flagOn(attr(t, "nwCell")),
+		NECell:      flagOn(attr(t, "firstRowLastColumn")) || flagOn(attr(t, "neCell")),
+		SWCell:      flagOn(attr(t, "lastRowFirstColumn")) || flagOn(attr(t, "swCell")),
+		SECell:      flagOn(attr(t, "lastRowLastColumn")) || flagOn(attr(t, "seCell")),
+	}
+	if v := attr(t, "val"); len(v) == 12 {
+		on := func(i int) bool { return v[i] == '1' }
+		if on(0) {
+			c.FirstRow = true
+		}
+		if on(1) {
+			c.LastRow = true
+		}
+		if on(2) {
+			c.FirstColumn = true
+		}
+		if on(3) {
+			c.LastColumn = true
+		}
+		if on(4) {
+			c.Band1Vert = true
+		}
+		if on(5) {
+			c.Band2Vert = true
+		}
+		if on(6) {
+			c.Band1Horz = true
+		}
+		if on(7) {
+			c.Band2Horz = true
+		}
+		if on(8) {
+			c.NECell = true
+		}
+		if on(9) {
+			c.NWCell = true
+		}
+		if on(10) {
+			c.SECell = true
+		}
+		if on(11) {
+			c.SWCell = true
+		}
+	}
+	return c
+}
+
 // decodePgBorders is structurally identical to decodeCellBorders, just over
 // a PageBorders target — Word reuses the border-edge XML schema. Reads
 // the parent element's w:offsetFrom attribute and each edge's w:space to
@@ -5107,6 +6523,9 @@ func decodeTcPr(dec *xml.Decoder, start xml.StartElement, cell *TableCell) error
 func decodePgBorders(dec *xml.Decoder, start xml.StartElement, b *PageBorders) error {
 	if v := attr(start, "offsetFrom"); v == "text" {
 		b.OffsetFromText = true
+	}
+	if v := attr(start, "display"); v != "" {
+		b.Display = v
 	}
 	for {
 		tok, err := dec.Token()
@@ -5525,6 +6944,70 @@ func decodeColsChildren(dec *xml.Decoder, start xml.StartElement, sec *Section) 
 	}
 }
 
+// decodeMathPr reads <m:mathPr> from settings.xml into MathProps. Each
+// child stores its value in @m:val; some are valueless flags. Captures
+// the subset that affects layout / font choice.
+func decodeMathPr(dec *xml.Decoder, start xml.StartElement, out *MathProps) error {
+	intVal := func(t xml.StartElement) int {
+		if v := attr(t, "val"); v != "" {
+			if x, err := strconv.Atoi(v); err == nil {
+				return x
+			}
+		}
+		return 0
+	}
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			switch t.Name.Local {
+			case "mathFont":
+				if v := attr(t, "val"); v != "" {
+					out.MathFont = v
+				}
+			case "brkBin":
+				out.BrkBin = attr(t, "val")
+			case "brkBinSub":
+				out.BrkBinSub = attr(t, "val")
+			case "smallFrac":
+				out.SmallFrac = attr(t, "val") != "0" && attr(t, "val") != "false"
+			case "dispDef":
+				out.DispDef = attr(t, "val") != "0" && attr(t, "val") != "false"
+			case "lMargin":
+				out.LMargin = intVal(t)
+			case "rMargin":
+				out.RMargin = intVal(t)
+			case "defJc":
+				out.DefJc = attr(t, "val")
+			case "wrapIndent":
+				out.WrapIndent = intVal(t)
+			case "wrapRight":
+				out.WrapRight = true
+			case "intLim":
+				out.IntLim = attr(t, "val")
+			case "naryLim":
+				out.NaryLim = attr(t, "val")
+			case "preSp":
+				out.PreSp = intVal(t)
+			case "postSp":
+				out.PostSp = intVal(t)
+			case "interSp":
+				out.InterSp = intVal(t)
+			case "intraSp":
+				out.IntraSp = intVal(t)
+			}
+			_ = dec.Skip()
+		case xml.EndElement:
+			if t.Name.Local == start.Name.Local {
+				return nil
+			}
+		}
+	}
+}
+
 // decodeNoteConfig parses a w:footnotePr / w:endnotePr block into NoteConfig.
 // Children we recognize: w:pos, w:numFmt, w:numStart, w:numRestart.
 func decodeNoteConfig(dec *xml.Decoder, start xml.StartElement) (*NoteConfig, error) {
@@ -5632,6 +7115,16 @@ func decodeCompat(dec *xml.Decoder, start xml.StartElement, s *Settings) error {
 				s.Compat.DoNotLeaveBackslashAlone = onOffPtr(t)
 			case "useFELayout":
 				s.Compat.UseFELayout = onOffPtr(t)
+			case "spaceForUL":
+				s.Compat.SpaceForUL = onOffPtr(t)
+			case "underlineTabInNumList":
+				s.Compat.UnderlineTabInNumList = onOffPtr(t)
+			case "doNotBreakWrappedTables":
+				s.Compat.DoNotBreakWrappedTables = onOffPtr(t)
+			case "doNotUseHTMLParagraphAutoSpacing":
+				s.Compat.DoNotUseHTMLParagraphAutoSpacing = onOffPtr(t)
+			case "adjustLineHeightInTable":
+				s.Compat.AdjustLineHeightInTable = onOffPtr(t)
 			}
 			_ = dec.Skip()
 		case xml.EndElement:

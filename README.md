@@ -358,14 +358,28 @@ docker run --rm -v "$PWD":/work \
 
 | Feature | Status |
 |---|---|
-| Math equations (`m:oMath` / `m:oMathPara`) — OMML walked structurally; fractions, radicals, n-aries, super/subscripts, matrices, accents survive; rendered with Unicode super/subscript fallback (no geometric stack layout) | ⚠️ |
+| Math equations (`m:oMath` / `m:oMathPara`) — fractions (bar / skw / lin / noBar), radicals, n-aries with limLoc + sup/subHide, super/subscripts, prescripts (`m:sPre`), delimiters with grow, matrices, accents | ✅ |
 | Text boxes (`wps:txbx`) — inline-extracted as italic; box geometry not preserved | ⚠️ |
 | Floating frames (`w:framePr`) — anchored correctly; body text does **not** wrap around | ⚠️ |
-| RTL (Hebrew / Arabic) — word order reversed, right-aligned; no UAX#9 mixed-direction | ⚠️ |
+| RTL (Hebrew / Arabic) — UAX#9 paragraph-level bidi reordering for mixed-direction text + Arabic letter shaping (Initial / Medial / Final / Isolated forms via Arabic Presentation Forms-B) | ✅ |
 | OLE / embedded objects — emit `[Embedded object]` placeholder | ⚠️ |
-| Arabic letter shaping (initial / medial / final) | ❌ |
+| EMF / WMF vector images — detected with intrinsic dimensions extracted from the file header; rendered as a labeled placeholder box at the original aspect ratio (no rasterization of vector contents) | ⚠️ |
+| SVG image fills (`a:svgBlip`) — fallback raster blip is used when present, SVG itself is skipped | ❌ |
+| SmartArt — uses Word's pre-rendered drawing part when present; otherwise synthesizes a layout based on the diagram's `layoutDef`: cycle / hierarchy / pyramid / list / matrix / radial / process | ✅ |
+| Cell text rotation (`w:textDirection` = `tbRl` / `btLr` / `lrTbV` / `tbRlV` / `tbLrV`) | ✅ |
+| 3D text effects (`w14:scene3d` / `w14:props3d`) — rendered as a layered depth-shadow approximation (no real 3D projection) | ⚠️ |
 | Form controls' interactive behavior | ❌ |
 | Embedded fonts (`w:embedRegular` / Bold / Italic / BoldItalic) — deobfuscated and registered with PDF | ✅ |
+| Tracked changes (ins / del / moveTo / moveFrom + rPr/pPr/tbl/tc/tr property changes) — visible markup + margin change bars when `ShowRevisions` is on | ✅ |
+| Section break types — `nextPage` / `continuous` / `evenPage` / `oddPage` / `nextColumn` all honored | ✅ |
+| Section vertical alignment — `top` / `center` / `bottom` / `both` (vertical justify) | ✅ |
+| Table conditional formatting — `tblLook` + explicit `w:cnfStyle` per row/cell, row/col band sizes, table `jc`, `bidiVisual`, table-level shading | ✅ |
+| Table row controls — `w:hidden`, `w:gridBefore` / `w:gridAfter`, `w:hideMark` (collapse paragraph-mark floor), `w:noWrap` (drives autofit min width) | ✅ |
+| Charts — column / bar / pie / doughnut / line / area / radar / bubble / scatter (with markers) / stock (candlesticks) / surface (stacked bands) / pie-of-pie | ✅ |
+| Word-level fields — PAGE / NUMPAGES / DATE / TIME / TOC / INDEX / STYLEREF / REF / PAGEREF / NOTEREF / HYPERLINK / SYMBOL / QUOTE / IF / COMPARE / SEQ / MERGEFIELD / MERGEREC / MERGESEQ / NEXT / NEXTIF / SKIPIF / SET / DOCVARIABLE / formula (`=`) | ✅ |
+| Underline styles — single / double / dotted / dottedHeavy / dash / dashed / wave / wavy / thick (plus dashDot variants) | ✅ |
+| `w:dstrike` (double strikethrough) | ✅ |
+| CJK emphasis marks (`w:em` = dot / circle / comma / underDot) | ✅ |
 
 If your document hinges on the "❌" rows and you need pixel-perfect
 rendering, **fall back to a LibreOffice-backed service**. The "⚠️" rows

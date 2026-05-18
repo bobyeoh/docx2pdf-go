@@ -6,6 +6,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"io"
+	"strconv"
 	"strings"
 )
 
@@ -43,7 +44,13 @@ func parseFontTable(f *zip.File, fontRels map[string]relEntry, files map[string]
 		if err := decodeFontEntry(dec, se, &ef, fontRels, files); err != nil {
 			return err
 		}
-		if ef.Regular == nil && ef.Bold == nil && ef.Italic == nil && ef.BoldItalic == nil {
+		// Persist even non-embedded entries when they carry useful
+		// metadata (panose / sig / family / pitch / charset) — Word's
+		// font-substitution algorithm reads those bits even when the
+		// font itself isn't shipped inside the .docx.
+		hasBytes := ef.Regular != nil || ef.Bold != nil || ef.Italic != nil || ef.BoldItalic != nil
+		hasMeta := ef.Panose1 != "" || ef.Charset != "" || ef.Family != "" || ef.Pitch != ""
+		if !hasBytes && !hasMeta {
 			continue
 		}
 		if doc.EmbeddedFonts == nil {
@@ -67,6 +74,29 @@ func decodeFontEntry(dec *xml.Decoder, start xml.StartElement, ef *EmbeddedFont,
 			switch t.Name.Local {
 			case "altName":
 				ef.AltName = attr(t, "val")
+				_ = dec.Skip()
+			case "panose1":
+				ef.Panose1 = attr(t, "val")
+				_ = dec.Skip()
+			case "charset":
+				ef.Charset = attr(t, "val")
+				_ = dec.Skip()
+			case "family":
+				ef.Family = attr(t, "val")
+				_ = dec.Skip()
+			case "pitch":
+				ef.Pitch = attr(t, "val")
+				_ = dec.Skip()
+			case "notTrueType":
+				ef.NotTrueType = attr(t, "val") == "1" || attr(t, "val") == "true"
+				_ = dec.Skip()
+			case "sig":
+				ef.Sig.USB0 = parseHex32(attr(t, "usb0"))
+				ef.Sig.USB1 = parseHex32(attr(t, "usb1"))
+				ef.Sig.USB2 = parseHex32(attr(t, "usb2"))
+				ef.Sig.USB3 = parseHex32(attr(t, "usb3"))
+				ef.Sig.CSB0 = parseHex32(attr(t, "csb0"))
+				ef.Sig.CSB1 = parseHex32(attr(t, "csb1"))
 				_ = dec.Skip()
 			case "embedRegular":
 				ef.Regular = loadEmbeddedFontPart(t, fontRels, files)
@@ -120,6 +150,23 @@ func loadEmbeddedFontPart(se xml.StartElement, fontRels map[string]relEntry, fil
 		return nil
 	}
 	return out
+}
+
+// parseHex32 reads a hex string with optional "0x" prefix. Empty input or
+// malformed digits return 0. Used to decode w:sig usbN/csbN attributes,
+// which Word writes as zero-padded 8-hex strings.
+func parseHex32(s string) uint32 {
+	s = strings.TrimSpace(s)
+	s = strings.TrimPrefix(s, "0x")
+	s = strings.TrimPrefix(s, "0X")
+	if s == "" {
+		return 0
+	}
+	v, err := strconv.ParseUint(s, 16, 32)
+	if err != nil {
+		return 0
+	}
+	return uint32(v)
 }
 
 // deobfuscateFont reverses ECMA-376 §17.8.1 obfuscation.

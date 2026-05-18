@@ -119,13 +119,17 @@ func (r *renderer) drawParagraph(p docx.Paragraph) error {
 	// when the paragraph chose a smaller indent.
 	var listMarkerText string
 	var listMarkerImg image.Image
+	var listMarkerFont string
+	var listMarkerJc string
 	var lvlHangPt float64
 	listIndent := 0.0
 	if p.List != nil {
-		markerText, markerImg, indentPt, hangPt := r.resolveListMarker(*p.List)
+		markerText, markerImg, indentPt, hangPt, font, jc := r.resolveListMarker(*p.List)
 		listIndent = indentPt
 		listMarkerText = markerText
 		listMarkerImg = markerImg
+		listMarkerFont = font
+		listMarkerJc = jc
 		lvlHangPt = hangPt
 	}
 
@@ -157,7 +161,14 @@ func (r *renderer) drawParagraph(p docx.Paragraph) error {
 		if markerX < r.marL {
 			markerX = r.marL
 		}
-		r.pendingMarker = &pendingMarker{text: listMarkerText, image: listMarkerImg, x: markerX}
+		r.pendingMarker = &pendingMarker{
+			text:       listMarkerText,
+			image:      listMarkerImg,
+			x:          markerX,
+			fontFamily: listMarkerFont,
+			jc:         listMarkerJc,
+			colWidth:   lvlHangPt,
+		}
 	}
 
 	savedColIdx := r.colIdx
@@ -214,6 +225,15 @@ func (r *renderer) drawParagraph(p docx.Paragraph) error {
 	if r.opts.ShowRevisions && paragraphHasRevision(p) {
 		r.drawRevisionChangeBar(pbdrTopY, pbdrBottomY)
 	}
+	// w:suppressLineNumbers — record the y-range so the section's
+	// line-number gutter skips this paragraph. Effective only when the
+	// section enables w:lnNumType; otherwise harmless.
+	if p.SuppressLineNumbers && pbdrBottomY > pbdrTopY {
+		r.suppressedLineNumRanges = append(r.suppressedLineNumRanges, suppressedRange{
+			top:    pbdrTopY,
+			bottom: pbdrBottomY,
+		})
+	}
 
 	if p.SpacingAfter > 0 {
 		r.cursorY += p.SpacingAfter
@@ -266,31 +286,79 @@ func (r *renderer) restoreParagraphState(savedColIdx int, savedMarL, savedConten
 // Returns empty values when the list isn't defined — some Word docs
 // reference numIds that aren't in numbering.xml, and we fall back gracefully
 // rather than failing the render.
-func (r *renderer) resolveListMarker(li docx.ListInfo) (marker string, img image.Image, indentPt, hangPt float64) {
+func (r *renderer) resolveListMarker(li docx.ListInfo) (marker string, img image.Image, indentPt, hangPt float64, fontFamily, markerJc string) {
 	absID, ok := r.doc.Numbering.NumToAbs[li.NumID]
 	if !ok {
-		return "", nil, 0, 0
+		return "", nil, 0, 0, "", ""
 	}
 	an, ok := r.doc.Numbering.Abstract[absID]
 	if !ok {
-		return "", nil, 0, 0
+		return "", nil, 0, 0, "", ""
 	}
 	lv, ok := an.Levels[li.Level]
 	if !ok {
-		return "", nil, 0, 0
+		return "", nil, 0, 0, "", ""
 	}
 
-	if r.counters[li.NumID] == nil {
-		r.counters[li.NumID] = map[int]int{}
+	// w:lvlOverride lives on the w:num, not the abstractNum. A num that
+	// inherits a shared abstract can either: replace the whole level
+	// definition (w:lvl child of w:lvlOverride), or override just the
+	// initial counter (w:startOverride).
+	var startOverride int
+	if numOv, ok := r.doc.Numbering.Overrides[li.NumID]; ok {
+		if ov, ok := numOv[li.Level]; ok {
+			if ov.LvlReplace != nil {
+				lv = *ov.LvlReplace
+			}
+			if ov.StartOverride > 0 {
+				startOverride = ov.StartOverride
+			}
+		}
 	}
-	if _, seen := r.counters[li.NumID][li.Level]; !seen {
-		r.counters[li.NumID][li.Level] = lv.Start
+
+	// Counter state is keyed by numId (not abstractNumId) so that distinct
+	// w:num records — even when sharing an abstractNum — keep independent
+	// counters. Word's "continuation" lists explicitly share the same numId,
+	// so this also preserves the legacy continuation behavior.
+	counterKey := li.NumID
+	if r.counters[counterKey] == nil {
+		r.counters[counterKey] = map[int]int{}
+	}
+	startVal := lv.Start
+	if startOverride > 0 {
+		startVal = startOverride
+	}
+	if _, seen := r.counters[counterKey][li.Level]; !seen {
+		r.counters[counterKey][li.Level] = startVal
 	} else {
-		r.counters[li.NumID][li.Level]++
+		r.counters[counterKey][li.Level]++
 	}
-	for k := range r.counters[li.NumID] {
-		if k > li.Level {
-			delete(r.counters[li.NumID], k)
+	// Default rule (OOXML §17.9.7): when a level appears, every higher-indent
+	// level (ilvl > current) resets next time it appears. A non-default
+	// w:lvlRestart on a higher level overrides this:
+	//   lvlRestart == 0       — never restart (don't delete)
+	//   lvlRestart  > 0       — restart only when ancestor at val advances;
+	//                            when WE just advanced level li.Level, only
+	//                            child-levels whose lvlRestart points at
+	//                            li.Level (or unset/<0) get reset.
+	for k, child := range an.Levels {
+		if k <= li.Level {
+			continue
+		}
+		// Default: reset whenever any higher level advances.
+		if child.LvlRestart < 0 {
+			delete(r.counters[counterKey], k)
+			continue
+		}
+		// Explicit "never restart".
+		if child.LvlRestart == 0 {
+			continue
+		}
+		// Explicit restart trigger: ancestor index (1-based in OOXML).
+		// val=N means restart when level (N-1) advances. We just advanced
+		// level li.Level, so restart only if li.Level == child.LvlRestart-1.
+		if li.Level == child.LvlRestart-1 {
+			delete(r.counters[counterKey], k)
 		}
 	}
 
@@ -308,21 +376,55 @@ func (r *renderer) resolveListMarker(li docx.ListInfo) (marker string, img image
 		hangPt = 18 // 360 twips = 0.25 inch — enough gap between marker and text
 	}
 
+	markerJc = lv.MarkerJc
 	if lv.PicBulletID > 0 {
 		if rid, ok := r.doc.Numbering.PicBullets[lv.PicBulletID]; ok {
 			if image, ok := r.doc.Images[rid]; ok {
-				return "", image, indentPt, hangPt
+				return "", image, indentPt, hangPt, "", markerJc
 			}
 		}
 	}
 
-	marker = formatLevelText(lv, r.counters[li.NumID])
-	return marker, nil, indentPt, hangPt
+	marker = formatLevelTextAt(lv, an.Levels, r.counters[counterKey], li.Level)
+	// Choose a font hint for the marker. Bullet levels often carry a
+	// w:rFonts pointing at "Symbol" / "Wingdings"; only honor it for
+	// bullet markers — for numeric markers the body font is correct.
+	if lv.Format == "bullet" && lv.MarkerFontFamily != "" {
+		fontFamily = lv.MarkerFontFamily
+	}
+	// w:suff controls what separates the marker from the body:
+	//   "tab"     — default: tab to next tabstop (we approximate with hangPt)
+	//   "space"   — one space-width gap (keep hangPt as-is; minor over-pad
+	//                acceptable vs. visible overlap with body)
+	//   "nothing" — body text starts immediately after the marker. Collapse
+	//                hangPt so the body indent equals the marker position.
+	if lv.Suff == "nothing" {
+		hangPt = 0
+		// Re-anchor indent at the marker's natural left edge: same as
+		// lv.LeftTwips, no extra hanging gap.
+		if twipsToPt(lv.LeftTwips) == 0 {
+			indentPt = 0
+		}
+	}
+	return marker, nil, indentPt, hangPt, fontFamily, markerJc
 }
 
 // formatLevelText expands lvlText placeholders like "%1.%2" using the
 // current counter map. For bullets, lvlText is taken literally.
-func formatLevelText(lv docx.NumLevel, counters map[int]int) string {
+//
+// Each %N references the counter for ilvl=N-1 and must be rendered in
+// THAT level's numFmt, not the current level's. When the current level
+// declares w:isLgl, every substitution is forced to decimal (Word's
+// "legal numbering" mode used for "1.2.3.4" outlines that mix Roman
+// and Arabic per-level formats).
+func formatLevelText(lv docx.NumLevel, allLevels map[int]docx.NumLevel, counters map[int]int) string {
+	return formatLevelTextAt(lv, allLevels, counters, -1)
+}
+
+// formatLevelTextAt is the same as formatLevelText but knows the current
+// ilvl so it can honor w:hideParent (which suppresses %N placeholders for
+// ancestor levels — ilvl < currentLevel).
+func formatLevelTextAt(lv docx.NumLevel, allLevels map[int]docx.NumLevel, counters map[int]int, currentLevel int) string {
 	if lv.Format == "bullet" || lv.Format == "" {
 		if lv.Text != "" {
 			return lv.Text
@@ -338,8 +440,21 @@ func formatLevelText(lv docx.NumLevel, counters map[int]int) string {
 		if !strings.Contains(out, needle) {
 			continue
 		}
+		// w:hideParent: %N referring to an ancestor (ilvl < currentLevel)
+		// is suppressed. Word renders the marker as if the placeholder
+		// wasn't there.
+		if lv.HideParent && currentLevel >= 0 && (n-1) < currentLevel {
+			out = strings.ReplaceAll(out, needle, "")
+			continue
+		}
 		val := counters[n-1]
-		fm := lv.Format
+		fm := ""
+		if other, ok := allLevels[n-1]; ok {
+			fm = other.Format
+		}
+		if fm == "" {
+			fm = lv.Format
+		}
 		if lv.IsLgl {
 			fm = "decimal"
 		}
@@ -416,7 +531,7 @@ func formatNumber(n int, fmtName string) string {
 		return irohaLabel(n, false)
 	case "irohaFullWidth":
 		return irohaLabel(n, true)
-	case "thaiNumbers", "thaiCountingThousand":
+	case "thaiNumbers", "thaiCountingThousand", "thaiCounting":
 		return thaiDigits(n)
 	case "ganada":
 		return ganadaLabel(n)
@@ -430,7 +545,7 @@ func formatNumber(n int, fmtName string) string {
 		return hindiVowelsLabel(n)
 	case "hindiConsonants":
 		return hindiConsonantsLabel(n)
-	case "hindiNumbers":
+	case "hindiNumbers", "hindiCounting":
 		return hindiDigits(n)
 	case "hebrew1":
 		return hebrew1Label(n)
@@ -454,10 +569,81 @@ func formatNumber(n int, fmtName string) string {
 		return zodiacLabel(n, true)
 	case "thaiLetters":
 		return thaiLettersLabel(n)
+	case "chicago":
+		// Footnote symbol cycle: * † ‡ § ‖ ¶, doubling on each wrap.
+		return chicagoLabel(n)
+	case "bahtText":
+		return bahtText(n)
+	case "dollarText":
+		return dollarText(n)
 	default:
 		return strconv.Itoa(n)
 	}
 }
+
+// chicagoLabel maps n → Chicago Manual of Style footnote symbols.
+// Cycle is *, †, ‡, §, ‖, ¶, repeating doubled on overflow (** †† …).
+func chicagoLabel(n int) string {
+	syms := []string{"*", "†", "‡", "§", "‖", "¶"}
+	if n < 1 {
+		return ""
+	}
+	idx := (n - 1) % len(syms)
+	rep := (n-1)/len(syms) + 1
+	return strings.Repeat(syms[idx], rep)
+}
+
+// bahtText spells out a number as Thai currency words (whole baht only,
+// no satang). Implements the OOXML numFmt "bahtText" — used in legal
+// documents in Thai locales.
+func bahtText(n int) string {
+	if n == 0 {
+		return "ศูนย์บาทถ้วน"
+	}
+	digits := []string{"", "หนึ่ง", "สอง", "สาม", "สี่", "ห้า", "หก", "เจ็ด", "แปด", "เก้า"}
+	positions := []string{"", "สิบ", "ร้อย", "พัน", "หมื่น", "แสน", "ล้าน"}
+	if n < 0 {
+		return "ลบ" + bahtText(-n)
+	}
+	if n >= 1_000_000 {
+		left := bahtText(n / 1_000_000)
+		right := n % 1_000_000
+		if right == 0 {
+			return left + "ล้านบาทถ้วน"
+		}
+		// Strip "บาทถ้วน" from the recursive call before concatenating.
+		rest := bahtText(right)
+		rest = strings.TrimSuffix(rest, "บาทถ้วน")
+		return left + "ล้าน" + rest + "บาทถ้วน"
+	}
+	var b strings.Builder
+	s := strconv.Itoa(n)
+	L := len(s)
+	for i, c := range s {
+		d := int(c - '0')
+		pos := L - i - 1
+		if d == 0 {
+			continue
+		}
+		switch {
+		case pos == 0 && L > 1 && d == 1:
+			b.WriteString("เอ็ด")
+		case pos == 1 && d == 2:
+			b.WriteString("ยี่")
+			b.WriteString(positions[pos])
+		case pos == 1 && d == 1:
+			b.WriteString(positions[pos])
+		default:
+			b.WriteString(digits[d])
+			if pos > 0 && pos < len(positions) {
+				b.WriteString(positions[pos])
+			}
+		}
+	}
+	b.WriteString("บาทถ้วน")
+	return b.String()
+}
+
 
 // zodiacLabel returns the Chinese 12-animal zodiac character for n.
 // Traditional adds a tick when the cycle wraps past 12.

@@ -8,7 +8,7 @@ import (
 
 func TestMatchingConditions_FirstRow(t *testing.T) {
 	look := docx.TableLook{FirstRow: true}
-	got := matchingConditions(look, 0, 0, 3, 3)
+	got := matchingConditions(look, 0, 0, 3, 3, 1, 1, docx.CnfStyle{}, docx.CnfStyle{})
 	wantHas := func(needle string) bool {
 		for _, s := range got {
 			if s == needle {
@@ -25,8 +25,8 @@ func TestMatchingConditions_FirstRow(t *testing.T) {
 func TestMatchingConditions_Banding(t *testing.T) {
 	look := docx.TableLook{} // no NoHBand → bands ON
 	// Row 0 → band1Horz, Row 1 → band2Horz, Row 2 → band1Horz
-	c0 := matchingConditions(look, 0, 0, 3, 1)
-	c1 := matchingConditions(look, 1, 0, 3, 1)
+	c0 := matchingConditions(look, 0, 0, 3, 1, 1, 1, docx.CnfStyle{}, docx.CnfStyle{})
+	c1 := matchingConditions(look, 1, 0, 3, 1, 1, 1, docx.CnfStyle{}, docx.CnfStyle{})
 	if c0[0] != "band1Horz" || c1[0] != "band2Horz" {
 		t.Errorf("banding rows: c0=%v c1=%v", c0, c1)
 	}
@@ -34,7 +34,7 @@ func TestMatchingConditions_Banding(t *testing.T) {
 
 func TestMatchingConditions_NoHBandSuppresses(t *testing.T) {
 	look := docx.TableLook{NoHBand: true}
-	got := matchingConditions(look, 0, 0, 3, 1)
+	got := matchingConditions(look, 0, 0, 3, 1, 1, 1, docx.CnfStyle{}, docx.CnfStyle{})
 	for _, s := range got {
 		if s == "band1Horz" || s == "band2Horz" {
 			t.Errorf("NoHBand should suppress banding, got %v", got)
@@ -44,7 +44,7 @@ func TestMatchingConditions_NoHBandSuppresses(t *testing.T) {
 
 func TestMatchingConditions_CornerWins(t *testing.T) {
 	look := docx.TableLook{FirstRow: true, FirstColumn: true}
-	got := matchingConditions(look, 0, 0, 3, 3)
+	got := matchingConditions(look, 0, 0, 3, 3, 1, 1, docx.CnfStyle{}, docx.CnfStyle{})
 	last := got[len(got)-1]
 	if last != "nwCell" {
 		t.Errorf("corner should land last in %v", got)

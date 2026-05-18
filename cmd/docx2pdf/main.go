@@ -36,6 +36,7 @@ func main() {
 	fontItalic := flag.String("font-italic", "", "path to italic TTF font (optional)")
 	fontHeading := flag.String("font-heading", "", "path to TTF used for theme-major (heading) runs; e.g. Cambria (optional)")
 	fontFallback := flag.String("font-fallback", "", "path to fallback TTF used for CJK glyphs (optional)")
+	fontSymbol := flag.String("font-symbol", "", "path to TTF that covers ballot-box / arrow / dingbat blocks — NotoSansSymbols2 is the canonical choice (optional)")
 	size := flag.Float64("size", 11, "default font size in points")
 	pageNumbers := flag.Bool("page-numbers", false, "draw 'X / N' page numbers at the bottom of every page")
 	recursive := flag.Bool("recursive", false, "in batch mode, descend into subdirectories")
@@ -60,6 +61,7 @@ func main() {
 		FontItalic:      *fontItalic,
 		FontHeading:     *fontHeading,
 		FontFallback:    *fontFallback,
+		FontSymbol:      *fontSymbol,
 		DefaultFontSize: *size,
 		PageNumbers:     *pageNumbers,
 		Verbose:         *verbose,

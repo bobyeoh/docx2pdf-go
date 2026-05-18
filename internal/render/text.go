@@ -2,6 +2,7 @@ package render
 
 import (
 	"image"
+	"math"
 	"strings"
 
 	"github.com/bobyeoh/docx2pdf-go/internal/docx"
@@ -35,12 +36,49 @@ type atom struct {
 	// "none"/"behind", these are also used to draw the image without
 	// affecting flow text.
 	anchorOffsetXPt, anchorOffsetYPt float64
+	// anchorWrapPolygon carries wp:wrapPolygon vertices in 1/21600 of the
+	// shape's bbox. When non-empty and anchorWrap is "tight" / "through",
+	// the renderer scales the polygon into the float-wrap band so text
+	// follows the contour instead of the bbox.
+	anchorWrapPolygon []docx.WrapPathPoint
+	// anchorSimplePosUsed / anchorSimplePosXPt / anchorSimplePosYPt mirror
+	// wp:anchor@simplePos. When the flag is set the renderer places the
+	// shape at the absolute page-relative coordinates instead of the
+	// inline cursor — legacy Word 2003 positioning.
+	anchorSimplePosUsed                    bool
+	anchorSimplePosXPt, anchorSimplePosYPt float64
+	// imageRotationDeg / imageFlipH / imageFlipV mirror a:xfrm on the
+	// source drawing. Applied at draw time around the image's bounding
+	// box.
+	imageRotationDeg float64
+	imageFlipH       bool
+	imageFlipV       bool
 	// shape, when non-nil, carries a VML geometric primitive that should
 	// be drawn at the current cursor position.
 	shape *docx.VMLShape
 	// math, when non-zero, carries a pre-laid-out OMML expression box.
 	// Drawn at the line's baseline at draw time.
 	math mathBox
+	// ruby, when non-empty, is the annotation text Word stored in
+	// <w:ruby>. The renderer paints it in a smaller font centered above
+	// the base atom. The base atom keeps its original width so adjacent
+	// flow text doesn't shift.
+	ruby string
+	// ptab, when non-nil, overrides the tab-stop computation for this
+	// atomTab. Alignment / RelativeTo determine the dynamic stop;
+	// Leader supplies the fill pattern.
+	ptab *docx.PtabInfo
+	// dirOverride mirrors Run.DirOverride — "ltr" / "rtl" — set when a
+	// w:bdo or w:dir wraps the run.
+	dirOverride string
+	// ptabPaddingPt, when an atomSpace atom is paired with a ptab,
+	// records width padding that we want consumed at end-of-line as
+	// trailing space (the gap before a right-aligned w:ptab).
+	ptabPaddingPt float64
+	// fitScale, when > 0 and != 1, scales the rendered font size of
+	// this atom to honor run-level w:fitText squeeze. Width has
+	// already been multiplied by the same scale at emit time.
+	fitScale float64
 }
 
 type atomKind int
@@ -107,9 +145,19 @@ func drawTabLeader(r *renderer, leader string, fromX, toX, baseline float64, pro
 	if toX-fromX < 4 {
 		return
 	}
+	// "heavy" is a thick continuous rule, not a glyph repeat. Stroke a
+	// single horizontal line at the baseline.
+	if leader == "heavy" {
+		r.pdf.SetLineWidth(1.5)
+		r.pdf.SetStrokeColor(0, 0, 0)
+		r.pdf.Line(fromX, baseline, toX, baseline)
+		return
+	}
 	var ch string
 	switch leader {
-	case "dot", "middleDot":
+	case "dot":
+		ch = "."
+	case "middleDot":
 		ch = "·"
 	case "hyphen":
 		ch = "-"
@@ -188,6 +236,9 @@ func (r *renderer) runsToAtoms(runs []docx.Run) []atom {
 		if run.Props.Vanish {
 			continue
 		}
+		// Capture the output index before emission so we can decorate
+		// any atoms produced for this run with its ruby annotation.
+		startIdx := len(out)
 		// Complex-script substitution: when the run is tagged w:cs (or
 		// rendered inside an RTL paragraph), Word reads bold/italic/size
 		// from the complex-script siblings (BCs/ICs/SzCs) rather than the
@@ -230,11 +281,20 @@ func (r *renderer) runsToAtoms(runs []docx.Run) []atom {
 				h *= scale
 			}
 			out = append(out, atom{
-				kind:   atomVMLShape,
-				shape:  s,
-				width:  w,
-				height: h,
-				props:  run.Props,
+				kind:                atomVMLShape,
+				shape:               s,
+				width:               w,
+				height:              h,
+				props:               run.Props,
+				anchored:            run.ImageAnchored,
+				anchorAlignH:        run.AnchorAlignH,
+				anchorWrap:          run.AnchorWrap,
+				anchorOffsetXPt:     run.AnchorOffsetXPt,
+				anchorOffsetYPt:     run.AnchorOffsetYPt,
+				anchorWrapPolygon:   run.AnchorWrapPolygon,
+				anchorSimplePosUsed: run.AnchorSimplePosUsed,
+				anchorSimplePosXPt:  run.AnchorSimplePosXPt,
+				anchorSimplePosYPt:  run.AnchorSimplePosYPt,
 			})
 			continue
 		}
@@ -321,18 +381,25 @@ func (r *renderer) runsToAtoms(runs []docx.Run) []atom {
 				w, h = r.fitImage(img)
 			}
 			out = append(out, atom{
-				kind:            atomImage,
-				imageID:         imgID,
-				width:           w,
-				height:          h,
-				props:           run.Props,
-				linkRID:         run.LinkURL,
-				linkAnchor:      run.LinkAnchor,
-				anchored:        run.ImageAnchored,
-				anchorAlignH:    run.AnchorAlignH,
-				anchorWrap:      run.AnchorWrap,
-				anchorOffsetXPt: run.AnchorOffsetXPt,
-				anchorOffsetYPt: run.AnchorOffsetYPt,
+				kind:                atomImage,
+				imageID:             imgID,
+				width:               w,
+				height:              h,
+				props:               run.Props,
+				linkRID:             run.LinkURL,
+				linkAnchor:          run.LinkAnchor,
+				anchored:            run.ImageAnchored,
+				anchorAlignH:        run.AnchorAlignH,
+				anchorWrap:          run.AnchorWrap,
+				anchorOffsetXPt:     run.AnchorOffsetXPt,
+				anchorOffsetYPt:     run.AnchorOffsetYPt,
+				anchorWrapPolygon:   run.AnchorWrapPolygon,
+				anchorSimplePosUsed: run.AnchorSimplePosUsed,
+				anchorSimplePosXPt:  run.AnchorSimplePosXPt,
+				anchorSimplePosYPt:  run.AnchorSimplePosYPt,
+				imageRotationDeg:    run.ImageRotationDeg,
+				imageFlipH:          run.ImageFlipH,
+				imageFlipV:          run.ImageFlipV,
 			})
 			continue
 		}
@@ -380,12 +447,27 @@ func (r *renderer) runsToAtoms(runs []docx.Run) []atom {
 			_ = r.applyFontFamily(run.Props, bufFamily)
 			text := buf.String()
 			// In an RTL paragraph, an all-RTL word atom is laid out by
-			// reversing its rune sequence here so the glyph stream we
-			// hand to gopdf draws in visual (right-to-left) order. Mixed
-			// or all-LTR words pass through unchanged — proper UAX#9
-			// resolution for embedded LTR runs is out of scope.
-			if r.paragraphRTL && allRTL(text) {
-				text = reverseRunes(text)
+			// Bidi reordering: when ANY rune is RTL or the paragraph
+			// is RTL we run a UAX#9 paragraph-level resolver on this
+			// segment so embedded LTR digits/words in an Arabic paragraph
+			// (and embedded RTL words in an LTR paragraph) come out in
+			// the correct visual order. Pure-LTR with no RTL chars is a
+			// fast no-op.
+			//
+			// After the bidi pass we apply Arabic letter shaping so the
+			// glyphs use their Initial/Medial/Final/Isolated forms — the
+			// difference between unshaped "ا ل ع ر ب ي ة" and shaped
+			// "العربية".
+			hasRTLChar := false
+			for _, ru := range text {
+				if isRTL(ru) {
+					hasRTLChar = true
+					break
+				}
+			}
+			if r.paragraphRTL || hasRTLChar {
+				text = reorderBidi(text, r.paragraphRTL)
+				text = shapeArabic(text)
 			}
 			w, _ := r.pdf.MeasureTextWidth(text)
 			out = append(out, atom{
@@ -410,7 +492,13 @@ func (r *renderer) runsToAtoms(runs []docx.Run) []atom {
 				flushBuf()
 				_ = r.applyFontFamily(run.Props, r.selectFont(run.Props))
 				w, _ := r.pdf.MeasureTextWidth("    ")
-				out = append(out, atom{kind: atomTab, props: run.Props, width: w})
+				out = append(out, atom{
+					kind:        atomTab,
+					props:       run.Props,
+					width:       w,
+					ptab:        run.Ptab,
+					dirOverride: run.DirOverride,
+				})
 			case rn == ' ':
 				flushBuf()
 				_ = r.applyFontFamily(run.Props, r.selectFont(run.Props))
@@ -428,6 +516,13 @@ func (r *renderer) runsToAtoms(runs []docx.Run) []atom {
 				_ = r.applyFontFamily(run.Props, fam)
 				s := string(rn)
 				w, _ := r.pdf.MeasureTextWidth(s)
+				// docGrid w:charSpace adds extra space between CJK
+				// characters when the section enables the
+				// linesAndChars grid. Apply only to CJK ranges so
+				// symbols/Latin in a CJK doc don't get over-padded.
+				if isCJK(rn) {
+					w += r.activeCharSpacePt()
+				}
 				out = append(out, atom{
 					kind:       atomWord,
 					text:       s,
@@ -449,6 +544,47 @@ func (r *renderer) runsToAtoms(runs []docx.Run) []atom {
 			}
 		}
 		flushBuf()
+		// Decorate the freshly-emitted atoms for this run with its
+		// w:ruby annotation. We attach the ruby text to every atom
+		// the run produced so multi-character bases get the same
+		// label drawn above each char; Word's typical use is single
+		// CJK char + Latin transliteration.
+		if run.Ruby != nil && run.Ruby.Text != "" {
+			for i := startIdx; i < len(out); i++ {
+				if out[i].kind == atomWord {
+					out[i].ruby = run.Ruby.Text
+				}
+			}
+		}
+		// w:fitText horizontal squeeze (run-level). When the run
+		// declares a target width, scale every atom we just emitted
+		// so the run's natural width hits exactly FitTextWidthPt.
+		// gopdf has no Tz (text horizontal scale) operator, so we
+		// fold the scale into the atom width and the per-atom font
+		// size — readable, just isotropic instead of true squash.
+		if run.Props.FitTextWidthPt > 0 {
+			var natural float64
+			for i := startIdx; i < len(out); i++ {
+				natural += out[i].width
+			}
+			if natural > 0 {
+				scale := run.Props.FitTextWidthPt / natural
+				if scale > 0 && scale != 1 {
+					for i := startIdx; i < len(out); i++ {
+						out[i].width *= scale
+						out[i].fitScale = scale
+					}
+				}
+			}
+		}
+		// Stamp dirOverride onto the run's atoms so reorderBidi at
+		// draw time treats them as if they live in a directional
+		// override (w:bdo / w:dir).
+		if run.DirOverride != "" {
+			for i := startIdx; i < len(out); i++ {
+				out[i].dirOverride = run.DirOverride
+			}
+		}
 	}
 	return out
 }
@@ -547,8 +683,29 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 				em := r.opts.DefaultFontSize
 				_ = r.drawImage(pm.image, pm.x, baseline-em, em, em)
 			} else {
-				_ = r.applyRunFont(pm.props)
-				r.pdf.SetX(pm.x)
+				if pm.fontFamily != "" && r.fonts[pm.fontFamily] {
+					_ = r.applyFontFamily(pm.props, pm.fontFamily)
+				} else {
+					_ = r.applyRunFont(pm.props)
+				}
+				drawX := pm.x
+				// w:lvlJc — when the marker should be right- or center-
+				// aligned within its hanging column, measure the rendered
+				// text and shift drawX so that the right edge sits at
+				// (pm.x + pm.colWidth).
+				if pm.colWidth > 0 && (pm.jc == "right" || pm.jc == "end" || pm.jc == "center") {
+					w, _ := r.pdf.MeasureTextWidth(pm.text)
+					switch pm.jc {
+					case "right", "end":
+						drawX = pm.x + pm.colWidth - w
+					case "center":
+						drawX = pm.x + (pm.colWidth-w)/2
+					}
+					if drawX < pm.x {
+						drawX = pm.x
+					}
+				}
+				r.pdf.SetX(drawX)
 				r.pdf.SetY(baseline - fontAscent(pm.props, r.opts.DefaultFontSize))
 				if err := r.pdf.Cell(nil, pm.text); err != nil {
 					return err
@@ -561,7 +718,20 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 		for i, a := range line {
 			switch a.kind {
 			case atomWord:
+				// Run-level w:fitText: temporarily fold the per-atom
+				// fitScale into the renderer's existing fitTextScale
+				// path so applyFontFamily picks up the squeezed size.
+				// Restored below at end of this case branch.
+				prevFit := r.fitTextScale
+				if a.fitScale > 0 && a.fitScale != 1 {
+					if prevFit > 0 {
+						r.fitTextScale = prevFit * a.fitScale
+					} else {
+						r.fitTextScale = a.fitScale
+					}
+				}
 				if err := r.applyFontFamily(a.props, a.fontFamily); err != nil {
+					r.fitTextScale = prevFit
 					return err
 				}
 				ascent := fontAscent(a.props, r.opts.DefaultFontSize)
@@ -581,6 +751,41 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 				}
 				r.pdf.SetX(cx)
 				r.pdf.SetY(topY)
+				// w14:scene3d / w14:props3d — draw a stack of three offset
+				// "depth" copies behind the glyph in progressively darker
+				// shades so flat-PDF can't render real 3D extrusion but
+				// the text still reads as raised. We respect any explicit
+				// w:color when computing the depth shade so 3D-on-blue
+				// text doesn't go gray.
+				if a.props.W14Has3D && a.text != "" {
+					baseR, baseG, baseB := uint8(64), uint8(64), uint8(64)
+					if a.props.Color != "" {
+						baseR, baseG, baseB = parseHexColor(a.props.Color)
+					}
+					for d := 3; d >= 1; d-- {
+						df := float64(d)
+						// Mix toward white as depth increases: lighter
+						// layers sit further "back" and read as recession.
+						mix := func(c uint8) uint8 {
+							t := 1.0 - df*0.25
+							v := float64(c)*t + 255.0*(1.0-t)
+							if v > 255 {
+								v = 255
+							}
+							if v < 0 {
+								v = 0
+							}
+							return uint8(v)
+						}
+						r.pdf.SetTextColor(mix(baseR), mix(baseG), mix(baseB))
+						r.pdf.SetX(cx + df*0.5)
+						r.pdf.SetY(topY + df*0.5)
+						_ = r.pdf.Cell(nil, a.text)
+					}
+					r.pdf.SetTextColor(baseR, baseG, baseB)
+					r.pdf.SetX(cx)
+					r.pdf.SetY(topY)
+				}
 				switch a.props.TextEffect {
 				case "emboss":
 					rOff, gOff, bOff := uint8(220), uint8(220), uint8(220)
@@ -608,6 +813,26 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 				if err := r.pdf.Cell(nil, a.text); err != nil {
 					return err
 				}
+				// w:ruby — paint the interlinear annotation in a smaller
+				// font centered above the base char. We approximate the
+				// raise as 1/2 ascent and the ruby size as 0.5×base.
+				if a.ruby != "" {
+					rubyFs := r.opts.DefaultFontSize * 0.5
+					savedFs := a.props.FontSize
+					props := a.props
+					props.FontSize = rubyFs
+					_ = r.applyFontFamily(props, a.fontFamily)
+					rw, _ := r.pdf.MeasureTextWidth(a.ruby)
+					rubyX := cx + (a.width-rw)/2
+					if rubyX < cx {
+						rubyX = cx
+					}
+					r.pdf.SetX(rubyX)
+					r.pdf.SetY(topY - rubyFs*0.95)
+					_ = r.pdf.Cell(nil, a.ruby)
+					props.FontSize = savedFs
+					_ = r.applyFontFamily(a.props, a.fontFamily)
+				}
 				// Faux bold: when the run wants bold but no bold face was
 				// registered, re-draw the same glyph stream at a small
 				// horizontal offset so the strokes look thicker. This is
@@ -619,20 +844,25 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 					r.pdf.SetY(topY)
 					_ = r.pdf.Cell(nil, a.text)
 				}
-				if a.props.Underline || a.props.Strike {
-					r.pdf.SetLineWidth(0.5)
+				if a.props.Underline || a.props.Strike || a.props.DStrike {
 					r.pdf.SetStrokeColor(0, 0, 0)
 					if a.props.Color != "" {
 						rr, gg, bb := parseHexColor(a.props.Color)
 						r.pdf.SetStrokeColor(rr, gg, bb)
 					}
 					if a.props.Underline {
-						ulY := baseline + 1
-						r.pdf.Line(cx, ulY, cx+a.width, ulY)
+						drawUnderline(r, a, cx, baseline)
 					}
 					if a.props.Strike {
+						r.pdf.SetLineWidth(0.5)
 						strikeY := baseline - fontAscent(a.props, r.opts.DefaultFontSize)*0.35
 						r.pdf.Line(cx, strikeY, cx+a.width, strikeY)
+					}
+					if a.props.DStrike {
+						r.pdf.SetLineWidth(0.5)
+						mid := baseline - fontAscent(a.props, r.opts.DefaultFontSize)*0.35
+						r.pdf.Line(cx, mid-0.7, cx+a.width, mid-0.7)
+						r.pdf.Line(cx, mid+0.7, cx+a.width, mid+0.7)
 					}
 				}
 				if url := r.resolveURL(a.linkRID); url != "" {
@@ -642,11 +872,50 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 					h := fontAscent(a.props, r.opts.DefaultFontSize) * 1.1
 					r.pdf.AddInternalLink(a.linkAnchor, cx, topY, a.width, h)
 				}
+				if a.props.Em != "" && a.text != "" {
+					drawEmphasisMark(r, a, cx, baseline)
+				}
 				cx += a.width
+				// Restore the renderer-wide fitTextScale we possibly
+				// overrode at the top of this case for run-level
+				// w:fitText. No-op when prevFit was already current.
+				r.fitTextScale = prevFit
 			case atomSpace:
 				cx += a.width + extraSpace
 			case atomTab:
-				stopX, leader, tabAlign, ok := r.nextTabAfterWithAlign(cx-x, a.props)
+				var stopX float64
+				var leader, tabAlign string
+				var ok bool
+				if a.ptab != nil {
+					// Positional tab: compute the stop from the
+					// alignment + relativeTo anchor instead of the
+					// paragraph's w:tabs list. Page-relative anchors
+					// use the section width; the simpler approach (and
+					// what Word does on a single-column body) is to
+					// anchor to the line's right edge / center.
+					rightEdge := r.contentW
+					if a.ptab.RelativeTo == "page" {
+						// page-relative: include the left margin so the
+						// stop sits at the actual page right edge.
+						rightEdge = r.contentW + r.marL + r.marR
+					}
+					switch a.ptab.Alignment {
+					case "right":
+						stopX = rightEdge
+					case "center":
+						stopX = rightEdge / 2
+					default:
+						stopX = cx - x + a.width
+					}
+					leader = a.ptab.Leader
+					if leader == "none" {
+						leader = ""
+					}
+					tabAlign = a.ptab.Alignment
+					ok = true
+				} else {
+					stopX, leader, tabAlign, ok = r.nextTabAfterWithAlign(cx-x, a.props)
+				}
 				if !ok {
 					cx += a.width
 					break
@@ -710,7 +979,7 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 						imgX = r.marL
 					}
 				}
-				if err := r.drawImage(img, imgX, r.cursorY, a.width, a.height); err != nil {
+				if err := r.drawTransformedImage(img, imgX, r.cursorY, a.width, a.height, a.imageRotationDeg, a.imageFlipH, a.imageFlipV); err != nil {
 					return err
 				}
 				if a.anchored {
@@ -992,16 +1261,29 @@ func (r *renderer) drawFloatingShapeWithWrap(a *atom) {
 		shapeTop = r.floatBand.bottomY
 	}
 	var imgX float64
-	if side == "right" {
-		imgX = r.marL + r.contentW - a.width
+	if a.anchorSimplePosUsed {
+		// Legacy absolute placement. Override side selection too — the
+		// band's side is decided by which half of the page the simplePos
+		// falls into.
+		imgX = a.anchorSimplePosXPt
+		shapeTop = a.anchorSimplePosYPt
+		if imgX+a.width/2 > r.marL+r.contentW/2 {
+			side = "right"
+		} else {
+			side = "left"
+		}
 	} else {
-		imgX = r.marL
+		if side == "right" {
+			imgX = r.marL + r.contentW - a.width
+		} else {
+			imgX = r.marL
+		}
+		// AnchorOffsetXPt is applied as a small lateral nudge from the
+		// snapped left/right edge. Word writes this even when an alignment
+		// is specified (especially in templates exported from web editors)
+		// so honoring it keeps captions/portraits aligned with the source.
+		imgX += a.anchorOffsetXPt
 	}
-	// AnchorOffsetXPt is applied as a small lateral nudge from the
-	// snapped left/right edge. Word writes this even when an alignment
-	// is specified (especially in templates exported from web editors)
-	// so honoring it keeps captions/portraits aligned with the source.
-	imgX += a.anchorOffsetXPt
 	if a.kind == atomImage {
 		var img image.Image
 		if strings.Contains(a.imageID, ":crop") {
@@ -1015,13 +1297,57 @@ func (r *renderer) drawFloatingShapeWithWrap(a *atom) {
 	} else if a.shape != nil {
 		drawVMLShape(r, a.shape, imgX, shapeTop, a.width, a.height)
 	}
-	r.floatBand = &floatWrapBand{
+	band := &floatWrapBand{
 		leftX:   imgX,
 		rightX:  imgX + a.width,
+		topY:    shapeTop,
 		bottomY: shapeTop + a.height,
 		side:    side,
 		gapPt:   6,
 	}
+	if len(a.anchorWrapPolygon) >= 3 &&
+		(a.anchorWrap == "tight" || a.anchorWrap == "through") {
+		band.polygon, band.polyMinY, band.polyMaxY = buildWrapPolygon(a.anchorWrapPolygon, imgX, shapeTop, a.width, a.height)
+	}
+	r.floatBand = band
+}
+
+// buildWrapPolygon scales wp:wrapPolygon vertices from their 1/21600-of-
+// shape-bbox coordinate space into renderer-space PDF points. Returns the
+// translated polygon plus its vertical extent so the scanline check can
+// skip rows above / below the contour. When any vertex coordinate exceeds
+// 21600, the function rescales by the actual max so out-of-range polygons
+// (a few Word builds emit raw EMU instead of normalized units) still land
+// within the image bbox.
+func buildWrapPolygon(pts []docx.WrapPathPoint, leftX, topY, w, h float64) ([]polyVertex, float64, float64) {
+	if len(pts) < 3 || w <= 0 || h <= 0 {
+		return nil, 0, 0
+	}
+	const polyUnit = 21600.0
+	scaleX, scaleY := polyUnit, polyUnit
+	for _, p := range pts {
+		if float64(p.X) > scaleX {
+			scaleX = float64(p.X)
+		}
+		if float64(p.Y) > scaleY {
+			scaleY = float64(p.Y)
+		}
+	}
+	out := make([]polyVertex, 0, len(pts))
+	minY := math.Inf(1)
+	maxY := math.Inf(-1)
+	for _, p := range pts {
+		px := leftX + (float64(p.X)/scaleX)*w
+		py := topY + (float64(p.Y)/scaleY)*h
+		if py < minY {
+			minY = py
+		}
+		if py > maxY {
+			maxY = py
+		}
+		out = append(out, polyVertex{x: px, y: py})
+	}
+	return out, minY, maxY
 }
 
 // drawFloatingShapeBehind paints a wp:anchor image whose wrap is
@@ -1032,16 +1358,24 @@ func (r *renderer) drawFloatingShapeBehind(a *atom) {
 	if a.width <= 0 || a.height <= 0 {
 		return
 	}
-	imgX := r.marL + a.anchorOffsetXPt
-	switch a.anchorAlignH {
-	case "right", "outside":
-		imgX = r.marL + r.contentW - a.width
-	case "center":
-		imgX = r.marL + (r.contentW-a.width)/2
-	case "left", "inside":
-		imgX = r.marL
+	var imgX, imgY float64
+	if a.anchorSimplePosUsed {
+		// Legacy Word 2003 absolute positioning — coordinates are page-
+		// relative, ignoring positionH/positionV alignment.
+		imgX = a.anchorSimplePosXPt
+		imgY = a.anchorSimplePosYPt
+	} else {
+		imgX = r.marL + a.anchorOffsetXPt
+		switch a.anchorAlignH {
+		case "right", "outside":
+			imgX = r.marL + r.contentW - a.width
+		case "center":
+			imgX = r.marL + (r.contentW-a.width)/2
+		case "left", "inside":
+			imgX = r.marL
+		}
+		imgY = r.cursorY + a.anchorOffsetYPt
 	}
-	imgY := r.cursorY + a.anchorOffsetYPt
 	if a.kind == atomImage {
 		var img image.Image
 		if strings.Contains(a.imageID, ":crop") {
@@ -1062,6 +1396,10 @@ func (r *renderer) drawFloatingShapeBehind(a *atom) {
 // the line falls below the band. A side-effect-free read; expiration
 // is detected and the field cleared on the next paragraph boundary
 // (see drawParagraph) so we don't mutate state during line layout.
+//
+// When the band carries a wp:wrapPolygon contour, exclusion bounds are
+// computed by scan-line intersection with the polygon rather than the
+// bbox edges — text follows the silhouette rather than the rectangle.
 func (r *renderer) lineBandAdjust(y, baseX, baseW float64) (float64, float64, bool) {
 	if r.floatBand == nil {
 		return 0, 0, false
@@ -1070,8 +1408,31 @@ func (r *renderer) lineBandAdjust(y, baseX, baseW float64) (float64, float64, bo
 		return 0, 0, false
 	}
 	gap := r.floatBand.gapPt
+	leftX, rightX := r.floatBand.leftX, r.floatBand.rightX
+	if len(r.floatBand.polygon) >= 3 {
+		// Scanline 2x: one at the line's top, one at the bottom of the
+		// (approximate) line height. We take the union so a line that
+		// straddles a polygon peak still yields to the widest crossing
+		// instead of slipping past the indent.
+		lineH := r.opts.DefaultFontSize * 1.2
+		l1, r1, hit1 := polygonScanline(r.floatBand.polygon, r.floatBand.polyMinY, r.floatBand.polyMaxY, y)
+		l2, r2, hit2 := polygonScanline(r.floatBand.polygon, r.floatBand.polyMinY, r.floatBand.polyMaxY, y+lineH)
+		switch {
+		case hit1 && hit2:
+			leftX = math.Min(l1, l2)
+			rightX = math.Max(r1, r2)
+		case hit1:
+			leftX, rightX = l1, r1
+		case hit2:
+			leftX, rightX = l2, r2
+		default:
+			// Line is above or below the polygon's vertical extent:
+			// nothing to exclude. Fall through to baseX/baseW.
+			return baseX, baseW, true
+		}
+	}
 	if r.floatBand.side == "left" {
-		newX := r.floatBand.rightX + gap
+		newX := rightX + gap
 		if newX > baseX {
 			delta := newX - baseX
 			if delta >= baseW {
@@ -1082,7 +1443,7 @@ func (r *renderer) lineBandAdjust(y, baseX, baseW float64) (float64, float64, bo
 		return baseX, baseW, true
 	}
 	// right side
-	limit := r.floatBand.leftX - gap
+	limit := leftX - gap
 	rightEdge := baseX + baseW
 	if rightEdge > limit {
 		newW := limit - baseX
@@ -1094,12 +1455,253 @@ func (r *renderer) lineBandAdjust(y, baseX, baseW float64) (float64, float64, bo
 	return baseX, baseW, true
 }
 
+// polygonScanline returns the polygon's horizontal span (leftX, rightX) at
+// the given scanline y. Returns ok=false when y is outside the polygon's
+// vertical extent or no edge crosses the line. Uses linear interpolation
+// across each edge (p[i] → p[i+1]) and reports the minimum / maximum x of
+// all crossings — adequate for the typical "single closed contour" wrap
+// polygon Word emits.
+func polygonScanline(poly []polyVertex, minY, maxY, y float64) (float64, float64, bool) {
+	if y < minY || y > maxY {
+		return 0, 0, false
+	}
+	lo := math.Inf(1)
+	hi := math.Inf(-1)
+	hit := false
+	for i := range poly {
+		p1 := poly[i]
+		p2 := poly[(i+1)%len(poly)]
+		// Edge straddles the scanline when the endpoints sit on opposite
+		// sides; half-open [min,max) avoids double-counting vertices.
+		y1, y2 := p1.y, p2.y
+		if y1 == y2 {
+			continue
+		}
+		var top, bot polyVertex
+		if y1 < y2 {
+			top, bot = p1, p2
+		} else {
+			top, bot = p2, p1
+		}
+		if y < top.y || y >= bot.y {
+			continue
+		}
+		t := (y - top.y) / (bot.y - top.y)
+		x := top.x + t*(bot.x-top.x)
+		if x < lo {
+			lo = x
+		}
+		if x > hi {
+			hi = x
+		}
+		hit = true
+	}
+	if !hit {
+		return 0, 0, false
+	}
+	return lo, hi, true
+}
+
 // clearExpiredFloatBand drops the active wrap band when the cursor has
 // passed its bottomY. Called at safe boundaries (paragraph start, page
 // break) so the field doesn't churn during line layout.
 func (r *renderer) clearExpiredFloatBand() {
 	if r.floatBand != nil && r.cursorY >= r.floatBand.bottomY {
 		r.floatBand = nil
+	}
+}
+
+// drawEmphasisMark paints a w:em emphasis mark above (or below for
+// "underDot") each glyph of an atom. Values: "dot" (default), "comma",
+// "circle", "underDot". This is the CJK convention for stressing words
+// without changing typeface — appears as a small mark per character.
+//
+// We approximate the mark as a tiny filled disc / open ring / comma
+// glyph, drawn per-rune so the visual density matches text density. For
+// proportional Latin fonts this slightly over-marks since runes share
+// glyph clusters, but the rendering remains legible.
+func drawEmphasisMark(r *renderer, a atom, cx, baseline float64) {
+	style := a.props.Em
+	ascent := fontAscent(a.props, r.opts.DefaultFontSize)
+	above := style != "underDot"
+	markY := baseline - ascent - 0.5
+	if !above {
+		markY = baseline + 1.5
+	}
+	runeCount := 0
+	for range a.text {
+		runeCount++
+	}
+	if runeCount == 0 {
+		return
+	}
+	step := a.width / float64(runeCount)
+	dotRadius := ascent * 0.06
+	if dotRadius < 0.4 {
+		dotRadius = 0.4
+	}
+	r.pdf.SetLineWidth(0.4)
+	for i := 0; i < runeCount; i++ {
+		mx := cx + step*float64(i) + step/2
+		switch style {
+		case "comma":
+			r.pdf.SetFontSize(ascent * 0.55)
+			r.pdf.SetX(mx - dotRadius)
+			r.pdf.SetY(markY - dotRadius)
+			_ = r.pdf.Cell(nil, "'")
+		case "circle":
+			r.pdf.Oval(mx-dotRadius*1.4, markY-dotRadius*1.4, mx+dotRadius*1.4, markY+dotRadius*1.4)
+		default:
+			// "dot" and "underDot": small filled disc.
+			r.pdf.SetFillColor(0, 0, 0)
+			r.pdf.Oval(mx-dotRadius, markY-dotRadius, mx+dotRadius, markY+dotRadius)
+		}
+	}
+	r.pdf.SetFontSize(r.opts.DefaultFontSize)
+}
+
+// drawUnderline paints an underline below an atom, honoring the OOXML
+// w:u w:val variant the run requested. Most variants map to a dash
+// pattern + line weight at a single Y offset; "double" doubles the line,
+// "wave" approximates a sinusoid as a triangle wave at small amplitude.
+// All other unknown variants fall through to a plain single line so we
+// degrade gracefully on novel attributes.
+func drawUnderline(r *renderer, a atom, cx, baseline float64) {
+	style := a.props.UnderlineStyle
+	if style == "" {
+		style = "single"
+	}
+	ulY := baseline + 1
+	switch style {
+	case "double", "doubleHeavy":
+		w := 0.5
+		if style == "doubleHeavy" {
+			w = 1.0
+		}
+		r.pdf.SetLineWidth(w)
+		r.pdf.Line(cx, ulY-0.5, cx+a.width, ulY-0.5)
+		r.pdf.Line(cx, ulY+0.5, cx+a.width, ulY+0.5)
+	case "thick":
+		r.pdf.SetLineWidth(1.5)
+		r.pdf.Line(cx, ulY, cx+a.width, ulY)
+	case "dotted":
+		drawDashedHLine(r, cx, cx+a.width, ulY, 0.7, 1.2, 0.5)
+	case "dottedHeavy":
+		drawDashedHLine(r, cx, cx+a.width, ulY, 1.0, 1.5, 1.0)
+	case "dash":
+		drawDashedHLine(r, cx, cx+a.width, ulY, 2.5, 1.5, 0.5)
+	case "dashedHeavy":
+		drawDashedHLine(r, cx, cx+a.width, ulY, 3.0, 1.5, 1.0)
+	case "dashLong":
+		drawDashedHLine(r, cx, cx+a.width, ulY, 5.0, 2.0, 0.5)
+	case "dashLongHeavy":
+		drawDashedHLine(r, cx, cx+a.width, ulY, 5.0, 2.0, 1.0)
+	case "dashDotHeavy":
+		drawDashDotHLine(r, cx, cx+a.width, ulY, 1.0)
+	case "dashDotDotHeavy":
+		drawDashDotDotHLine(r, cx, cx+a.width, ulY, 1.0)
+	case "wave", "wavyHeavy", "wavyDouble":
+		w := 0.5
+		if style == "wavyHeavy" {
+			w = 1.0
+		}
+		r.pdf.SetLineWidth(w)
+		drawWaveHLine(r, cx, cx+a.width, ulY, 1.2, 3.0)
+		if style == "wavyDouble" {
+			drawWaveHLine(r, cx, cx+a.width, ulY+1.5, 1.2, 3.0)
+		}
+	case "words":
+		// Underline only word glyphs, not spaces. We're past the atom-
+		// split boundary so this is implicitly the case anyway.
+		r.pdf.SetLineWidth(0.5)
+		r.pdf.Line(cx, ulY, cx+a.width, ulY)
+	default:
+		// "single", "" and anything else: solid line.
+		r.pdf.SetLineWidth(0.5)
+		r.pdf.Line(cx, ulY, cx+a.width, ulY)
+	}
+}
+
+// drawDashedHLine renders a horizontal dashed line of the given dash/gap
+// pattern. Caller is responsible for setting stroke color first.
+func drawDashedHLine(r *renderer, x0, x1, y, dash, gap, width float64) {
+	r.pdf.SetLineWidth(width)
+	step := dash + gap
+	for x := x0; x < x1; x += step {
+		end := x + dash
+		if end > x1 {
+			end = x1
+		}
+		r.pdf.Line(x, y, end, y)
+	}
+}
+
+// drawDashDotHLine: long-dash + dot pattern.
+func drawDashDotHLine(r *renderer, x0, x1, y, width float64) {
+	r.pdf.SetLineWidth(width)
+	for x := x0; x < x1; {
+		end := x + 3.0
+		if end > x1 {
+			end = x1
+		}
+		r.pdf.Line(x, y, end, y)
+		x = end + 1.5
+		if x >= x1 {
+			break
+		}
+		dotEnd := x + 0.5
+		if dotEnd > x1 {
+			dotEnd = x1
+		}
+		r.pdf.Line(x, y, dotEnd, y)
+		x = dotEnd + 1.5
+	}
+}
+
+// drawDashDotDotHLine: long-dash + dot + dot pattern.
+func drawDashDotDotHLine(r *renderer, x0, x1, y, width float64) {
+	r.pdf.SetLineWidth(width)
+	for x := x0; x < x1; {
+		end := x + 3.0
+		if end > x1 {
+			end = x1
+		}
+		r.pdf.Line(x, y, end, y)
+		x = end + 1.2
+		for k := 0; k < 2; k++ {
+			if x >= x1 {
+				break
+			}
+			dotEnd := x + 0.5
+			if dotEnd > x1 {
+				dotEnd = x1
+			}
+			r.pdf.Line(x, y, dotEnd, y)
+			x = dotEnd + 1.2
+		}
+	}
+}
+
+// drawWaveHLine approximates a sine wave as a triangle wave. Period and
+// amplitude are in points; small values look like Word's red-spell-check
+// squiggle without blowing up the PDF stream with thousands of segments.
+func drawWaveHLine(r *renderer, x0, x1, y, amp, period float64) {
+	if period <= 0 {
+		period = 3.0
+	}
+	half := period / 2
+	up := true
+	for x := x0; x < x1; x += half {
+		end := x + half
+		if end > x1 {
+			end = x1
+		}
+		if up {
+			r.pdf.Line(x, y+amp, end, y-amp)
+		} else {
+			r.pdf.Line(x, y-amp, end, y+amp)
+		}
+		up = !up
 	}
 }
 
