@@ -300,6 +300,7 @@ func charSpacingFor(p docx.RunProps, fontSize float64) float64 {
 //	lumOff < 0      → darken (rare; spec allows negative)
 //
 // Special cases:
+//
 //	If both are zero, return the hex unchanged.
 //	Pure grayscale colors (S = 0) keep saturation 0; only L moves.
 func applyLumModOff(hex string, lumMod, lumOff float64) string {

@@ -10,21 +10,21 @@ import (
 // about beyond the placeholder text — type-discriminator plus per-type
 // data (date format, checkbox state, dropdown selection).
 type sdtProps struct {
-	xpath         string
-	xpathPrefix   string // w:prefixMappings — "" if absent, mostly informational
+	xpath       string
+	xpathPrefix string // w:prefixMappings — "" if absent, mostly informational
 	// storeItemID is the GUID from <w:storeItemID>. When non-empty, the
 	// XPath resolver searches only the custom-xml part whose
 	// itemPropsN.xml advertises that same GUID. Without this, a doc
 	// carrying multiple stores with overlapping element names would
 	// silently pull values from the wrong store.
-	storeItemID   string
+	storeItemID string
 	// OpenDoPE annotations carried on <w:tag w:val="…"/>. Format:
 	//   od:xpath=adX1&od:condition=adC1&od:repeat=adR1
 	// Each suffix references an ID in customXml/itemN.xml. The renderer
 	// looks the ID up via opendope.xml's <od:xpaths>.
-	odCondition string
-	odRepeat    string
-	odXpath     string
+	odCondition   string
+	odRepeat      string
+	odXpath       string
 	kind          string // "", "date", "checkbox", "dropdown", "combo", "picture", "richText", "plainText"
 	dateFormat    string
 	dateFullValue string

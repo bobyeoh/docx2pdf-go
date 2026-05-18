@@ -12,27 +12,27 @@ import (
 
 // Document is the top-level parsed result of a .docx file.
 type Document struct {
-	Body         []Block
-	Images       map[string]image.Image    // keyed by rId (relationship id)
-	Hyperlink    map[string]string         // rId → external URL (from rels, TargetMode=External)
+	Body      []Block
+	Images    map[string]image.Image // keyed by rId (relationship id)
+	Hyperlink map[string]string      // rId → external URL (from rels, TargetMode=External)
 	// RelTargets is rId → internal package target (e.g.
 	// "subDocument/sub1.docx", "media/image1.png"). Populated for
 	// every non-external relationship so callers can resolve referents
 	// (subDoc, INCLUDETEXT/INCLUDEPICTURE, hyperlink anchors). External
 	// targets stay in Hyperlink to preserve the existing convention.
-	RelTargets map[string]string
+	RelTargets   map[string]string
 	Defaults     RunProps                  // default run properties from styles.xml docDefaults/rPrDefault
 	ParaDefaults ParaDefaults              // default paragraph properties from styles.xml docDefaults/pPrDefault
 	Styles       map[string]ParagraphStyle // styleId → resolved paragraph style (basedOn already flattened)
 	CharStyles   map[string]RunProps       // styleId → resolved character style (basedOn flattened)
 	LatentStyles LatentStylesInfo          // w:latentStyles + w:lsdException
 
-	PageSize     PageSize                  // from sectPr; falls back to A4
-	Margins      Margins                   // from sectPr; falls back to defaults
-	Numbering    Numbering                 // list definitions from numbering.xml
-	HeaderBlocks []Block                   // default header content; rendered on every page
-	FooterBlocks []Block                   // default footer content; rendered on every page
-	Sections     []Section                 // body split at sectPr boundaries; len>=1
+	PageSize     PageSize  // from sectPr; falls back to A4
+	Margins      Margins   // from sectPr; falls back to defaults
+	Numbering    Numbering // list definitions from numbering.xml
+	HeaderBlocks []Block   // default header content; rendered on every page
+	FooterBlocks []Block   // default footer content; rendered on every page
+	Sections     []Section // body split at sectPr boundaries; len>=1
 	// Footnotes / endnotes keyed by w:id, parsed from word/footnotes.xml and
 	// word/endnotes.xml. The renderer optionally appends a "Footnotes" /
 	// "Endnotes" trailing section at document end so the content survives.
@@ -358,22 +358,22 @@ type Settings struct {
 // decide where n-ary limits go (sub/super vs under/over), and how
 // fractions/breaks are laid out.
 type MathProps struct {
-	MathFont    string // m:mathFont val — default "Cambria Math"
-	BrkBin      string // m:brkBin val (before/after/repeat)
-	BrkBinSub   string // m:brkBinSub val (--/-+/+-)
-	SmallFrac   bool   // m:smallFrac
-	DispDef     bool   // m:dispDef
-	LMargin     int    // m:lMargin (twips)
-	RMargin     int    // m:rMargin (twips)
-	DefJc       string // m:defJc val (left/right/center/centerGroup)
-	WrapIndent  int    // m:wrapIndent (twips)
-	WrapRight   bool   // m:wrapRight
-	IntLim      string // m:intLim val (subSup/undOvr)
-	NaryLim     string // m:naryLim val (subSup/undOvr)
-	PreSp       int    // m:preSp (twips)
-	PostSp      int    // m:postSp (twips)
-	InterSp     int    // m:interSp (twips)
-	IntraSp     int    // m:intraSp (twips)
+	MathFont   string // m:mathFont val — default "Cambria Math"
+	BrkBin     string // m:brkBin val (before/after/repeat)
+	BrkBinSub  string // m:brkBinSub val (--/-+/+-)
+	SmallFrac  bool   // m:smallFrac
+	DispDef    bool   // m:dispDef
+	LMargin    int    // m:lMargin (twips)
+	RMargin    int    // m:rMargin (twips)
+	DefJc      string // m:defJc val (left/right/center/centerGroup)
+	WrapIndent int    // m:wrapIndent (twips)
+	WrapRight  bool   // m:wrapRight
+	IntLim     string // m:intLim val (subSup/undOvr)
+	NaryLim    string // m:naryLim val (subSup/undOvr)
+	PreSp      int    // m:preSp (twips)
+	PostSp     int    // m:postSp (twips)
+	InterSp    int    // m:interSp (twips)
+	IntraSp    int    // m:intraSp (twips)
 }
 
 // RevisionView mirrors w:revisionView in settings.xml. Each flag tells the
@@ -381,11 +381,11 @@ type MathProps struct {
 // inverted booleans (the attribute defaults to 0, meaning "show"), so the
 // parser converts to positive booleans for consumer ergonomics.
 type RevisionView struct {
-	Markup          bool // markup balloons / change bars
-	Comments        bool
-	InsDel          bool // insertions/deletions
-	Formatting      bool // formatting changes (w:rPrChange/w:pPrChange)
-	InkAnnotations  bool
+	Markup         bool // markup balloons / change bars
+	Comments       bool
+	InsDel         bool // insertions/deletions
+	Formatting     bool // formatting changes (w:rPrChange/w:pPrChange)
+	InkAnnotations bool
 }
 
 // CompatOptions mirrors the most consequential w:compat children. Each
@@ -393,17 +393,17 @@ type RevisionView struct {
 // from "explicitly false". We surface only options that affect rendering;
 // the long tail of revisionable knobs (printerMetrics, etc.) is ignored.
 type CompatOptions struct {
-	DoNotExpandShiftReturn       *bool
+	DoNotExpandShiftReturn            *bool
 	UseSingleBorderForContiguousCells *bool
-	GrowAutofit                  *bool
-	NoLeading                    *bool
-	SpacingInWholePoints         *bool
-	BalanceSingleByteDoubleByteWidth *bool
-	DoNotUseEastAsianBreakRules  *bool
-	SuppressTopSpacing           *bool
-	UlTrailSpace                 *bool
-	DoNotLeaveBackslashAlone     *bool
-	UseFELayout                  *bool
+	GrowAutofit                       *bool
+	NoLeading                         *bool
+	SpacingInWholePoints              *bool
+	BalanceSingleByteDoubleByteWidth  *bool
+	DoNotUseEastAsianBreakRules       *bool
+	SuppressTopSpacing                *bool
+	UlTrailSpace                      *bool
+	DoNotLeaveBackslashAlone          *bool
+	UseFELayout                       *bool
 	// SpaceForUL: pad underline runs with a trailing space's width so the
 	// underline appears uniform (Word 6 / 95 compatibility quirk).
 	SpaceForUL *bool
@@ -857,7 +857,7 @@ type Run struct {
 	// the user hovers the link. PDF has no native tooltip surface, but
 	// we preserve the metadata so AST consumers can introspect it.
 	LinkTooltip string
-	Bookmark   string // when set, this is a marker placing a named anchor here
+	Bookmark    string // when set, this is a marker placing a named anchor here
 	// Explicit image size in points (from wp:extent in EMU). Zero means
 	// "use the image's native dimensions scaled to content width if too big."
 	ImageWidthPt, ImageHeightPt float64
@@ -892,7 +892,7 @@ type Run struct {
 	// simplePos="1" — legacy Word 2003 positioning where the anchor's
 	// x/y are absolute EMUs from the page top-left. Non-zero
 	// AnchorSimplePosUsed flips the renderer onto that placement path.
-	AnchorSimplePosUsed                bool
+	AnchorSimplePosUsed                    bool
 	AnchorSimplePosXPt, AnchorSimplePosYPt float64
 	// FootnoteID, when non-empty, tags this run as a footnote / endnote
 	// reference site. The visible Text is still drawn (typically as a
@@ -1052,11 +1052,11 @@ type ChartData struct {
 // DataLabelOptions mirrors c:dLbls children that toggle per-point label
 // visibility. ECMA-376 §21.2.2.61.
 type DataLabelOptions struct {
-	ShowVal      bool
-	ShowCatName  bool
-	ShowSerName  bool
-	ShowPercent  bool
-	ShowLegendKey bool
+	ShowVal        bool
+	ShowCatName    bool
+	ShowSerName    bool
+	ShowPercent    bool
+	ShowLegendKey  bool
 	ShowBubbleSize bool
 }
 
@@ -1273,9 +1273,9 @@ type FormFieldInfo struct {
 
 // RunProps captures character-level formatting we honor.
 type RunProps struct {
-	Bold       bool
-	Italic     bool
-	Underline  bool
+	Bold      bool
+	Italic    bool
+	Underline bool
 	// UnderlineStyle captures w:u w:val when set. Empty falls back to
 	// "single" (the default single solid line). Renderer honors:
 	// "single" / "double" / "dotted" / "dottedHeavy" / "dash" /
@@ -1284,7 +1284,7 @@ type RunProps struct {
 	UnderlineStyle string
 	Strike         bool // w:strike — single-line strikethrough
 	// DStrike is w:dstrike — double strikethrough.
-	DStrike bool
+	DStrike    bool
 	Caps       bool    // w:caps — render as uppercase
 	SmallCaps  bool    // w:smallCaps — lowercase rendered as small upper-case
 	FontSize   float64 // half-points in docx; we store points
@@ -1488,7 +1488,7 @@ type Table struct {
 // "editors" / "owners" or the literal w:ed user/group name. The
 // renderer ignores this — purely metadata for AST consumers.
 type PermissionRange struct {
-	ID         string
+	ID          string
 	EditorGroup string // w:edGrp
 	Editor      string // w:ed
 }

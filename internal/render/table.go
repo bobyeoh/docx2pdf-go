@@ -1681,4 +1681,3 @@ func (r *renderer) measureAtomsHeight(atoms []atom, innerW float64) float64 {
 	}
 	return h
 }
-

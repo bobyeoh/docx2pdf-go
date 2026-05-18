@@ -242,7 +242,6 @@ func mathMod(x, m float64) float64 {
 	return x
 }
 
-
 // adjustLum applies bright + contrast (each in [-1, 1]) to a single
 // channel triple. Bright shifts; contrast scales around 0.5.
 func adjustLum(r, g, b uint8, bright, contrast float64) (uint8, uint8, uint8) {

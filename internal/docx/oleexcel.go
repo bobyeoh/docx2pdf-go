@@ -176,8 +176,8 @@ func parseExcelSheet(f *zip.File, shared []string, maxRows, maxCols int) ([][]st
 				if !inSheet {
 					continue
 				}
-				ref := attr(t, "r")        // e.g. "B7"
-				typ := attr(t, "t")        // s = shared string, b = bool, str = formula-string
+				ref := attr(t, "r") // e.g. "B7"
+				typ := attr(t, "t") // s = shared string, b = bool, str = formula-string
 				colIdx := colIndexFromRef(ref, curColIdx)
 				// Read <v> or <is> inline.
 				var raw string

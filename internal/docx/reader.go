@@ -1163,31 +1163,31 @@ type xmlStyles struct {
 }
 
 type xmlLatentStyles struct {
-	DefLockedState    string                `xml:"defLockedState,attr"`
-	DefUIPriority     string                `xml:"defUIPriority,attr"`
-	DefSemiHidden     string                `xml:"defSemiHidden,attr"`
-	DefUnhideWhenUsed string                `xml:"defUnhideWhenUsed,attr"`
-	DefQFormat        string                `xml:"defQFormat,attr"`
-	Count             string                `xml:"count,attr"`
-	Exceptions        []xmlLsdException     `xml:"lsdException"`
+	DefLockedState    string            `xml:"defLockedState,attr"`
+	DefUIPriority     string            `xml:"defUIPriority,attr"`
+	DefSemiHidden     string            `xml:"defSemiHidden,attr"`
+	DefUnhideWhenUsed string            `xml:"defUnhideWhenUsed,attr"`
+	DefQFormat        string            `xml:"defQFormat,attr"`
+	Count             string            `xml:"count,attr"`
+	Exceptions        []xmlLsdException `xml:"lsdException"`
 }
 
 type xmlLsdException struct {
-	Name            string `xml:"name,attr"`
-	UIPriority      string `xml:"uiPriority,attr"`
-	SemiHidden      string `xml:"semiHidden,attr"`
-	UnhideWhenUsed  string `xml:"unhideWhenUsed,attr"`
-	QFormat         string `xml:"qFormat,attr"`
-	Locked          string `xml:"locked,attr"`
-	PrimaryStyle    string `xml:"primaryStyle,attr"`
+	Name           string `xml:"name,attr"`
+	UIPriority     string `xml:"uiPriority,attr"`
+	SemiHidden     string `xml:"semiHidden,attr"`
+	UnhideWhenUsed string `xml:"unhideWhenUsed,attr"`
+	QFormat        string `xml:"qFormat,attr"`
+	Locked         string `xml:"locked,attr"`
+	PrimaryStyle   string `xml:"primaryStyle,attr"`
 }
 
 type xmlStyle struct {
-	Type         string `xml:"type,attr"`
-	StyleID      string `xml:"styleId,attr"`
-	Default      string `xml:"default,attr"`
-	CustomStyle  string `xml:"customStyle,attr"`
-	Name         *struct {
+	Type        string `xml:"type,attr"`
+	StyleID     string `xml:"styleId,attr"`
+	Default     string `xml:"default,attr"`
+	CustomStyle string `xml:"customStyle,attr"`
+	Name        *struct {
 		Val string `xml:"val,attr"`
 	} `xml:"name"`
 	Aliases *struct {
@@ -1205,14 +1205,14 @@ type xmlStyle struct {
 	UIPriority *struct {
 		Val string `xml:"val,attr"`
 	} `xml:"uiPriority"`
-	Hidden         *struct{} `xml:"hidden"`
-	SemiHidden     *struct{} `xml:"semiHidden"`
-	UnhideWhenUsed *struct{} `xml:"unhideWhenUsed"`
-	QFormat        *struct{} `xml:"qFormat"`
-	Locked         *struct{} `xml:"locked"`
-	PPr   *xmlStylePPr   `xml:"pPr"`
-	RPr   *xmlRPr        `xml:"rPr"`
-	TblPr *xmlStyleTblPr `xml:"tblPr"`
+	Hidden         *struct{}      `xml:"hidden"`
+	SemiHidden     *struct{}      `xml:"semiHidden"`
+	UnhideWhenUsed *struct{}      `xml:"unhideWhenUsed"`
+	QFormat        *struct{}      `xml:"qFormat"`
+	Locked         *struct{}      `xml:"locked"`
+	PPr            *xmlStylePPr   `xml:"pPr"`
+	RPr            *xmlRPr        `xml:"rPr"`
+	TblPr          *xmlStyleTblPr `xml:"tblPr"`
 }
 
 // xmlStyleTblPr captures the table-level properties a w:style of
@@ -2294,18 +2294,18 @@ type xmlRPr struct {
 	// consumes it is laid out.
 	SpecVanish *struct{}   `xml:"specVanish"`
 	WebHidden  *struct{}   `xml:"webHidden"`
-	NoProof   *struct{}   `xml:"noProof"`
-	CS        *struct{}   `xml:"cs"`  // complex-script run
-	RTL       *struct{}   `xml:"rtl"` // right-to-left
-	Emboss    *struct{}   `xml:"emboss"`
-	Imprint   *struct{}   `xml:"imprint"`
-	Outline   *struct{}   `xml:"outline"`
-	Em        *xmlValAttr `xml:"em"`     // CJK emphasis mark
-	Effect    *xmlValAttr `xml:"effect"` // animation effect
-	Sz        *xmlValAttr `xml:"sz"`     // half-points
-	SzCs      *xmlValAttr `xml:"szCs"`
-	Kern      *xmlValAttr `xml:"kern"` // half-points threshold
-	Color     *struct {
+	NoProof    *struct{}   `xml:"noProof"`
+	CS         *struct{}   `xml:"cs"`  // complex-script run
+	RTL        *struct{}   `xml:"rtl"` // right-to-left
+	Emboss     *struct{}   `xml:"emboss"`
+	Imprint    *struct{}   `xml:"imprint"`
+	Outline    *struct{}   `xml:"outline"`
+	Em         *xmlValAttr `xml:"em"`     // CJK emphasis mark
+	Effect     *xmlValAttr `xml:"effect"` // animation effect
+	Sz         *xmlValAttr `xml:"sz"`     // half-points
+	SzCs       *xmlValAttr `xml:"szCs"`
+	Kern       *xmlValAttr `xml:"kern"` // half-points threshold
+	Color      *struct {
 		Val        string `xml:"val,attr"`
 		ThemeColor string `xml:"themeColor,attr"`
 		ThemeShade string `xml:"themeShade,attr"` // hex 00-FF: darken (lumMod = hex/255)
@@ -3824,29 +3824,29 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 						atoms = append(atoms, Run{IsBreak: true, Props: rp})
 					}
 					atoms = append(atoms, Run{
-						ImageID:                di.RID,
-						ImageWidthPt:           di.WPt,
-						ImageHeightPt:          di.HPt,
-						ImageRotationDeg:       di.RotationDeg,
-						ImageFlipH:             di.FlipH,
-						ImageFlipV:             di.FlipV,
-						CropTopPct:             di.CropT,
-						CropBottomPct:          di.CropB,
-						CropLeftPct:            di.CropL,
-						CropRightPct:           di.CropR,
-						ImageEffects:           di.ImageEffects,
-						ImageAnchored:          di.IsAnchor,
-						AnchorAlignH:           di.PosH.Align,
-						AnchorAlignV:           di.PosV.Align,
-						AnchorOffsetXPt:        di.PosH.OffsetPt(),
-						AnchorOffsetYPt:        di.PosV.OffsetPt(),
-						AnchorWrap:             di.WrapType,
-						AnchorWrapPolygon:      di.WrapPolygon,
-						AnchorSimplePosUsed:    di.SimplePosUsed,
-						AnchorSimplePosXPt:     di.SimplePosXPt,
-						AnchorSimplePosYPt:     di.SimplePosYPt,
-						AltText:                di.AltText,
-						Props:                  rp,
+						ImageID:             di.RID,
+						ImageWidthPt:        di.WPt,
+						ImageHeightPt:       di.HPt,
+						ImageRotationDeg:    di.RotationDeg,
+						ImageFlipH:          di.FlipH,
+						ImageFlipV:          di.FlipV,
+						CropTopPct:          di.CropT,
+						CropBottomPct:       di.CropB,
+						CropLeftPct:         di.CropL,
+						CropRightPct:        di.CropR,
+						ImageEffects:        di.ImageEffects,
+						ImageAnchored:       di.IsAnchor,
+						AnchorAlignH:        di.PosH.Align,
+						AnchorAlignV:        di.PosV.Align,
+						AnchorOffsetXPt:     di.PosH.OffsetPt(),
+						AnchorOffsetYPt:     di.PosV.OffsetPt(),
+						AnchorWrap:          di.WrapType,
+						AnchorWrapPolygon:   di.WrapPolygon,
+						AnchorSimplePosUsed: di.SimplePosUsed,
+						AnchorSimplePosXPt:  di.SimplePosXPt,
+						AnchorSimplePosYPt:  di.SimplePosYPt,
+						AltText:             di.AltText,
+						Props:               rp,
 					})
 				} else if di.IsGroup && di.GroupChildShapeCount > 1 && di.ShapePrst == "" && di.CustPath == "" {
 					// Group drawing whose children were heterogeneous enough
@@ -3914,19 +3914,19 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 						sh.HeightPt = 48
 					}
 					atoms = append(atoms, Run{
-						VMLShape:               sh,
-						AltText:                di.AltText,
-						ImageAnchored:          di.IsAnchor,
-						AnchorAlignH:           di.PosH.Align,
-						AnchorAlignV:           di.PosV.Align,
-						AnchorOffsetXPt:        di.PosH.OffsetPt(),
-						AnchorOffsetYPt:        di.PosV.OffsetPt(),
-						AnchorWrap:             di.WrapType,
-						AnchorWrapPolygon:      di.WrapPolygon,
-						AnchorSimplePosUsed:    di.SimplePosUsed,
-						AnchorSimplePosXPt:     di.SimplePosXPt,
-						AnchorSimplePosYPt:     di.SimplePosYPt,
-						Props:                  rp,
+						VMLShape:            sh,
+						AltText:             di.AltText,
+						ImageAnchored:       di.IsAnchor,
+						AnchorAlignH:        di.PosH.Align,
+						AnchorAlignV:        di.PosV.Align,
+						AnchorOffsetXPt:     di.PosH.OffsetPt(),
+						AnchorOffsetYPt:     di.PosV.OffsetPt(),
+						AnchorWrap:          di.WrapType,
+						AnchorWrapPolygon:   di.WrapPolygon,
+						AnchorSimplePosUsed: di.SimplePosUsed,
+						AnchorSimplePosXPt:  di.SimplePosXPt,
+						AnchorSimplePosYPt:  di.SimplePosYPt,
+						Props:               rp,
 					})
 					// Done — text-box content is carried by the shape
 					// itself, no separate inline italic dump needed.
@@ -4301,8 +4301,8 @@ type drawingInfo struct {
 	ShapePrst string
 	// ShapeFill / ShapeStroke / ShapeStrokeWeightPt are scraped from
 	// <a:spPr><a:solidFill>/<a:ln>.
-	ShapeFill          string
-	ShapeStroke        string
+	ShapeFill           string
+	ShapeStroke         string
 	ShapeStrokeWeightPt float64
 	// ShapeHeadEnd / ShapeTailEnd carry the <a:headEnd type="..."/> and
 	// <a:tailEnd type="..."/> values when the line declares arrows.
@@ -5142,12 +5142,12 @@ func parseLineProps(dec *xml.Decoder, start xml.StartElement, theme Theme) (colo
 // arrow types, dash style, line cap and compound. Used by shape renderers
 // to translate OOXML stroke semantics to PDF graphics state.
 type LineProps struct {
-	Color       string
-	HeadEnd     string // none/triangle/stealth/diamond/oval/arrow
-	TailEnd     string
-	DashStyle   string // prstDash w:val: solid/dash/dashDot/lgDash/lgDashDot/lgDashDotDot/sysDash/sysDashDot/sysDashDotDot/sysDot/dot
-	CapStyle    string // a:ln@cap: flat/rnd/sq
-	CompoundLn  string // a:ln@cmpd: sng/dbl/thickThin/thinThick/tri
+	Color      string
+	HeadEnd    string // none/triangle/stealth/diamond/oval/arrow
+	TailEnd    string
+	DashStyle  string // prstDash w:val: solid/dash/dashDot/lgDash/lgDashDot/lgDashDotDot/sysDash/sysDashDot/sysDashDotDot/sysDot/dot
+	CapStyle   string // a:ln@cap: flat/rnd/sq
+	CompoundLn string // a:ln@cmpd: sng/dbl/thickThin/thinThick/tri
 }
 
 // parseLinePropsExt is the modern entry point; parseLineProps is kept as

@@ -11,25 +11,25 @@ import (
 // the consumer is meant to honor the first Choice all of whose prefixes
 // it can handle. We map prefix → bool so the test is a fast lookup.
 var supportedMCNamespacePrefixes = map[string]bool{
-	"w14":  true, // Word 2010 extensions (3D text, ligatures, ...)
-	"w15":  true, // Word 2013 extensions (paragraph IDs, ...)
-	"w16":  true, // Word 2019 / Office 365 extensions
-	"w16cid": true,
-	"w16se":  true,
-	"w16cex": true,
+	"w14":      true, // Word 2010 extensions (3D text, ligatures, ...)
+	"w15":      true, // Word 2013 extensions (paragraph IDs, ...)
+	"w16":      true, // Word 2019 / Office 365 extensions
+	"w16cid":   true,
+	"w16se":    true,
+	"w16cex":   true,
 	"w16sdtdh": true,
-	"wp14": true, // DrawingML wordprocessing 2010
-	"wp":   true, // DrawingML wordprocessing baseline
-	"wps":  true, // WordprocessingShape (2010+)
-	"wpg":  true, // WordprocessingGroup (2010+)
-	"wpc":  true, // WordprocessingCanvas
-	"wpi":  true, // WordprocessingInkAnnotation (we placeholder-render ink)
-	"v":    true, // VML (legacy)
-	"o":    true, // Office VML
-	"a":    true, // DrawingML core
-	"r":    true, // Relationships
-	"m":    true, // OMML math
-	"pic":  true,
+	"wp14":     true, // DrawingML wordprocessing 2010
+	"wp":       true, // DrawingML wordprocessing baseline
+	"wps":      true, // WordprocessingShape (2010+)
+	"wpg":      true, // WordprocessingGroup (2010+)
+	"wpc":      true, // WordprocessingCanvas
+	"wpi":      true, // WordprocessingInkAnnotation (we placeholder-render ink)
+	"v":        true, // VML (legacy)
+	"o":        true, // Office VML
+	"a":        true, // DrawingML core
+	"r":        true, // Relationships
+	"m":        true, // OMML math
+	"pic":      true,
 }
 
 // requiresSupported returns true if every namespace prefix the

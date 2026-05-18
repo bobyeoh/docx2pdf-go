@@ -113,12 +113,12 @@ type MathNode struct {
 	//   StyleBI  → m:sty val=bi (bold-italic)
 	//   StyleP   → m:sty val=p  (plain — same effect as Nor)
 	//   Script   → m:scr val=roman | script | fraktur | sansSerif | monospace | doubleStruck
-	Nor      bool
-	StyleB   bool
-	StyleI   bool
-	StyleBI  bool
-	StyleP   bool
-	Script   string
+	Nor     bool
+	StyleB  bool
+	StyleI  bool
+	StyleBI bool
+	StyleP  bool
+	Script  string
 	// Align is the display-block alignment hint from m:oMathParaPr/m:jc on
 	// an oMathPara wrapper: "" (Word default — center), "left", "center",
 	// "right", "centerGroup". Only meaningful on the root node when its

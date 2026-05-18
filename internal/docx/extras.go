@@ -1140,7 +1140,6 @@ func matchSuffixWithPredicates(stack []xpathFrame, steps []xpathStep) bool {
 	return true
 }
 
-
 // parseGradFill parses a DrawingML <a:gradFill> element into a list of
 // color stops, the gradient angle (in degrees), and a kind ("linear" or
 // "radial"). The XML schema is:

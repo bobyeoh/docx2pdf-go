@@ -541,7 +541,7 @@ func flattenFields(runs []docx.Run, vars fieldVars) []docx.Run {
 		// never auto-update (frozen page numbers in printable forms,
 		// stamped dates).
 		lockResult bool
-		formField   *docx.FormFieldInfo
+		formField  *docx.FormFieldInfo
 	}
 	var stack []*frame
 	top := func() *frame {

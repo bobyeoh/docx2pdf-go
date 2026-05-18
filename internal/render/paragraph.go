@@ -644,7 +644,6 @@ func bahtText(n int) string {
 	return b.String()
 }
 
-
 // zodiacLabel returns the Chinese 12-animal zodiac character for n.
 // Traditional adds a tick when the cycle wraps past 12.
 func zodiacLabel(n int, traditional bool) string {

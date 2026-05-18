@@ -6,10 +6,10 @@ import (
 
 func TestParseOpenDoPETag(t *testing.T) {
 	cases := []struct {
-		in              string
-		wantCond        string
-		wantRepeat      string
-		wantXpath       string
+		in         string
+		wantCond   string
+		wantRepeat string
+		wantXpath  string
 	}{
 		{"od:xpath=adX1", "", "", "adX1"},
 		{"od:condition=adC1&od:xpath=adX2", "adC1", "", "adX2"},

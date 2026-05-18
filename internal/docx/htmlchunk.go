@@ -219,11 +219,11 @@ type htmlBuilder struct {
 	inPara   bool
 
 	// Per-paragraph state.
-	heading int // 1..6 when inside h1..h6
-	listLvl int // 0 = no list, 1+ = nesting depth
-	listKind []string
+	heading   int // 1..6 when inside h1..h6
+	listLvl   int // 0 = no list, 1+ = nesting depth
+	listKind  []string
 	listIndex []int
-	linkURL string
+	linkURL   string
 }
 
 func (b *htmlBuilder) pushProps() {
