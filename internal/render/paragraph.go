@@ -45,6 +45,14 @@ func (r *renderer) drawParagraph(p docx.Paragraph) error {
 	// chapter".
 	if title := headingTitle(p); title != "" {
 		r.pdf.AddOutline(title)
+		// TOC discovery hook: when the renderer is running its
+		// first pass via renderWithTOC, this callback records the
+		// page number each heading lands on so we can populate the
+		// auto-generated TOC entries with live page numbers on the
+		// second pass. Nil in the normal render path.
+		if r.opts.onHeadingPage != nil {
+			r.opts.onHeadingPage(title, p.StyleID, r.pdf.GetNumberOfPages())
+		}
 	}
 	// RTL paragraph state: drives rune-reversal inside RTL word atoms and
 	// line-internal atom reversal at flush time. Set before runsToAtoms so

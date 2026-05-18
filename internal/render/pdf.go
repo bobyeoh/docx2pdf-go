@@ -50,6 +50,12 @@ type Options struct {
 	// directly. Public users get cancellation via convert.ConvertContext.
 	ctx context.Context
 
+	// onHeadingPage is set internally during the TOC discovery render
+	// (see toc.go). drawParagraph invokes it for every heading-styled
+	// paragraph with the page number that paragraph landed on. Nil in
+	// the normal render path.
+	onHeadingPage func(title, styleID string, page int)
+
 	// FontRegular is the path to the TTF used for normal text. When
 	// empty, resolution order is: $DOCX2PDF_FONT env var, then a list
 	// of common system-font locations (Arial / Helvetica on macOS,
@@ -115,7 +121,23 @@ func Render(doc *docx.Document, outPath string, opts Options) error {
 }
 
 // RenderWriter is the streaming variant — writes the produced PDF to w.
+//
+// When the document carries a TOC field, RenderWriter routes through
+// the two-pass orchestrator in toc.go so the auto-generated table of
+// contents picks up real page numbers from a discovery render. The
+// normal single-pass path runs otherwise.
 func RenderWriter(doc *docx.Document, w io.Writer, opts Options) error {
+	if hasTOCField(doc) {
+		return renderWithTOC(doc, w, opts)
+	}
+	return renderImpl(doc, w, opts)
+}
+
+// renderImpl is the single-pass render loop. RenderWriter calls it
+// directly when no TOC discovery is needed; renderWithTOC in toc.go
+// calls it twice (a discard pass with an onHeadingPage callback set,
+// then the final pass with the populated TOC blocks spliced in).
+func renderImpl(doc *docx.Document, w io.Writer, opts Options) error {
 	// Pull in fonts the document embeds in word/fontTable.xml so that
 	// branded/specialty faces render even on hosts that don't have
 	// them installed. Runs before the env / system-font fallback so

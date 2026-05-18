@@ -246,6 +246,7 @@ func allCases() []verifyCase {
 		caseSdtInTableCell(),
 		caseInlineMath(),
 		caseDisplayMath(),
+		caseTOCAutoGenerate(),
 		caseFldSimplePage(),
 		caseRTLParagraph(),
 		caseTextBoxContent(),
@@ -3922,6 +3923,65 @@ func caseDisplayMath() verifyCase {
 			}
 			if !(b < e && e < a) {
 				fail("expected before<equation<after, got %d %d %d", b, e, a)
+			}
+		},
+	}
+}
+
+// caseTOCAutoGenerate covers the two-pass TOC orchestration. A doc
+// containing a TOC field with NO cached body (empty between sep and
+// end) should auto-generate entries from the document's headings,
+// with live page numbers from the discovery render. We use a styled
+// heading on its own page followed by another so the page numbers
+// are deterministic (page 1 for TOC, page 2 for Heading One, etc.).
+func caseTOCAutoGenerate() verifyCase {
+	return verifyCase{
+		name:        "120a_toc_auto",
+		description: "Empty TOC field auto-generates entries from headings with live page numbers",
+		build: func(t *testing.T, dir string) string {
+			body := `
+    <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Table of Contents</w:t></w:r></w:p>
+    <w:p>
+      <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+      <w:r><w:instrText xml:space="preserve"> TOC \o "1-3" \h \z </w:instrText></w:r>
+      <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+      <w:r><w:fldChar w:fldCharType="end"/></w:r>
+    </w:p>
+    <w:p><w:r><w:br w:type="page"/></w:r></w:p>
+    <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Chapter One</w:t></w:r></w:p>
+    <w:p><w:r><w:t>Body of chapter one.</w:t></w:r></w:p>
+    <w:p><w:pPr><w:pStyle w:val="Heading2"/></w:pPr>
+      <w:r><w:t>Subsection 1.1</w:t></w:r></w:p>
+    <w:p><w:r><w:t>More content.</w:t></w:r></w:p>
+    <w:p><w:r><w:br w:type="page"/></w:r></w:p>
+    <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Chapter Two</w:t></w:r></w:p>
+    <w:p><w:r><w:t>Final chapter content.</w:t></w:r></w:p>`
+			return newDocx().Body(body).Write(t, dir)
+		},
+		expectText: []string{
+			"Chapter One",
+			"Subsection 1.1",
+			"Chapter Two",
+		},
+		custom: func(t *testing.T, pdf string, fail func(format string, args ...any)) {
+			// The first page should contain the TOC with dot-leader
+			// entries for the three headings.
+			txt := pdftotext(t, pdf)
+			// All three heading titles must appear as TOC entries
+			// AND as their actual chapter headings — so each title
+			// should be present at least twice in the extracted text.
+			for _, title := range []string{"Chapter One", "Subsection 1.1", "Chapter Two"} {
+				if strings.Count(txt, title) < 2 {
+					fail("expected %q in both TOC and body, got %d occurrence(s):\n%s",
+						title, strings.Count(txt, title), txt)
+				}
+			}
+			// TOC dot-leader is the visual hallmark of an entry.
+			if !strings.Contains(txt, "...") {
+				fail("expected dot leaders in TOC, got:\n%s", txt)
 			}
 		},
 	}
