@@ -87,6 +87,12 @@ func (r *renderer) stampPageDecorations(sections []docx.Section, sectionPageStar
 			author:      savedFields.author,
 			title:       savedFields.title,
 			subject:     savedFields.subject,
+			docProps:    savedFields.docProps,
+			docVars:     savedFields.docVars,
+			created:     savedFields.created,
+			modified:    savedFields.modified,
+			lastPrinted: savedFields.lastPrinted,
+			totalTime:   savedFields.totalTime,
 			seqCounters: savedFields.seqCounters,
 			bookmarks:   savedFields.bookmarks,
 		}

@@ -6,7 +6,10 @@
 // but stays narrow enough to keep in one head.
 package docx
 
-import "image"
+import (
+	"image"
+	"time"
+)
 
 // Document is the top-level parsed result of a .docx file.
 type Document struct {
@@ -123,20 +126,44 @@ type Settings struct {
 	// switch for w:background (page color). When absent, Word does NOT
 	// paint the background even if a color is defined.
 	DisplayBackgroundShape bool
+	// DocVars mirrors w:docVars / w:docVar entries — string variables
+	// referenced by DOCVARIABLE fields. Keys are stored case-insensitive
+	// (lower-cased) so DOCVARIABLE lookup can be case-insensitive too.
+	DocVars map[string]string
 }
 
 // Properties mirrors a slice of word/docProps/core.xml + app.xml. Word/Office
 // computes some counts (Pages/Words/Characters) and saves them into app.xml;
-// we surface them for the PDF /Info dictionary.
+// we surface them for the PDF /Info dictionary and for the DOCPROPERTY /
+// MERGEFIELD / SAVEDATE / etc. field codes that look them up by name.
 type Properties struct {
-	Title      string
-	Author     string
-	Subject    string
-	Company    string
-	Pages      int
-	Words      int
-	Characters int
-	Lines      int
+	// core.xml — dc:title / dc:creator / dc:subject / dc:description /
+	// cp:keywords / cp:category / cp:lastModifiedBy / cp:revision; and
+	// the three timestamps dc:created / dc:modified / cp:lastPrinted.
+	// Description maps to Word's "Comments" doc property.
+	Title          string
+	Author         string
+	Subject        string
+	Description    string // = "Comments" doc-property
+	Keywords       string
+	Category       string
+	LastModifiedBy string
+	Revision       string
+	Created        time.Time
+	Modified       time.Time
+	LastPrinted    time.Time
+
+	// app.xml — Company / Manager / Application; TotalTime is edit
+	// minutes used by EDITTIME. Page/Word/Char/Line counts are Word's
+	// last-save snapshot.
+	Company     string
+	Manager     string
+	Application string
+	TotalTime   int // minutes
+	Pages       int
+	Words       int
+	Characters  int
+	Lines       int
 }
 
 // ChartData is the structured form of a c:chartSpace part. The

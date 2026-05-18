@@ -12,6 +12,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Open reads and parses a .docx file at path. It is a thin wrapper around
@@ -362,8 +363,12 @@ func decodeFontScheme(dec *xml.Decoder, start xml.StartElement, theme *Theme) er
 	}
 }
 
-// parseCoreProps pulls Title/Author/Subject out of docProps/core.xml. The
-// schema has cp:coreProperties with dc:title, dc:creator, dc:subject children.
+// parseCoreProps pulls Title/Author/Subject/Description/Keywords/Category
+// /LastModifiedBy/Revision plus the three Created/Modified/LastPrinted
+// timestamps out of docProps/core.xml. The schema is cp:coreProperties
+// with mixed dc:/cp:/dcterms: children. Timestamps are W3CDTF
+// (RFC 3339-ish) so time.Parse handles them via the time.RFC3339 layout
+// with a fallback to a date-only layout.
 func parseCoreProps(f *zip.File, p *Properties) error {
 	rc, err := openZipFile(f)
 	if err != nil {
@@ -397,8 +402,60 @@ func parseCoreProps(f *zip.File, p *Properties) error {
 			if err := dec.DecodeElement(&s, &se); err == nil {
 				p.Subject = s
 			}
+		case "description":
+			if err := dec.DecodeElement(&s, &se); err == nil {
+				p.Description = s
+			}
+		case "keywords":
+			if err := dec.DecodeElement(&s, &se); err == nil {
+				p.Keywords = s
+			}
+		case "category":
+			if err := dec.DecodeElement(&s, &se); err == nil {
+				p.Category = s
+			}
+		case "lastModifiedBy":
+			if err := dec.DecodeElement(&s, &se); err == nil {
+				p.LastModifiedBy = s
+			}
+		case "revision":
+			if err := dec.DecodeElement(&s, &se); err == nil {
+				p.Revision = s
+			}
+		case "created":
+			if err := dec.DecodeElement(&s, &se); err == nil {
+				p.Created = parseCorePropsDate(s)
+			}
+		case "modified":
+			if err := dec.DecodeElement(&s, &se); err == nil {
+				p.Modified = parseCorePropsDate(s)
+			}
+		case "lastPrinted":
+			if err := dec.DecodeElement(&s, &se); err == nil {
+				p.LastPrinted = parseCorePropsDate(s)
+			}
 		}
 	}
+}
+
+// parseCorePropsDate parses a W3CDTF / RFC3339 timestamp from
+// docProps/core.xml. Returns the zero time on parse failure — callers
+// then suppress the field rather than emit garbage.
+func parseCorePropsDate(s string) time.Time {
+	if s == "" {
+		return time.Time{}
+	}
+	for _, layout := range []string{
+		time.RFC3339,
+		"2006-01-02T15:04:05Z",
+		"2006-01-02T15:04:05",
+		"2006-01-02",
+	} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
 }
 
 // parseAppProps reads docProps/app.xml — extended Office properties. We pull
@@ -427,6 +484,20 @@ func parseAppProps(f *zip.File, p *Properties) error {
 		case "Company":
 			if err := dec.DecodeElement(&s, &se); err == nil {
 				p.Company = s
+			}
+		case "Manager":
+			if err := dec.DecodeElement(&s, &se); err == nil {
+				p.Manager = s
+			}
+		case "Application":
+			if err := dec.DecodeElement(&s, &se); err == nil {
+				p.Application = s
+			}
+		case "TotalTime":
+			if err := dec.DecodeElement(&s, &se); err == nil {
+				if x, err := strconv.Atoi(s); err == nil {
+					p.TotalTime = x
+				}
 			}
 		case "Pages":
 			if err := dec.DecodeElement(&s, &se); err == nil {
@@ -490,6 +561,20 @@ func parseSettings(f *zip.File, s *Settings) error {
 				if x, err := strconv.Atoi(v); err == nil && x > 0 {
 					s.DefaultTabStopTwips = x
 				}
+			}
+			_ = dec.Skip()
+		case "docVar":
+			// w:docVar w:name="x" w:val="y" — can appear directly under
+			// w:settings (older docs) or nested in w:docVars. The XML
+			// decoder visits both forms equivalently as long as we just
+			// react to docVar StartElements.
+			name := attr(se, "name")
+			val := attr(se, "val")
+			if name != "" {
+				if s.DocVars == nil {
+					s.DocVars = map[string]string{}
+				}
+				s.DocVars[strings.ToLower(name)] = val
 			}
 			_ = dec.Skip()
 		}

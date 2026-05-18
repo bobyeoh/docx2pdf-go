@@ -143,18 +143,19 @@ func TestFlattenFields_PageSubstitution(t *testing.T) {
 }
 
 func TestFlattenFields_UnknownFallsThrough(t *testing.T) {
-	// MERGEFIELD isn't in our handler — cached result should pass through
-	// untouched.
+	// A field code we don't recognize at all — cached result should pass
+	// through untouched. (MERGEFIELD used to live here but we now handle
+	// it explicitly; pick a code we don't substitute.)
 	runs := []docx.Run{
 		{FieldBegin: true},
-		{InstrText: "MERGEFIELD Name"},
+		{InstrText: "BARCODE 12345"},
 		{FieldSep: true},
-		{Text: "John Smith"},
+		{Text: "cached barcode"},
 		{FieldEnd: true},
 	}
 	out := flattenFields(runs, fieldVars{})
-	if len(out) != 1 || out[0].Text != "John Smith" {
-		t.Errorf("unknown field: got %+v, want one run with %q", out, "John Smith")
+	if len(out) != 1 || out[0].Text != "cached barcode" {
+		t.Errorf("unknown field: got %+v, want one run with %q", out, "cached barcode")
 	}
 }
 
@@ -175,6 +176,157 @@ func TestFlattenFields_Hyperlink(t *testing.T) {
 	}
 	if out[0].Text != "click here" {
 		t.Errorf("hyperlink: text = %q, want %q", out[0].Text, "click here")
+	}
+}
+
+// TestFlattenFields_DocProperty covers DOCPROPERTY lookups. Doc-property
+// names are case-insensitive and the canonical Word names ("Title",
+// "Author", "Comments") all resolve via the same lookup map.
+func TestFlattenFields_DocProperty(t *testing.T) {
+	props := buildDocPropertyMap(&docx.Properties{
+		Title:       "My Doc",
+		Author:      "Ada",
+		Description: "first draft",
+		Pages:       7,
+	}, "")
+	vars := fieldVars{docProps: props}
+
+	cases := []struct {
+		instr string
+		want  string
+	}{
+		{`DOCPROPERTY Title`, "My Doc"},
+		{`DOCPROPERTY "Author"`, "Ada"},
+		{`DOCPROPERTY Comments`, "first draft"}, // description → Comments
+		{`DOCPROPERTY Pages`, "7"},
+		{`DOCPROPERTY title`, "My Doc"}, // case-insensitive
+	}
+	for _, c := range cases {
+		runs := []docx.Run{
+			{FieldBegin: true},
+			{InstrText: c.instr},
+			{FieldSep: true},
+			{Text: "cached"},
+			{FieldEnd: true},
+		}
+		out := flattenFields(runs, vars)
+		if len(out) != 1 || out[0].Text != c.want {
+			t.Errorf("%q: got %+v, want one run with %q", c.instr, out, c.want)
+		}
+	}
+}
+
+// TestFlattenFields_MergeField confirms a MERGEFIELD without a merge
+// source renders as «Name» — matching how Word shows unfilled fields.
+func TestFlattenFields_MergeField(t *testing.T) {
+	runs := []docx.Run{
+		{FieldBegin: true},
+		{InstrText: `MERGEFIELD FirstName \* MERGEFORMAT`},
+		{FieldSep: true},
+		{Text: "«FirstName»"},
+		{FieldEnd: true},
+	}
+	out := flattenFields(runs, fieldVars{})
+	if len(out) != 1 || out[0].Text != "«FirstName»" {
+		t.Errorf("MERGEFIELD: got %+v, want «FirstName»", out)
+	}
+}
+
+// TestFlattenFields_DateFields covers SAVEDATE / CREATEDATE / PRINTDATE.
+// Each is suppressed (cached result wins) when the timestamp is zero,
+// and emits YYYY-MM-DD when set.
+func TestFlattenFields_DateFields(t *testing.T) {
+	saved := time.Date(2024, 3, 15, 10, 0, 0, 0, time.UTC)
+	created := time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC)
+	vars := fieldVars{modified: saved, created: created}
+
+	cases := []struct {
+		instr string
+		want  string
+	}{
+		{"SAVEDATE", "2024-03-15"},
+		{"CREATEDATE", "2023-01-01"},
+		{"PRINTDATE", "cached"}, // zero time → fall through
+	}
+	for _, c := range cases {
+		runs := []docx.Run{
+			{FieldBegin: true},
+			{InstrText: c.instr},
+			{FieldSep: true},
+			{Text: "cached"},
+			{FieldEnd: true},
+		}
+		out := flattenFields(runs, vars)
+		if len(out) != 1 || out[0].Text != c.want {
+			t.Errorf("%s: got %+v, want %q", c.instr, out, c.want)
+		}
+	}
+}
+
+// TestFlattenFields_DocVariable confirms DOCVARIABLE pulls from
+// settings.xml's w:docVars (passed in via the docVars map).
+func TestFlattenFields_DocVariable(t *testing.T) {
+	vars := fieldVars{docVars: map[string]string{
+		"greeting": "Hello",
+		"region":   "EMEA",
+	}}
+	runs := []docx.Run{
+		{FieldBegin: true},
+		{InstrText: "DOCVARIABLE Greeting"},
+		{FieldSep: true},
+		{Text: "cached"},
+		{FieldEnd: true},
+	}
+	out := flattenFields(runs, vars)
+	if len(out) != 1 || out[0].Text != "Hello" {
+		t.Errorf("DOCVARIABLE: got %+v, want Hello", out)
+	}
+}
+
+// TestFlattenFields_NamedDocPropertyFields covers the dedicated codes
+// (KEYWORDS, COMPANY, MANAGER, etc.) that bypass DOCPROPERTY but still
+// resolve via the doc-property map.
+func TestFlattenFields_NamedDocPropertyFields(t *testing.T) {
+	props := buildDocPropertyMap(&docx.Properties{
+		Keywords:       "math, physics",
+		Company:        "Acme",
+		Manager:        "Boss",
+		LastModifiedBy: "Bob",
+		Revision:       "12",
+		Words:          1234,
+		Characters:     5678,
+		Description:    "summary",
+		Category:       "report",
+	}, "")
+	vars := fieldVars{docProps: props, totalTime: 45}
+
+	cases := []struct {
+		instr string
+		want  string
+	}{
+		{"KEYWORDS", "math, physics"},
+		{"COMPANY", "Acme"},
+		{"MANAGER", "Boss"},
+		{"LASTSAVEDBY", "Bob"},
+		{"REVNUM", "12"},
+		{"NUMWORDS", "1234"},
+		{"NUMCHARS", "5678"},
+		{"COMMENTS", "summary"},
+		{"CATEGORY", "report"},
+		{"EDITTIME", "45"},
+	}
+	for _, c := range cases {
+		runs := []docx.Run{
+			{FieldBegin: true},
+			{InstrText: c.instr},
+			{FieldSep: true},
+			{Text: "cached"},
+			{FieldEnd: true},
+		}
+		out := flattenFields(runs, vars)
+		if len(out) != 1 || out[0].Text != c.want {
+			t.Errorf("%s: got %+v, want %q", c.instr, out, c.want)
+		}
 	}
 }
 

@@ -52,6 +52,24 @@ type fieldVars struct {
 	title    string
 	subject  string
 
+	// Doc properties exposed by name to DOCPROPERTY. Populated once
+	// during renderer init from doc.Properties; per-page rebuilds keep
+	// the same map reference. Keys are case-insensitive — see
+	// docPropertyByName.
+	docProps map[string]string
+
+	// w:docVars from settings.xml, surfaced to DOCVARIABLE. Same
+	// case-insensitive lookup semantics as docProps.
+	docVars map[string]string
+
+	// Timestamps surfaced to SAVEDATE / CREATEDATE / PRINTDATE.
+	created     time.Time
+	modified    time.Time
+	lastPrinted time.Time
+
+	// Edit-minutes for EDITTIME.
+	totalTime int
+
 	seqCounters map[string]int
 	bookmarks   map[string]string
 }
@@ -238,6 +256,155 @@ func lookupFieldValueWith(code, arg string, vars fieldVars) (string, bool) {
 		}
 	case "HYPERLINK":
 		return "", false
+	case "DOCPROPERTY":
+		if v, ok := docPropertyByName(vars.docProps, arg); ok {
+			return v, true
+		}
+	case "DOCVARIABLE":
+		if v, ok := docPropertyByName(vars.docVars, arg); ok {
+			return v, true
+		}
+	case "MERGEFIELD":
+		if arg != "" {
+			// Without a merge data source we render the field name in
+			// the French double-angle quotes Word uses to mark unfilled
+			// merge fields. Matches what Word shows in "view field
+			// codes off" mode when no recipient is selected.
+			return "«" + arg + "»", true
+		}
+	case "SAVEDATE":
+		if v, ok := formatDateField(vars.modified); ok {
+			return v, true
+		}
+	case "CREATEDATE":
+		if v, ok := formatDateField(vars.created); ok {
+			return v, true
+		}
+	case "PRINTDATE":
+		if v, ok := formatDateField(vars.lastPrinted); ok {
+			return v, true
+		}
+	case "EDITTIME":
+		if vars.totalTime > 0 {
+			return strconv.Itoa(vars.totalTime), true
+		}
+	case "NUMCHARS":
+		if v, ok := docPropertyByName(vars.docProps, "Characters"); ok {
+			return v, true
+		}
+	case "NUMWORDS":
+		if v, ok := docPropertyByName(vars.docProps, "Words"); ok {
+			return v, true
+		}
+	case "KEYWORDS":
+		if v, ok := docPropertyByName(vars.docProps, "Keywords"); ok {
+			return v, true
+		}
+	case "COMMENTS":
+		// COMMENTS field renders the "Comments" core property (which we
+		// store under Description), NOT reviewer comments.
+		if v, ok := docPropertyByName(vars.docProps, "Comments"); ok {
+			return v, true
+		}
+	case "CATEGORY":
+		if v, ok := docPropertyByName(vars.docProps, "Category"); ok {
+			return v, true
+		}
+	case "COMPANY":
+		if v, ok := docPropertyByName(vars.docProps, "Company"); ok {
+			return v, true
+		}
+	case "MANAGER":
+		if v, ok := docPropertyByName(vars.docProps, "Manager"); ok {
+			return v, true
+		}
+	case "LASTSAVEDBY":
+		if v, ok := docPropertyByName(vars.docProps, "LastModifiedBy"); ok {
+			return v, true
+		}
+	case "REVNUM":
+		if v, ok := docPropertyByName(vars.docProps, "Revision"); ok {
+			return v, true
+		}
 	}
 	return "", false
+}
+
+// docPropertyByName looks up a doc-property value by case-insensitive
+// name. Returns ("", false) when the map is nil, the key is missing,
+// or the value is empty — caller falls back to the cached Word result.
+func docPropertyByName(m map[string]string, name string) (string, bool) {
+	if m == nil || name == "" {
+		return "", false
+	}
+	key := strings.ToLower(name)
+	if v, ok := m[key]; ok && v != "" {
+		return v, true
+	}
+	return "", false
+}
+
+// buildDocPropertyMap builds a lower-cased name → value map for the
+// standard core/app doc properties so DOCPROPERTY and friends can look
+// them up by Word's canonical names ("Title", "Author", "Comments",
+// "Pages", etc.). The author override takes precedence so the field
+// agrees with the value in the PDF /Info dictionary when the caller
+// passes Options.Author.
+//
+// Integer/time fields are formatted up-front: callers want strings.
+// Time uses the same YYYY-MM-DD layout as SAVEDATE / CREATEDATE.
+func buildDocPropertyMap(p *docx.Properties, authorOverride string) map[string]string {
+	if p == nil {
+		return map[string]string{}
+	}
+	m := map[string]string{}
+	set := func(name, value string) {
+		if value != "" {
+			m[strings.ToLower(name)] = value
+		}
+	}
+	setInt := func(name string, value int) {
+		if value > 0 {
+			m[strings.ToLower(name)] = strconv.Itoa(value)
+		}
+	}
+	setTime := func(name string, t time.Time) {
+		if !t.IsZero() {
+			m[strings.ToLower(name)] = t.Format("2006-01-02")
+		}
+	}
+	set("Title", p.Title)
+	set("Author", firstNonEmpty(authorOverride, p.Author))
+	set("Subject", p.Subject)
+	// "Comments" is the Word display name for dc:description.
+	set("Comments", p.Description)
+	set("Description", p.Description)
+	set("Keywords", p.Keywords)
+	set("Category", p.Category)
+	set("LastModifiedBy", p.LastModifiedBy)
+	set("Revision", p.Revision)
+	set("Company", p.Company)
+	set("Manager", p.Manager)
+	set("Application", p.Application)
+	setInt("Pages", p.Pages)
+	setInt("Words", p.Words)
+	setInt("Characters", p.Characters)
+	setInt("Lines", p.Lines)
+	setInt("TotalTime", p.TotalTime)
+	setTime("Created", p.Created)
+	setTime("Modified", p.Modified)
+	setTime("LastPrinted", p.LastPrinted)
+	return m
+}
+
+// formatDateField renders a Properties timestamp for SAVEDATE /
+// CREATEDATE / PRINTDATE. We ignore the `\@ "format"` switch and use
+// a fixed YYYY-MM-DD layout — matching how DATE / TIME already render.
+// Word users who need a specific layout still see the cached value
+// since we return (_, false) on zero time, letting the snapshot win.
+func formatDateField(t time.Time) (string, bool) {
+	if t.IsZero() {
+		return "", false
+	}
+	return t.Format("2006-01-02"), true
 }
