@@ -2335,6 +2335,15 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 					return nil, err
 				}
 				if di.RID != "" {
+					// wp:wrapTopAndBottom forces line breaks above and
+					// below the image so surrounding text doesn't sit
+					// next to it. Other wrap modes (square / tight /
+					// through / none) currently render as inline; the
+					// flag is preserved on Run.WrapMode for future
+					// work but isn't honored by the line breaker yet.
+					if di.WrapMode == "topAndBottom" {
+						atoms = append(atoms, Run{IsBreak: true, Props: rp})
+					}
 					atoms = append(atoms, Run{
 						ImageID:       di.RID,
 						ImageWidthPt:  di.WPt,
@@ -2343,8 +2352,12 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 						CropBottomPct: di.CropB,
 						CropLeftPct:   di.CropL,
 						CropRightPct:  di.CropR,
+						WrapMode:      di.WrapMode,
 						Props:         rp,
 					})
+					if di.WrapMode == "topAndBottom" {
+						atoms = append(atoms, Run{IsBreak: true, Props: rp})
+					}
 				}
 				// Text-box body (wps:txbx) accompanies any image content
 				// the drawing also has — both can coexist on one shape.
@@ -2434,6 +2447,16 @@ type drawingInfo struct {
 	// <c:chart r:id="…">. The renderer looks up Document.Charts[ChartRID]
 	// to surface chart labels as plain text. Empty for non-chart drawings.
 	ChartRID string
+	// WrapMode mirrors the wp:wrap* child of wp:anchor:
+	//   ""              — inline (wp:inline) or unspecified
+	//   "topAndBottom"  — text breaks above and below the image
+	//   "square"        — text wraps around the image rectangle (planned)
+	//   "tight"         — text follows the image's tight outline (planned)
+	//   "through"       — same as tight with cutouts honored (planned)
+	//   "none"          — image floats over/under text (planned)
+	// Today we honor "topAndBottom" by inserting soft breaks around the
+	// image atom; other wrap modes fall back to inline placement.
+	WrapMode string
 }
 
 // emuPerPt is the OOXML "English Metric Unit" → PostScript point conversion.
@@ -2498,6 +2521,16 @@ func findDrawingInfo(dec *xml.Decoder, start xml.StartElement) (info drawingInfo
 						break
 					}
 				}
+			case "wrapNone":
+				info.WrapMode = "none"
+			case "wrapSquare":
+				info.WrapMode = "square"
+			case "wrapTight":
+				info.WrapMode = "tight"
+			case "wrapThrough":
+				info.WrapMode = "through"
+			case "wrapTopAndBottom":
+				info.WrapMode = "topAndBottom"
 			case "txbxContent":
 				// Word text-box body. Real txbxContent holds a tree of
 				// w:p/w:r/w:t; we pull out the visible text with a single
