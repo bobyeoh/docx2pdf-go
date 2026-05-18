@@ -18,6 +18,12 @@ type atom struct {
 	fontFamily string
 	width      float64
 	height     float64
+	// bidiLevel is the UAX#9 embedding level (0 = LTR, 1 = RTL, 2 =
+	// LTR embedded in RTL). Atoms with an odd level have their `text`
+	// rune-reversed at construction so gopdf's left-to-right drawing
+	// produces the right-to-left visual form. layoutLine consumes the
+	// level via reorderAtomsL2 to place atoms in visual order.
+	bidiLevel uint8
 }
 
 type atomKind int
@@ -205,12 +211,20 @@ func (r *renderer) runsToAtoms(runs []docx.Run) []atom {
 			}
 			_ = r.applyFontFamily(run.Props, bufFamily)
 			text := buf.String()
-			// In an RTL paragraph, an all-RTL word atom is laid out by
-			// reversing its rune sequence here so the glyph stream we
-			// hand to gopdf draws in visual (right-to-left) order. Mixed
-			// or all-LTR words pass through unchanged — proper UAX#9
-			// resolution for embedded LTR runs is out of scope.
-			if r.paragraphRTL && allRTL(text) {
+			// Arabic shaping: substitute presentation forms for
+			// joinable letters based on neighbor context. Must run
+			// on logical-order text BEFORE the RTL rune reverse so
+			// joining decisions see the correct neighbors.
+			text = shapeArabic(text)
+			// UAX#9 atom-level: pick the embedding level from the
+			// atom's first-strong directional class + paragraph base.
+			// Odd levels are RTL — reverse the rune sequence here so
+			// gopdf's left-to-right draw produces the visual form.
+			// L2 reordering at the line layer (reorderAtomsL2) then
+			// places atoms in visual order, including embedded LTR
+			// fragments inside an RTL paragraph.
+			level := atomBidiLevel(text, r.paragraphRTL)
+			if level%2 == 1 {
 				text = reverseRunes(text)
 			}
 			w, _ := r.pdf.MeasureTextWidth(text)
@@ -222,6 +236,7 @@ func (r *renderer) runsToAtoms(runs []docx.Run) []atom {
 				width:      w,
 				linkRID:    run.LinkURL,
 				linkAnchor: run.LinkAnchor,
+				bidiLevel:  level,
 			})
 			buf.Reset()
 			bufFamily = ""
@@ -231,17 +246,17 @@ func (r *renderer) runsToAtoms(runs []docx.Run) []atom {
 			switch {
 			case rn == '\n':
 				flushBuf()
-				out = append(out, atom{kind: atomBreak, props: run.Props})
+				out = append(out, atom{kind: atomBreak, props: run.Props, bidiLevel: paragraphBaseLevel(r.paragraphRTL)})
 			case rn == '\t':
 				flushBuf()
 				_ = r.applyFontFamily(run.Props, r.selectFont(run.Props))
 				w, _ := r.pdf.MeasureTextWidth("    ")
-				out = append(out, atom{kind: atomTab, props: run.Props, width: w})
+				out = append(out, atom{kind: atomTab, props: run.Props, width: w, bidiLevel: paragraphBaseLevel(r.paragraphRTL)})
 			case rn == ' ':
 				flushBuf()
 				_ = r.applyFontFamily(run.Props, r.selectFont(run.Props))
 				w, _ := r.pdf.MeasureTextWidth(" ")
-				out = append(out, atom{kind: atomSpace, text: " ", props: run.Props, width: w})
+				out = append(out, atom{kind: atomSpace, text: " ", props: run.Props, width: w, bidiLevel: paragraphBaseLevel(r.paragraphRTL)})
 			case isCJK(rn) || isSymbolGlyph(rn):
 				// CJK and symbol-block runes share a code path: each
 				// becomes its own atom. CJK because we need
@@ -262,6 +277,7 @@ func (r *renderer) runsToAtoms(runs []docx.Run) []atom {
 					width:      w,
 					linkRID:    run.LinkURL,
 					linkAnchor: run.LinkAnchor,
+					bidiLevel:  atomBidiLevel(s, r.paragraphRTL),
 				})
 			default:
 				fam := r.chooseFamily(rn, run.Props)
@@ -312,14 +328,13 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 			hang = 0
 			return nil
 		}
-		// RTL paragraphs draw their atoms in reverse visual order: the
-		// logically-first atom appears at the right edge. Width totals and
-		// per-atom metadata are unchanged — only the iteration order flips.
-		if r.paragraphRTL {
-			for i, j := 0, len(line)-1; i < j; i, j = i+1, j-1 {
-				line[i], line[j] = line[j], line[i]
-			}
-		}
+		// Atom-level UAX#9 L2 reordering: place atoms in visual order
+		// based on their embedding level. For all-LTR lines this is a
+		// no-op (early return inside reorderAtomsL2). For all-RTL it
+		// reverses the entire line. For mixed-direction lines (RTL
+		// paragraph with embedded English fragment, or vice versa)
+		// the level distinction produces the correct interleaving.
+		line = reorderAtomsL2(line)
 		if lineMaxH == 0 {
 			lineMaxH = r.opts.DefaultFontSize * 1.2
 		}
@@ -644,21 +659,6 @@ func fontAscent(p docx.RunProps, defaultSize float64) float64 {
 		sz = defaultSize
 	}
 	return sz * 0.8
-}
-
-// allRTL reports whether every rune in s belongs to a right-to-left
-// script. Empty string returns false. Used by runsToAtoms to decide
-// whether an atom's text should be rune-reversed for RTL display.
-func allRTL(s string) bool {
-	if s == "" {
-		return false
-	}
-	for _, r := range s {
-		if !isRTL(r) {
-			return false
-		}
-	}
-	return true
 }
 
 // reverseRunes returns s with its runes in reverse order. Operates on
