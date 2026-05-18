@@ -36,6 +36,7 @@ const (
 	atomImage
 	atomTab
 	atomBookmark // zero-width marker; registers a named PDF anchor at this position
+	atomChart    // c:chart reference; renderer draws data graphic via drawChart
 )
 
 // nextTabAfterWithAlign returns the next tab stop strictly past relX
@@ -155,6 +156,30 @@ func (r *renderer) runsToAtoms(runs []docx.Run) []atom {
 		}
 		if run.Bookmark != "" {
 			out = append(out, atom{kind: atomBookmark, text: run.Bookmark})
+			continue
+		}
+		if run.ChartID != "" {
+			data, ok := r.doc.Charts[run.ChartID]
+			if !ok || !data.HasData() {
+				continue
+			}
+			w, h := run.ImageWidthPt, run.ImageHeightPt
+			if w <= 0 || h <= 0 {
+				w, h = 360, 240 // 5×3.33in default for charts with no extent
+			}
+			if w > r.contentW {
+				scale := r.contentW / w
+				w *= scale
+				h *= scale
+			}
+			out = append(out, atom{
+				kind:    atomChart,
+				text:    run.ChartID,
+				width:   w,
+				height:  h,
+				props:   run.Props,
+				linkRID: run.LinkURL,
+			})
 			continue
 		}
 		if run.ImageID != "" {
@@ -522,6 +547,12 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 					return err
 				}
 				cx += a.width
+			case atomChart:
+				data := r.doc.Charts[a.text]
+				if err := r.drawChart(data, cx, r.cursorY, a.width, a.height); err != nil {
+					return err
+				}
+				cx += a.width
 			}
 		}
 
@@ -641,7 +672,7 @@ func (r *renderer) splitWordAtomByRune(a atom) []atom {
 
 func atomHeight(a atom, defaultSize float64) float64 {
 	switch a.kind {
-	case atomImage:
+	case atomImage, atomChart:
 		return a.height
 	case atomWord, atomSpace, atomTab:
 		sz := a.props.FontSize

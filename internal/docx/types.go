@@ -32,11 +32,12 @@ type Document struct {
 	// w:id. The renderer appends a "Comments" trailing section so the
 	// notes survive into the PDF rather than being silently dropped.
 	Comments map[string][]Block
-	// Charts maps relationship id → flattened text extracted from a
-	// referenced chart part (word/charts/chartN.xml). We can't render
-	// the data graphic but we surface titles, axis labels, and data
-	// labels so the prose around the chart still makes sense.
-	Charts map[string]string
+	// Charts maps relationship id → structured chart data extracted
+	// from a referenced chart part (word/charts/chartN.xml). Bar /
+	// line / pie charts are drawn with gopdf primitives by the
+	// renderer; unsupported chart types fall back to ChartData.FlatText
+	// rendered as a "[Chart: …]" placeholder.
+	Charts map[string]ChartData
 	// Theme is the parsed contents of word/theme/theme1.xml — color scheme +
 	// font scheme — used to resolve w:themeColor / rFonts w:asciiTheme refs.
 	Theme Theme
@@ -119,6 +120,56 @@ type Properties struct {
 	Words      int
 	Characters int
 	Lines      int
+}
+
+// ChartData is the structured form of a c:chartSpace part. The
+// parser extracts the first plot type it finds (bar/line/pie) along
+// with categories and per-series values. Multi-plot charts and
+// secondary axes are out of scope — the first plot wins.
+type ChartData struct {
+	// Type is one of "bar", "line", "pie", or "" when none of the
+	// supported plot types were found. The renderer dispatches on
+	// this; "" falls back to a "[Chart: FlatText]" placeholder.
+	Type string
+	// Title is the chart title text (c:title/c:tx descendants).
+	Title string
+	// BarDir = "col" for vertical bars, "bar" for horizontal. Only
+	// meaningful when Type == "bar".
+	BarDir string
+	// Categories are the x-axis labels (from c:cat/c:strRef/c:strCache).
+	// Length matches the longest series' Values slice for clean
+	// alignment; shorter series are right-padded with NaN.
+	Categories []string
+	// Series carries one entry per c:ser inside the chart.
+	Series []ChartSeries
+	// FlatText is the legacy concatenation of all CharData. Used as
+	// the fallback rendering for unsupported chart types and as the
+	// human-readable surrogate when a chart is referenced from
+	// text-extraction tooling (pdftotext, etc.).
+	FlatText string
+}
+
+// ChartSeries is one data series — a name, a fill color (hex), and
+// numeric values aligned with ChartData.Categories.
+type ChartSeries struct {
+	Name   string
+	Color  string // 6-hex, no leading "#"; "" → renderer picks a default palette slot
+	Values []float64
+}
+
+// HasData reports whether this chart has at least one numeric value
+// across its series. Used to gate the "draw real chart" path against
+// truly empty charts that should render as the textual placeholder.
+func (c ChartData) HasData() bool {
+	if c.Type == "" {
+		return false
+	}
+	for _, s := range c.Series {
+		if len(s.Values) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // ParaDefaults seeds every paragraph before its own pPr is applied. Modern
@@ -321,6 +372,7 @@ type Run struct {
 	Text       string
 	IsBreak    bool   // soft line break (w:br without page type)
 	ImageID    string // rId if this run is a w:drawing/pic image
+	ChartID    string // rId if this run is a w:drawing/c:chart reference
 	LinkURL    string // hyperlink rId → external URL (resolved by renderer)
 	LinkAnchor string // hyperlink w:anchor → internal bookmark name target
 	Bookmark   string // when set, this is a marker placing a named anchor here

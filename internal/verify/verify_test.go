@@ -254,6 +254,7 @@ func allCases() []verifyCase {
 		caseComments(),
 		caseHeadingOutline(),
 		caseChartTextExtraction(),
+		caseChartBarRender(),
 		casePageBreakBeforeValZero(),
 		caseOverwideWordInCell(),
 		caseHorizontalRuleVMLPict(),
@@ -4342,6 +4343,79 @@ func caseChartTextExtraction() verifyCase {
 			"Q1-LABEL",
 			"Q2-LABEL",
 			"below",
+		},
+		expectPages: 1,
+	}
+}
+
+// caseChartBarRender exercises the actual chart-drawing path with
+// numeric values present. The chart's title + legend + category
+// labels survive as PDF text via the chart renderer's Cell calls.
+func caseChartBarRender() verifyCase {
+	return verifyCase{
+		name:        "127a_chart_bar",
+		description: "Bar chart with numeric data renders title/legend/categories as PDF text",
+		build: func(t *testing.T, dir string) string {
+			chart := `<?xml version="1.0"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
+              xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <c:chart>
+    <c:title>
+      <c:tx><c:rich><a:p><a:r><a:t>QUARTERLY-REVENUE</a:t></a:r></a:p></c:rich></c:tx>
+    </c:title>
+    <c:plotArea>
+      <c:barChart>
+        <c:barDir val="col"/>
+        <c:ser>
+          <c:tx><c:strRef><c:strCache><c:pt idx="0"><c:v>WIDGETS-INC</c:v></c:pt></c:strCache></c:strRef></c:tx>
+          <c:cat>
+            <c:strRef><c:strCache>
+              <c:pt idx="0"><c:v>QUARTER-ONE</c:v></c:pt>
+              <c:pt idx="1"><c:v>QUARTER-TWO</c:v></c:pt>
+              <c:pt idx="2"><c:v>QUARTER-THREE</c:v></c:pt>
+            </c:strCache></c:strRef>
+          </c:cat>
+          <c:val>
+            <c:numRef><c:numCache>
+              <c:pt idx="0"><c:v>30</c:v></c:pt>
+              <c:pt idx="1"><c:v>45</c:v></c:pt>
+              <c:pt idx="2"><c:v>60</c:v></c:pt>
+            </c:numCache></c:numRef>
+          </c:val>
+        </c:ser>
+      </c:barChart>
+    </c:plotArea>
+  </c:chart>
+</c:chartSpace>`
+			body := `
+    <w:p>
+      <w:r>
+        <w:drawing>
+          <wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">
+            <wp:extent cx="3000000" cy="2000000"/>
+            <a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+              <a:graphicData>
+                <c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" r:id="rChart"/>
+              </a:graphicData>
+            </a:graphic>
+          </wp:inline>
+        </w:drawing>
+      </w:r>
+    </w:p>`
+			return newDocx().
+				RawBody(docHeader+body+docFooter).
+				Part("charts/chart1.xml", chart).
+				Rels(`<?xml version="1.0"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rChart" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="charts/chart1.xml"/>
+</Relationships>`).
+				Write(t, dir)
+		},
+		expectText: []string{
+			"QUARTERLY-REVENUE",
+			"QUARTER-ONE",
+			"QUARTER-TWO",
+			"QUARTER-THREE",
 		},
 		expectPages: 1,
 	}
