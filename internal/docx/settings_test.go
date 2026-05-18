@@ -39,3 +39,43 @@ func TestParseSettings_DefaultTabStop(t *testing.T) {
 		t.Error("DisplayBackgroundShape = false, want true")
 	}
 }
+
+func TestParseSettings_Protection(t *testing.T) {
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	must := func(err error) {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	w, err := zw.Create("word/document.xml")
+	must(err)
+	_, err = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p/></w:body></w:document>`))
+	must(err)
+	w, err = zw.Create("word/settings.xml")
+	must(err)
+	_, err = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?>
+<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:writeProtection w:recommended="1"/>
+  <w:documentProtection w:edit="readOnly" w:enforcement="1" w:formatting="1"/>
+</w:settings>`))
+	must(err)
+	must(zw.Close())
+
+	doc, err := Parse(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if doc.Settings.DocumentProtection.Edit != "readOnly" {
+		t.Errorf("Edit = %q, want readOnly", doc.Settings.DocumentProtection.Edit)
+	}
+	if !doc.Settings.DocumentProtection.Enforcement {
+		t.Error("DocumentProtection.Enforcement = false")
+	}
+	if !doc.Settings.DocumentProtection.FormatLockdown {
+		t.Error("FormatLockdown = false")
+	}
+	if !doc.Settings.WriteProtection.Recommended {
+		t.Error("WriteProtection.Recommended = false")
+	}
+}

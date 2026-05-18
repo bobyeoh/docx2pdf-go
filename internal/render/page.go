@@ -57,6 +57,7 @@ func (r *renderer) stampPageDecorations(sections []docx.Section, sectionPageStar
 		r.marT = twipsToPt(sec.Margins.Top)
 		r.marB = twipsToPt(sec.Margins.Bottom)
 		r.contentW = r.pageW - r.marL - r.marR
+		applyPageBorderMargins(r, sec.Borders)
 
 		// Word only paints w:background when settings.xml declares
 		// w:displayBackgroundShape — without that switch the color is
@@ -66,35 +67,56 @@ func (r *renderer) stampPageDecorations(sections []docx.Section, sectionPageStar
 			r.pdf.SetFillColor(r1, g1, b1)
 			r.pdf.Rectangle(0, 0, r.pageW, r.pageH, "F", 0, 0)
 		}
-		drawPageBorders(r, sec.Borders)
+		secIdx := sectionOf(i)
+		pageInSection := i - sectionPageStart[secIdx] + 1
+		isLastSecPage := i == n || (secIdx+1 < len(sectionPageStart) && sectionPageStart[secIdx+1]-1 == i)
+		if shouldDrawPageBorder(sec.Borders.Display, pageInSection, isLastSecPage) {
+			drawPageBorders(r, sec.Borders)
+		}
 
 		if sec.LineNumbering.CountBy > 0 {
 			drawLineNumbers(r, sec)
 		}
 
 		savedFields := r.fields
-		pageInSection := i - sectionPageStart[sectionOf(i)] + 1
 		displayPage := pageInSection
 		if sec.PageNumber.Start > 0 {
 			displayPage = sec.PageNumber.Start + pageInSection - 1
 		}
+		// pages in THIS section = next-section-start - this-section-start.
+		// Last section runs to the end of the document.
+		secPagesEnd := n
+		if secIdx+1 < len(sectionPageStart) {
+			secPagesEnd = sectionPageStart[secIdx+1] - 1
+		}
+		numSecPages := secPagesEnd - sectionPageStart[secIdx] + 1
 		r.fields = fieldVars{
-			page:        displayPage,
-			numPages:    n,
-			pageFmt:     sec.PageNumber.Fmt,
-			now:         savedFields.now,
-			filename:    savedFields.filename,
-			author:      savedFields.author,
-			title:       savedFields.title,
-			subject:     savedFields.subject,
-			docProps:    savedFields.docProps,
-			docVars:     savedFields.docVars,
-			created:     savedFields.created,
-			modified:    savedFields.modified,
-			lastPrinted: savedFields.lastPrinted,
-			totalTime:   savedFields.totalTime,
-			seqCounters: savedFields.seqCounters,
-			bookmarks:   savedFields.bookmarks,
+			page:            displayPage,
+			numPages:        n,
+			pageFmt:         sec.PageNumber.Fmt,
+			numSectionPages: numSecPages,
+			section:         secIdx + 1,
+			decimalSymbol:   savedFields.decimalSymbol,
+			listSeparator:   savedFields.listSeparator,
+			now:           savedFields.now,
+			filename:      savedFields.filename,
+			author:        savedFields.author,
+			title:         savedFields.title,
+			subject:       savedFields.subject,
+			company:       savedFields.company,
+			keywords:      savedFields.keywords,
+			comments:      savedFields.comments,
+			username:      savedFields.username,
+			numWords:      savedFields.numWords,
+			numChars:      savedFields.numChars,
+			totalMinutes:  savedFields.totalMinutes,
+			createDate:    savedFields.createDate,
+			saveDate:      savedFields.saveDate,
+			printDate:     savedFields.printDate,
+			seqCounters:   savedFields.seqCounters,
+			bookmarks:     savedFields.bookmarks,
+			bookmarkPages: savedFields.bookmarkPages,
+			docProperties: savedFields.docProperties,
 		}
 
 		hdr := sec.HeaderBlocks
@@ -138,6 +160,129 @@ func (r *renderer) stampPageDecorations(sections []docx.Section, sectionPageStar
 		r.fields = savedFields
 	}
 	return nil
+}
+
+// measureBlocks does a dry layout pass over a block list and returns the
+// total rendered height. Used by section vAlign to know the slack space
+// before drawing. Tables are estimated via measureCell; paragraphs reuse
+// the same atom math as layoutLine without drawing.
+func (r *renderer) measureBlocks(blocks []docx.Block) float64 {
+	total := 0.0
+	savedLine := r.lineHeight
+	savedFootnotes := r.pendingFootnotes
+	defer func() {
+		r.lineHeight = savedLine
+		r.pendingFootnotes = savedFootnotes
+	}()
+	for _, b := range blocks {
+		switch v := b.(type) {
+		case docx.Paragraph:
+			total += r.measureParagraph(v)
+		case docx.Table:
+			total += r.measureTable(v)
+		}
+	}
+	return total
+}
+
+// measureParagraph estimates one paragraph's rendered height at the
+// current contentW. Mirrors drawParagraph's geometry decisions but
+// without touching the renderer's drawing state.
+func (r *renderer) measureParagraph(p docx.Paragraph) float64 {
+	if len(p.Runs) == 0 && p.List == nil {
+		return r.opts.DefaultFontSize * 1.2
+	}
+	r.lineHeight = p.LineHeight
+	atoms := r.runsToAtoms(p.Runs)
+	innerW := r.contentW
+	if p.IndentLeftPt > 0 {
+		innerW -= p.IndentLeftPt
+	}
+	if innerW <= 0 {
+		innerW = r.contentW
+	}
+	h := p.SpacingBefore + p.SpacingAfter
+	lineW := 0.0
+	lineH := r.applyLineHeight(r.opts.DefaultFontSize * 1.2)
+	hadAny := false
+	flush := func() {
+		h += lineH
+		lineW = 0
+		lineH = r.applyLineHeight(r.opts.DefaultFontSize * 1.2)
+		hadAny = false
+	}
+	for _, a := range atoms {
+		if a.kind == atomBookmark {
+			continue
+		}
+		if a.kind == atomBreak || a.kind == atomPageBreak {
+			flush()
+			continue
+		}
+		ah := atomHeight(a, r.opts.DefaultFontSize)
+		if lineW+a.width > innerW && lineW > 0 {
+			flush()
+			if a.kind == atomSpace {
+				continue
+			}
+		}
+		lineW += a.width
+		scaled := r.applyLineHeight(ah)
+		if scaled > lineH {
+			lineH = scaled
+		}
+		hadAny = true
+	}
+	if hadAny || lineW > 0 || len(atoms) == 0 {
+		h += lineH
+	}
+	return h
+}
+
+// measureTable estimates a table's rendered height.
+func (r *renderer) measureTable(t docx.Table) float64 {
+	cols := 0
+	for _, row := range t.Rows {
+		if len(row.Cells) > cols {
+			cols = len(row.Cells)
+		}
+	}
+	if cols == 0 {
+		return 0
+	}
+	widths := r.resolveColumnWidths(t, cols)
+	total := 0.0
+	for _, row := range t.Rows {
+		rowH := 0.0
+		col := 0
+		for _, cell := range row.Cells {
+			if col >= len(widths) {
+				break
+			}
+			span := cell.GridSpan
+			if span < 1 {
+				span = 1
+			}
+			w := sumWidths(widths, col, span)
+			if cell.VMerge != "continue" {
+				if ch := r.measureCell(cell, w); ch > rowH {
+					rowH = ch
+				}
+			}
+			col += span
+		}
+		if rowH < r.opts.DefaultFontSize*1.4 {
+			rowH = r.opts.DefaultFontSize * 1.4
+		}
+		if row.HeightTwips > 0 {
+			minH := float64(row.HeightTwips) / 20.0
+			if row.HeightRuleExact || minH > rowH {
+				rowH = minH
+			}
+		}
+		total += rowH
+	}
+	return total
 }
 
 // drawAt runs the block-level drawing pipeline against a transient region
@@ -202,26 +347,309 @@ func (r *renderer) stampPageNumbers() error {
 
 // applyLineHeight converts a natural (font-derived) line height to the
 // effective line height per the paragraph's w:spacing w:line semantics.
+// When the active section declares a w:docGrid line pitch we additionally
+// snap the result UP to a multiple of that pitch so consecutive lines
+// land on the CJK grid (Word's "line grid" feature).
 func (r *renderer) applyLineHeight(natural float64) float64 {
+	var h float64
 	switch r.lineHeight.Rule {
 	case "exact":
 		if r.lineHeight.Pt > 0 {
-			return r.lineHeight.Pt
+			h = r.lineHeight.Pt
+		} else {
+			h = natural
 		}
 	case "atLeast":
 		if r.lineHeight.Pt > natural {
-			return r.lineHeight.Pt
+			h = r.lineHeight.Pt
+		} else {
+			h = natural
 		}
 	case "auto":
 		if r.lineHeight.Mul > 0 {
-			return natural * r.lineHeight.Mul
+			h = natural * r.lineHeight.Mul
+		} else {
+			h = natural
+		}
+	default:
+		h = natural
+	}
+	// docGrid snap: only for the line-grid modes ("lines" or
+	// "linesAndChars"). The pitch is in 1/20 pt units.
+	if (r.activeDocGrid.Type == "lines" || r.activeDocGrid.Type == "linesAndChars") &&
+		r.activeDocGrid.LinePitch > 0 && r.lineHeight.Rule != "exact" {
+		pitch := float64(r.activeDocGrid.LinePitch) / 20.0
+		if pitch > 0 {
+			// Snap upward to the next whole pitch step.
+			steps := h / pitch
+			rounded := float64(int(steps))
+			if rounded < steps {
+				rounded++
+			}
+			snapped := rounded * pitch
+			if snapped > h {
+				h = snapped
+			}
 		}
 	}
-	return natural
+	return h
+}
+
+// activeCharSpacePt returns extra letter-spacing in points to apply to
+// CJK text in the current section, derived from w:docGrid/@w:charSpace.
+// Returns 0 unless the section enables the linesAndChars grid mode.
+//
+// CharSpace is stored in 1/100 pt; OOXML uses it as the additional space
+// inserted between CJK characters so the grid spacing equals
+// LinePitch + CharSpace/100 (per the spec). For Latin text the effect
+// is negligible at typical CharSpace values, so we apply it uniformly —
+// the visible difference on CJK is what authors are after.
+func (r *renderer) activeCharSpacePt() float64 {
+	if r.activeDocGrid.Type != "linesAndChars" {
+		return 0
+	}
+	if r.activeDocGrid.CharSpace <= 0 {
+		return 0
+	}
+	return float64(r.activeDocGrid.CharSpace) / 100.0
+}
+
+// appendCommentsSection renders the Comments trailer with author/date
+// headers and reply-thread indentation. Threads are reconstructed from
+// w:commentsExtended (paraId / paraIdParent), with replies sorted right
+// after their parent and indented per nesting depth.
+func (r *renderer) appendCommentsSection(doc *docx.Document) error {
+	if len(doc.Comments) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(doc.Comments))
+	for k := range doc.Comments {
+		ids = append(ids, k)
+	}
+	sortStringDecimals(ids)
+
+	paraToCommentID := map[string]string{}
+	for _, id := range ids {
+		if meta, ok := doc.CommentMeta[id]; ok && meta.ParaID != "" {
+			paraToCommentID[meta.ParaID] = id
+		}
+	}
+
+	// Build a per-comment "thread depth" by walking the parent chain.
+	depths := computeCommentDepths(doc, paraToCommentID)
+	// Reorder ids so replies follow their parent (DFS by parent links).
+	ordered := orderCommentsByThread(ids, doc, paraToCommentID)
+
+	r.ensureRoom(36)
+	r.cursorY += 18
+	title := docx.Paragraph{
+		Runs:         []docx.Run{{Text: "Comments", Props: docx.RunProps{Bold: true, FontSize: 14}}},
+		SpacingAfter: 6,
+	}
+	if err := r.drawParagraph(title); err != nil {
+		return err
+	}
+	for _, id := range ordered {
+		meta := doc.CommentMeta[id]
+		author := meta.Author
+		if author == "" {
+			author = "Reviewer"
+		}
+		header := "[" + id + "] " + author
+		if meta.Date != "" {
+			header += " • " + meta.Date
+		}
+		if ext, ok := doc.CommentsExtended[meta.ParaID]; ok && ext.Done {
+			header += " (resolved)"
+		}
+		indent := float64(depths[id]) * 18.0
+		// Author color-coding: re-use the revision palette so a reviewer
+		// who appears as both a tracked-change author and a comment author
+		// shows the same color across the document. Empty author falls
+		// back to default black.
+		headerColor := ""
+		if meta.Author != "" {
+			headerColor = revisionColorForAuthor(meta.Author, "")
+		}
+		marker := docx.Paragraph{
+			Runs:         []docx.Run{{Text: header, Props: docx.RunProps{Bold: true, Color: headerColor}}},
+			IndentLeftPt: indent,
+		}
+		if err := r.drawParagraph(marker); err != nil {
+			return err
+		}
+		for _, b := range doc.Comments[id] {
+			switch v := b.(type) {
+			case docx.Paragraph:
+				v.IndentLeftPt += indent
+				if err := r.drawParagraph(v); err != nil {
+					return err
+				}
+			case docx.Table:
+				if err := r.drawTable(v); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// computeCommentDepths walks each comment's parent chain (via paraIdParent
+// in commentsExtended) and returns a map of commentID → nesting depth.
+// Root comments have depth 0. Cycle-safe by capping at len(comments).
+func computeCommentDepths(doc *docx.Document, paraToCommentID map[string]string) map[string]int {
+	out := map[string]int{}
+	for id, meta := range doc.CommentMeta {
+		depth := 0
+		paraID := meta.ParaID
+		guard := len(doc.CommentMeta) + 1
+		for paraID != "" && guard > 0 {
+			ext, ok := doc.CommentsExtended[paraID]
+			if !ok || ext.ParentParaID == "" {
+				break
+			}
+			if _, isComment := paraToCommentID[ext.ParentParaID]; !isComment {
+				break
+			}
+			depth++
+			paraID = ext.ParentParaID
+			guard--
+		}
+		out[id] = depth
+	}
+	return out
+}
+
+// orderCommentsByThread reshuffles a list of comment IDs so replies fall
+// immediately after their parent (DFS), preserving the original order
+// among siblings. Comments without a parent stay in the original spot.
+func orderCommentsByThread(ids []string, doc *docx.Document, paraToCommentID map[string]string) []string {
+	parentOf := map[string]string{}
+	childrenOf := map[string][]string{}
+	for _, id := range ids {
+		meta, ok := doc.CommentMeta[id]
+		if !ok {
+			continue
+		}
+		ext, ok := doc.CommentsExtended[meta.ParaID]
+		if !ok || ext.ParentParaID == "" {
+			continue
+		}
+		parentID, ok := paraToCommentID[ext.ParentParaID]
+		if !ok {
+			continue
+		}
+		parentOf[id] = parentID
+		childrenOf[parentID] = append(childrenOf[parentID], id)
+	}
+	visited := map[string]bool{}
+	out := make([]string, 0, len(ids))
+	var visit func(id string)
+	visit = func(id string) {
+		if visited[id] {
+			return
+		}
+		visited[id] = true
+		out = append(out, id)
+		for _, child := range childrenOf[id] {
+			visit(child)
+		}
+	}
+	for _, id := range ids {
+		if _, hasParent := parentOf[id]; hasParent {
+			continue
+		}
+		visit(id)
+	}
+	// Stragglers (orphaned replies) come last in original order.
+	for _, id := range ids {
+		if !visited[id] {
+			visit(id)
+		}
+	}
+	return out
+}
+
+// allSectionsHaveSectEndnotes reports whether every section in the
+// document declares w:endnotePr w:pos="sectEnd". When true the renderer
+// suppresses the doc-end endnote trailer because each section already
+// emitted its endnotes inline.
+func allSectionsHaveSectEndnotes(secs []docx.Section) bool {
+	if len(secs) == 0 {
+		return false
+	}
+	for _, s := range secs {
+		if s.EndnotePr == nil || s.EndnotePr.Pos != "sectEnd" {
+			return false
+		}
+	}
+	return true
+}
+
+// appendSectionEndnotes renders the endnotes referenced from sec.Blocks
+// inline (at the current cursor) under a "Section N endnotes" heading.
+func (r *renderer) appendSectionEndnotes(sec docx.Section, secIdx int) error {
+	ids := collectNoteRefs(sec.Blocks, true)
+	if len(ids) == 0 {
+		return nil
+	}
+	// Filter to unique IDs that actually have bodies.
+	seen := map[string]bool{}
+	uniq := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if seen[id] {
+			continue
+		}
+		if _, ok := r.doc.Endnotes[id]; !ok {
+			continue
+		}
+		seen[id] = true
+		uniq = append(uniq, id)
+	}
+	if len(uniq) == 0 {
+		return nil
+	}
+	r.ensureRoom(24)
+	r.cursorY += 12
+	heading := docx.Paragraph{
+		Runs:         []docx.Run{{Text: "Endnotes", Props: docx.RunProps{Bold: true, FontSize: 11}}},
+		SpacingAfter: 4,
+	}
+	_ = secIdx // section index unused in label; reserved for callers that want "Section N Endnotes"
+	if err := r.drawParagraph(heading); err != nil {
+		return err
+	}
+	for _, id := range uniq {
+		label := id
+		if lbl, ok := r.endnoteLabels[id]; ok && lbl != "" {
+			label = lbl
+		}
+		marker := docx.Paragraph{
+			Runs: []docx.Run{{Text: label + ". ", Props: docx.RunProps{Bold: true}}},
+		}
+		if err := r.drawParagraph(marker); err != nil {
+			return err
+		}
+		for _, b := range r.doc.Endnotes[id] {
+			switch v := b.(type) {
+			case docx.Paragraph:
+				if err := r.drawParagraph(v); err != nil {
+					return err
+				}
+			case docx.Table:
+				if err := r.drawTable(v); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // appendNotesSection appends a heading + the note bodies (each prefixed with
 // "[id]") to the current page. Skipped silently if notes is empty.
+
 func (r *renderer) appendNotesSection(notes map[string][]docx.Block, title string) error {
 	if len(notes) == 0 {
 		return nil
@@ -242,8 +670,17 @@ func (r *renderer) appendNotesSection(notes map[string][]docx.Block, title strin
 		return err
 	}
 	for _, id := range ids {
+		label := id
+		// appendNotesSection is called for both footnotes and endnotes;
+		// pick the right label map by checking which one contains the
+		// id (the maps are disjoint by source).
+		if lbl, ok := r.footnoteLabels[id]; ok && lbl != "" {
+			label = lbl
+		} else if lbl, ok := r.endnoteLabels[id]; ok && lbl != "" {
+			label = lbl
+		}
 		marker := docx.Paragraph{
-			Runs: []docx.Run{{Text: "[" + id + "] ", Props: docx.RunProps{Bold: true}}},
+			Runs: []docx.Run{{Text: label + ". ", Props: docx.RunProps{Bold: true}}},
 		}
 		if err := r.drawParagraph(marker); err != nil {
 			return err
@@ -294,6 +731,13 @@ func drawLineNumbers(r *renderer, sec docx.Section) {
 	r.pdf.SetTextColor(120, 120, 120)
 	n := r.lineNumCounter
 	for y := r.marT; y+lineH < r.pageH-r.marB; y += lineH {
+		// w:suppressLineNumbers paragraphs don't advance the counter or
+		// emit a marker. We check the suppressed bands rather than
+		// per-paragraph since the line-number gutter is rasterized after
+		// the page body is finished.
+		if isSuppressedY(r.suppressedLineNumRanges, y, y+lineH) {
+			continue
+		}
 		if n%countBy == 0 {
 			r.pdf.SetX(x)
 			r.pdf.SetY(y)
@@ -306,14 +750,100 @@ func drawLineNumbers(r *renderer, sec docx.Section) {
 	}
 }
 
-// drawPageBorders draws the four w:pgBorders edges inset slightly from the
-// page edge.
+// isSuppressedY reports whether a line whose top/bottom y straddle any of
+// the suppressed ranges should be skipped. A line that partially overlaps
+// a suppressed band still skips — Word's behavior is conservative.
+func isSuppressedY(ranges []suppressedRange, top, bottom float64) bool {
+	for _, sr := range ranges {
+		if bottom < sr.top || top > sr.bottom {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// pageBorderRect computes the four border-line positions for the current
+// page. With offsetFrom="page" the inset is measured from the page edge;
+// with offsetFrom="text" it's measured outward from the text margin (so
+// the border sits BETWEEN the page edge and the margin).
+func pageBorderRect(r *renderer, b docx.PageBorders) (x1, y1, x2, y2 float64) {
+	top := b.OffsetTopPt
+	bot := b.OffsetBottomPt
+	lef := b.OffsetLeftPt
+	rig := b.OffsetRightPt
+	if top == 0 {
+		top = 24
+	}
+	if bot == 0 {
+		bot = 24
+	}
+	if lef == 0 {
+		lef = 24
+	}
+	if rig == 0 {
+		rig = 24
+	}
+	if b.OffsetFromText {
+		// Sit `offset` outward from the text edge — i.e. closer to the
+		// page edge by the offset amount.
+		x1 = r.marL - lef
+		y1 = r.marT - top
+		x2 = r.pageW - r.marR + rig
+		y2 = r.pageH - r.marB + bot
+		if x1 < 1 {
+			x1 = 1
+		}
+		if y1 < 1 {
+			y1 = 1
+		}
+		if x2 > r.pageW-1 {
+			x2 = r.pageW - 1
+		}
+		if y2 > r.pageH-1 {
+			y2 = r.pageH - 1
+		}
+		return
+	}
+	x1 = lef
+	y1 = top
+	x2 = r.pageW - rig
+	y2 = r.pageH - bot
+	return
+}
+
+// shouldDrawPageBorder reports whether the page-border frame should appear
+// on this page given the section's w:display selector:
+//
+//	"" / "allPages": draw on every page.
+//	"firstPage":     only on the section's first page.
+//	"notFirstPage": every page except the section's first.
+//	"notLastPage":  every page except the section's last (Word actually
+//	                spells this "lastPage" with inverted semantics; we
+//	                accept either form to stay forgiving).
+func shouldDrawPageBorder(display string, pageInSection int, isLastSecPage bool) bool {
+	switch display {
+	case "", "allPages":
+		return true
+	case "firstPage":
+		return pageInSection == 1
+	case "notFirstPage":
+		return pageInSection != 1
+	case "lastPage":
+		return isLastSecPage
+	case "notLastPage":
+		return !isLastSecPage
+	}
+	return true
+}
+
+// drawPageBorders draws the four w:pgBorders edges. Position respects
+// w:offsetFrom + each edge's w:space (offsets in points).
 func drawPageBorders(r *renderer, b docx.PageBorders) {
 	if !(b.Top.Has() || b.Bottom.Has() || b.Left.Has() || b.Right.Has()) {
 		return
 	}
-	inset := 18.0
-	x1, y1, x2, y2 := inset, inset, r.pageW-inset, r.pageH-inset
+	x1, y1, x2, y2 := pageBorderRect(r, b)
 	if b.Top.Has() {
 		drawCellEdge(r, b.Top, x1, y1, x2, y1)
 	}
@@ -328,6 +858,51 @@ func drawPageBorders(r *renderer, b docx.PageBorders) {
 	}
 }
 
+// applyPageBorderMargins enlarges the current marL/marR/marT/marB so they
+// don't overlap with the visible page-border lines. Called after the
+// section's page geometry has been set up but before content is drawn.
+//
+// When offsetFrom="text" the borders sit OUTSIDE the text edge, so no
+// margin adjustment is necessary. When offsetFrom="page", the borders are
+// at fixed insets from the page edge; if a tiny user margin would let
+// content cross the border, push the margin out to clear it.
+func applyPageBorderMargins(r *renderer, b docx.PageBorders) {
+	if b.OffsetFromText {
+		return
+	}
+	if !(b.Top.Has() || b.Bottom.Has() || b.Left.Has() || b.Right.Has()) {
+		return
+	}
+	const padPt = 4.0 // extra breathing room between border and text
+	getOffset := func(o float64) float64 {
+		if o == 0 {
+			return 24
+		}
+		return o
+	}
+	if b.Top.Has() {
+		if min := getOffset(b.OffsetTopPt) + b.Top.Sz + padPt; r.marT < min {
+			r.marT = min
+		}
+	}
+	if b.Bottom.Has() {
+		if min := getOffset(b.OffsetBottomPt) + b.Bottom.Sz + padPt; r.marB < min {
+			r.marB = min
+		}
+	}
+	if b.Left.Has() {
+		if min := getOffset(b.OffsetLeftPt) + b.Left.Sz + padPt; r.marL < min {
+			r.marL = min
+		}
+	}
+	if b.Right.Has() {
+		if min := getOffset(b.OffsetRightPt) + b.Right.Sz + padPt; r.marR < min {
+			r.marR = min
+		}
+	}
+	r.contentW = r.pageW - r.marL - r.marR
+}
+
 func (r *renderer) ensureRoom(h float64) {
 	if r.noPageBreak {
 		return
@@ -335,7 +910,7 @@ func (r *renderer) ensureRoom(h float64) {
 	if r.cursorY+h > r.pageH-r.marB {
 		if r.numColumns > 1 && r.colIdx < int(r.numColumns)-1 {
 			r.colIdx++
-			r.marL = r.colBaseX + float64(r.colIdx)*(r.colW+r.colGap)
+			r.applyColumn(r.colIdx)
 			r.cursorY = r.marT
 			return
 		}
@@ -343,9 +918,23 @@ func (r *renderer) ensureRoom(h float64) {
 		r.newPage()
 		if r.numColumns > 1 {
 			r.colIdx = 0
-			r.marL = r.colBaseX
+			r.applyColumn(0)
 		}
 	}
+}
+
+// applyColumn sets marL / contentW for column idx. When colSpecs is set
+// (unequal widths) the per-column rect is used; otherwise we use the
+// equal-distribution formula.
+func (r *renderer) applyColumn(idx int) {
+	if len(r.colSpecs) > 0 && idx < len(r.colSpecs) {
+		r.marL = r.colSpecs[idx].x
+		r.contentW = r.colSpecs[idx].w
+		r.colW = r.colSpecs[idx].w
+		return
+	}
+	r.marL = r.colBaseX + float64(idx)*(r.colW+r.colGap)
+	r.contentW = r.colW
 }
 
 // drawFootnotesAtBottom emits pendingFootnotes immediately above the bottom
@@ -374,10 +963,20 @@ func (r *renderer) drawFootnotesAtBottom() {
 		r.noPageBreak = savedNoPageBreak
 	}()
 
-	r.pdf.SetLineWidth(0.5)
-	r.pdf.SetStrokeColor(120, 120, 120)
-	r.pdf.Line(r.marL, startY, r.marL+r.contentW*0.3, startY)
-	r.cursorY = startY + 2
+	// If the doc declared a custom <w:footnote w:type="separator"> body,
+	// draw that instead of our default thin rule. The custom separator is
+	// a list of paragraphs (usually one paragraph with a tab-stop and a
+	// thin line), so we render it via drawAt at the bottom-of-page anchor.
+	customSep := r.doc.FootnoteSeparators["separator"]
+	if len(customSep) > 0 {
+		_ = r.drawAt(customSep, r.marL, startY, r.contentW)
+		r.cursorY = startY + 8
+	} else {
+		r.pdf.SetLineWidth(0.5)
+		r.pdf.SetStrokeColor(120, 120, 120)
+		r.pdf.Line(r.marL, startY, r.marL+r.contentW*0.3, startY)
+		r.cursorY = startY + 2
+	}
 
 	logFn := r.opts.Logger
 	if logFn == nil && r.opts.Verbose {
@@ -392,14 +991,22 @@ func (r *renderer) drawFootnotesAtBottom() {
 
 	for _, pn := range r.pendingFootnotes {
 		var blocks []docx.Block
+		labels := r.footnoteLabels
 		if pn.endnote {
 			blocks = r.doc.Endnotes[pn.id]
+			labels = r.endnoteLabels
 		} else {
 			blocks = r.doc.Footnotes[pn.id]
 		}
+		label := pn.id
+		if labels != nil {
+			if lbl, ok := labels[pn.id]; ok && lbl != "" {
+				label = lbl
+			}
+		}
 		marker := docx.Paragraph{
 			Runs: []docx.Run{{
-				Text: "[" + pn.id + "] ", Props: docx.RunProps{Bold: true, FontSize: 9},
+				Text: label + ". ", Props: docx.RunProps{Bold: true, FontSize: 9},
 			}},
 		}
 		logErr("marker "+pn.id, r.drawParagraph(marker))
@@ -425,6 +1032,10 @@ func (r *renderer) newPage() {
 		PageSize: &gopdf.Rect{W: r.pageW, H: r.pageH},
 	})
 	r.cursorY = r.marT
+	// Wrap bands belong to the page they were established on — drop any
+	// active band so content on the new page starts at full width.
+	r.floatBand = nil
+	r.suppressedLineNumRanges = r.suppressedLineNumRanges[:0]
 	primeContentStream(r.pdf)
 }
 

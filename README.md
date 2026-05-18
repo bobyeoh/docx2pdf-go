@@ -199,6 +199,7 @@ docx2pdf -in ./input -out ./output -recursive -workers 8
 | `-size N` | Default font size in points (default 11) |
 | `-page-numbers` | Draw "X / N" at the bottom of every page |
 | `-author NAME` | Override `AUTHOR` field + PDF metadata `Author` |
+| `-show-revisions` | Render tracked changes inline (insertions underlined, deletions struck through, per-author colors) instead of silently accepting them |
 | `-recursive` | In batch mode, descend into subdirectories |
 | `-workers N` | Parallel batch workers (default 1) |
 | `-keep-going` | Don't abort the batch on per-file errors |
@@ -332,9 +333,9 @@ docker run --rm -v "$PWD":/work \
 | Image cropping (`a:srcRect`) and explicit extent | ✅ |
 | Legacy VML images (`w:pict` / `v:imagedata`) — older Word, Excel/Outlook pastes | ✅ |
 | Anchored images (`wp:anchor`) — rendered as inline best-effort | ⚠️ |
-| Text wrap around floating images | ❌ |
+| Text wrap around floating images (`wp:anchor` square / tight / topAndBottom) — bbox-based per-line exclusion | ✅ |
 | SmartArt diagrams | ❌ |
-| Charts (`c:chart`) — title / labels extracted as `[Chart: …]` text | ⚠️ |
+| Charts (`c:chart`) — bar / column / pie / doughnut / line / scatter / area / bubble / radar drawn natively; uncovered kinds (3D, surface, stock, combo) fall back to text | ✅ |
 
 ### Document structure & metadata
 
@@ -346,9 +347,10 @@ docker run --rm -v "$PWD":/work \
 | Both field encodings: `fldChar` complex + `fldSimple` compact | ✅ |
 | Footnotes & endnotes (refs as `[N]`, bodies at page bottom / trailer) | ✅ |
 | Comments (`comments.xml`) — surfaced as a trailing "Comments" section | ✅ |
-| Tracked changes (`w:ins` / `w:del` / `w:moveFrom` / `w:moveTo`) — accept-all | ✅ |
-| Content controls (`w:sdt`) — block + inline, transparent wrapper | ✅ |
+| Tracked changes (`w:ins` / `w:del` / `w:moveFrom` / `w:moveTo`) — accept-all by default, `-show-revisions` decorates with per-author colors | ✅ |
+| Content controls (`w:sdt`) — block + inline; data binding (`w:dataBinding`); OpenDoPE `od:condition` / `od:repeat` / `od:xpath` markers honored when bound XPaths resolve via customXml | ✅ |
 | `mc:AlternateContent` — Choice over Fallback | ✅ |
+| AltChunk parts (HTML / RTF / plain) — HTML parsed into Paragraph / Run tree with bold / italic / underline / strike / sub-sup / lists / headings / hyperlinks / inline-style colors | ✅ |
 | Doc properties (`docProps/core.xml` + `app.xml`) → PDF /Info | ✅ |
 | Settings (`settings.xml`) — defaultTabStop / evenAndOddHeaders / displayBackgroundShape | ✅ |
 
@@ -356,14 +358,28 @@ docker run --rm -v "$PWD":/work \
 
 | Feature | Status |
 |---|---|
-| Math equations (`m:oMath` / `m:oMathPara`) — text extracted as italic, structure lost | ⚠️ |
+| Math equations (`m:oMath` / `m:oMathPara`) — fractions (bar / skw / lin / noBar), radicals, n-aries with limLoc + sup/subHide, super/subscripts, prescripts (`m:sPre`), delimiters with grow, matrices, accents | ✅ |
 | Text boxes (`wps:txbx`) — inline-extracted as italic; box geometry not preserved | ⚠️ |
 | Floating frames (`w:framePr`) — anchored correctly; body text does **not** wrap around | ⚠️ |
-| RTL (Hebrew / Arabic) — word order reversed, right-aligned; no UAX#9 mixed-direction | ⚠️ |
+| RTL (Hebrew / Arabic) — UAX#9 paragraph-level bidi reordering for mixed-direction text + Arabic letter shaping (Initial / Medial / Final / Isolated forms via Arabic Presentation Forms-B) | ✅ |
 | OLE / embedded objects — emit `[Embedded object]` placeholder | ⚠️ |
-| Arabic letter shaping (initial / medial / final) | ❌ |
+| EMF / WMF vector images — detected with intrinsic dimensions extracted from the file header; rendered as a labeled placeholder box at the original aspect ratio (no rasterization of vector contents) | ⚠️ |
+| SVG image fills (`a:svgBlip`) — fallback raster blip is used when present, SVG itself is skipped | ❌ |
+| SmartArt — uses Word's pre-rendered drawing part when present; otherwise synthesizes a layout based on the diagram's `layoutDef`: cycle / hierarchy / pyramid / list / matrix / radial / process | ✅ |
+| Cell text rotation (`w:textDirection` = `tbRl` / `btLr` / `lrTbV` / `tbRlV` / `tbLrV`) | ✅ |
+| 3D text effects (`w14:scene3d` / `w14:props3d`) — rendered as a layered depth-shadow approximation (no real 3D projection) | ⚠️ |
 | Form controls' interactive behavior | ❌ |
-| Embedded fonts (`w:embedRegular`) loaded from package | ❌ |
+| Embedded fonts (`w:embedRegular` / Bold / Italic / BoldItalic) — deobfuscated and registered with PDF | ✅ |
+| Tracked changes (ins / del / moveTo / moveFrom + rPr/pPr/tbl/tc/tr property changes) — visible markup + margin change bars when `ShowRevisions` is on | ✅ |
+| Section break types — `nextPage` / `continuous` / `evenPage` / `oddPage` / `nextColumn` all honored | ✅ |
+| Section vertical alignment — `top` / `center` / `bottom` / `both` (vertical justify) | ✅ |
+| Table conditional formatting — `tblLook` + explicit `w:cnfStyle` per row/cell, row/col band sizes, table `jc`, `bidiVisual`, table-level shading | ✅ |
+| Table row controls — `w:hidden`, `w:gridBefore` / `w:gridAfter`, `w:hideMark` (collapse paragraph-mark floor), `w:noWrap` (drives autofit min width) | ✅ |
+| Charts — column / bar / pie / doughnut / line / area / radar / bubble / scatter (with markers) / stock (candlesticks) / surface (stacked bands) / pie-of-pie | ✅ |
+| Word-level fields — PAGE / NUMPAGES / DATE / TIME / TOC / INDEX / STYLEREF / REF / PAGEREF / NOTEREF / HYPERLINK / SYMBOL / QUOTE / IF / COMPARE / SEQ / MERGEFIELD / MERGEREC / MERGESEQ / NEXT / NEXTIF / SKIPIF / SET / DOCVARIABLE / formula (`=`) | ✅ |
+| Underline styles — single / double / dotted / dottedHeavy / dash / dashed / wave / wavy / thick (plus dashDot variants) | ✅ |
+| `w:dstrike` (double strikethrough) | ✅ |
+| CJK emphasis marks (`w:em` = dot / circle / comma / underDot) | ✅ |
 
 If your document hinges on the "❌" rows and you need pixel-perfect
 rendering, **fall back to a LibreOffice-backed service**. The "⚠️" rows
@@ -551,13 +567,12 @@ may gain fields as features land. Pin a tag in production.
 Issues and PRs welcome. Highest-impact missing features (in roughly that
 order):
 
-1. Text wrap around floating images / frames — needs per-line shape
-   exclusion in the layout pass (`wp:anchor` with wrap geometry, `w:framePr`
-   currently positions but doesn't wrap)
+1. (done) Floating-image bbox wrap; remaining: shape-exact "through"
+   wrap that follows the image's alpha contour (currently uses the bbox)
 2. Full UAX#9 bidi for mixed-direction lines (Latin embedded in Arabic)
 3. Arabic letter shaping (initial / medial / final connected forms)
 4. SmartArt rendering
-5. Embedded fonts (`w:embedRegular`) loaded from the package
+5. (done) Embedded fonts
 
 ---
 

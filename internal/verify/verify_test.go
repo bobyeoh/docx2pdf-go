@@ -255,7 +255,7 @@ func allCases() []verifyCase {
 		caseComments(),
 		caseHeadingOutline(),
 		caseChartTextExtraction(),
-		caseChartBarRender(),
+		caseSmartArtTextExtraction(),
 		casePageBreakBeforeValZero(),
 		caseOverwideWordInCell(),
 		caseHorizontalRuleVMLPict(),
@@ -4408,76 +4408,76 @@ func caseChartTextExtraction() verifyCase {
 	}
 }
 
-// caseChartBarRender exercises the actual chart-drawing path with
-// numeric values present. The chart's title + legend + category
-// labels survive as PDF text via the chart renderer's Cell calls.
-func caseChartBarRender() verifyCase {
+// caseSmartArtTextExtraction: a w:drawing carrying a dgm:relIds
+// reference to a SmartArt data part. Without parsing, every node
+// label is dropped. We assert each label survives in the produced
+// PDF.
+func caseSmartArtTextExtraction() verifyCase {
 	return verifyCase{
-		name:        "127a_chart_bar",
-		description: "Bar chart with numeric data renders title/legend/categories as PDF text",
+		name:        "127b_smartart_text",
+		description: "SmartArt diagram node text (dgm:pt/dgm:t) is surfaced from the data part",
 		build: func(t *testing.T, dir string) string {
-			chart := `<?xml version="1.0"?>
-<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
-              xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
-  <c:chart>
-    <c:title>
-      <c:tx><c:rich><a:p><a:r><a:t>QUARTERLY-REVENUE</a:t></a:r></a:p></c:rich></c:tx>
-    </c:title>
-    <c:plotArea>
-      <c:barChart>
-        <c:barDir val="col"/>
-        <c:ser>
-          <c:tx><c:strRef><c:strCache><c:pt idx="0"><c:v>WIDGETS-INC</c:v></c:pt></c:strCache></c:strRef></c:tx>
-          <c:cat>
-            <c:strRef><c:strCache>
-              <c:pt idx="0"><c:v>QUARTER-ONE</c:v></c:pt>
-              <c:pt idx="1"><c:v>QUARTER-TWO</c:v></c:pt>
-              <c:pt idx="2"><c:v>QUARTER-THREE</c:v></c:pt>
-            </c:strCache></c:strRef>
-          </c:cat>
-          <c:val>
-            <c:numRef><c:numCache>
-              <c:pt idx="0"><c:v>30</c:v></c:pt>
-              <c:pt idx="1"><c:v>45</c:v></c:pt>
-              <c:pt idx="2"><c:v>60</c:v></c:pt>
-            </c:numCache></c:numRef>
-          </c:val>
-        </c:ser>
-      </c:barChart>
-    </c:plotArea>
-  </c:chart>
-</c:chartSpace>`
+			data := `<?xml version="1.0"?>
+<dgm:dataModel xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram"
+               xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <dgm:ptLst>
+    <dgm:pt modelId="1" type="doc"/>
+    <dgm:pt modelId="2">
+      <dgm:t><a:p><a:r><a:t>STAGE-ALPHA</a:t></a:r></a:p></dgm:t>
+    </dgm:pt>
+    <dgm:pt modelId="3">
+      <dgm:t><a:p><a:r><a:t>STAGE-BETA</a:t></a:r></a:p></dgm:t>
+    </dgm:pt>
+    <dgm:pt modelId="4">
+      <dgm:t><a:p><a:r><a:t>STAGE-GAMMA</a:t></a:r></a:p></dgm:t>
+    </dgm:pt>
+    <dgm:pt modelId="P1" type="pres">
+      <dgm:t><a:p><a:r><a:t>SKIP-ME-PRES</a:t></a:r></a:p></dgm:t>
+    </dgm:pt>
+  </dgm:ptLst>
+</dgm:dataModel>`
 			body := `
     <w:p>
+      <w:r><w:t xml:space="preserve">Workflow: </w:t></w:r>
       <w:r>
         <w:drawing>
           <wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">
-            <wp:extent cx="3000000" cy="2000000"/>
+            <wp:extent cx="4000000" cy="2000000"/>
             <a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
               <a:graphicData>
-                <c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" r:id="rChart"/>
+                <dgm:relIds xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram" r:dm="rDiagram" r:lo="rLayout" r:qs="rQS" r:cs="rCS"/>
               </a:graphicData>
             </a:graphic>
           </wp:inline>
         </w:drawing>
       </w:r>
+      <w:r><w:t xml:space="preserve"> end.</w:t></w:r>
     </w:p>`
 			return newDocx().
 				RawBody(docHeader+body+docFooter).
-				Part("charts/chart1.xml", chart).
+				Part("diagrams/data1.xml", data).
 				Rels(`<?xml version="1.0"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-  <Relationship Id="rChart" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="charts/chart1.xml"/>
+  <Relationship Id="rDiagram" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData" Target="diagrams/data1.xml"/>
 </Relationships>`).
 				Write(t, dir)
 		},
 		expectText: []string{
-			"QUARTERLY-REVENUE",
-			"QUARTER-ONE",
-			"QUARTER-TWO",
-			"QUARTER-THREE",
+			"Workflow",
+			"STAGE-ALPHA",
+			"STAGE-BETA",
+			"STAGE-GAMMA",
+			"end",
 		},
 		expectPages: 1,
+		custom: func(t *testing.T, pdf string, fail func(format string, args ...any)) {
+			txt := pdftotext(t, pdf)
+			// Presentation scaffold nodes (type="pres") must not
+			// appear — they're algorithmic noise.
+			if strings.Contains(txt, "SKIP-ME-PRES") {
+				fail("presentation node leaked into PDF: %s", txt)
+			}
+		},
 	}
 }
 

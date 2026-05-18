@@ -8,11 +8,13 @@ import (
 )
 
 const (
-	defaultFamily  = "doc"
-	boldFamily     = "doc-b"
-	italicFamily   = "doc-i"
-	headingFamily  = "doc-h"
-	fallbackFamily = "doc-fb"
+	defaultFamily   = "doc"
+	boldFamily      = "doc-b"
+	italicFamily    = "doc-i"
+	headingFamily   = "doc-h"
+	fallbackFamily  = "doc-fb"
+	symbolFamily    = "doc-sym"
+	embFamilyPrefix = "emb-"
 )
 
 // applyEmbeddedDocFonts substitutes sentinel paths into the relevant
@@ -99,6 +101,8 @@ func (r *renderer) registerFonts() error {
 	r.tryLoadOptionalFont(italicFamily, r.opts.FontItalic)
 	r.tryLoadOptionalFont(headingFamily, r.opts.FontHeading)
 	r.tryLoadOptionalFont(fallbackFamily, r.opts.FontFallback)
+	r.tryLoadOptionalFont(symbolFamily, r.opts.FontSymbol)
+	r.registerEmbeddedFonts()
 	return nil
 }
 
@@ -171,11 +175,11 @@ func isMajorThemeRole(role string) bool {
 }
 
 // selectFont picks the registered family that should render `p`, honoring
-// bold/italic variants when available. A run whose theme font role is
-// "major*" (heading) routes to the heading family if FontHeading was
-// registered; otherwise it falls through to the regular face — keeping
-// behavior unchanged for callers that don't opt into a heading font.
+// bold/italic variants when available. Embedded fonts take priority.
 func (r *renderer) selectFont(p docx.RunProps) string {
+	if fam := r.resolveEmbedded(p); fam != "" {
+		return fam
+	}
 	if isMajorThemeRole(p.ThemeFontRole) && r.fonts[headingFamily] {
 		return headingFamily
 	}
@@ -186,6 +190,120 @@ func (r *renderer) selectFont(p docx.RunProps) string {
 		return italicFamily
 	}
 	return defaultFamily
+}
+
+// registerEmbeddedFonts iterates deobfuscated fonts from fontTable.xml
+// and registers each variant with gopdf.
+func (r *renderer) registerEmbeddedFonts() {
+	if len(r.doc.EmbeddedFonts) == 0 {
+		return
+	}
+	if r.embeddedFamilies == nil {
+		r.embeddedFamilies = map[string]embeddedFamily{}
+	}
+	log := r.opts.Logger
+	if log == nil && r.opts.Verbose {
+		log = func(s string) { fmt.Println(s) }
+	}
+	if log == nil {
+		log = func(string) {}
+	}
+	idx := 0
+	names := make([]string, 0, len(r.doc.EmbeddedFonts))
+	for k := range r.doc.EmbeddedFonts {
+		names = append(names, k)
+	}
+	for i := 1; i < len(names); i++ {
+		for j := i; j > 0 && names[j] < names[j-1]; j-- {
+			names[j], names[j-1] = names[j-1], names[j]
+		}
+	}
+	for _, name := range names {
+		ef := r.doc.EmbeddedFonts[name]
+		fam := embeddedFamily{}
+		regular := fmt.Sprintf("%s%d", embFamilyPrefix, idx)
+		bold := regular + "-b"
+		italic := regular + "-i"
+		boldItalic := regular + "-bi"
+		idx++
+		if ef.Regular != nil {
+			if err := r.pdf.AddTTFFontData(regular, ef.Regular); err == nil {
+				r.fonts[regular] = true
+				fam.regular = regular
+			} else {
+				log(fmt.Sprintf("font: embedded %s regular load: %v", name, err))
+			}
+		}
+		if ef.Bold != nil {
+			if err := r.pdf.AddTTFFontData(bold, ef.Bold); err == nil {
+				r.fonts[bold] = true
+				fam.bold = bold
+			} else {
+				log(fmt.Sprintf("font: embedded %s bold load: %v", name, err))
+			}
+		}
+		if ef.Italic != nil {
+			if err := r.pdf.AddTTFFontData(italic, ef.Italic); err == nil {
+				r.fonts[italic] = true
+				fam.italic = italic
+			} else {
+				log(fmt.Sprintf("font: embedded %s italic load: %v", name, err))
+			}
+		}
+		if ef.BoldItalic != nil {
+			if err := r.pdf.AddTTFFontData(boldItalic, ef.BoldItalic); err == nil {
+				r.fonts[boldItalic] = true
+				fam.boldItalic = boldItalic
+			} else {
+				log(fmt.Sprintf("font: embedded %s bold-italic load: %v", name, err))
+			}
+		}
+		if fam.regular == "" && fam.bold == "" && fam.italic == "" && fam.boldItalic == "" {
+			continue
+		}
+		r.embeddedFamilies[name] = fam
+		r.embeddedFamilies[strings.ToLower(name)] = fam
+	}
+}
+
+type embeddedFamily struct {
+	regular, bold, italic, boldItalic string
+}
+
+// resolveEmbedded looks up the family id appropriate for the run's
+// bold/italic combination. Returns "" when no embedded match.
+func (r *renderer) resolveEmbedded(p docx.RunProps) string {
+	if len(r.embeddedFamilies) == 0 || p.FontFamily == "" {
+		return ""
+	}
+	fam, ok := r.embeddedFamilies[p.FontFamily]
+	if !ok {
+		fam, ok = r.embeddedFamilies[strings.ToLower(p.FontFamily)]
+	}
+	if !ok {
+		return ""
+	}
+	switch {
+	case p.Bold && p.Italic:
+		if fam.boldItalic != "" {
+			return fam.boldItalic
+		}
+		if fam.bold != "" {
+			return fam.bold
+		}
+		if fam.italic != "" {
+			return fam.italic
+		}
+	case p.Bold:
+		if fam.bold != "" {
+			return fam.bold
+		}
+	case p.Italic:
+		if fam.italic != "" {
+			return fam.italic
+		}
+	}
+	return fam.regular
 }
 
 // applyFontFamily activates a specific registered family at the run's size.
@@ -207,6 +325,14 @@ func (r *renderer) applyFontFamily(p docx.RunProps, family string) error {
 	}
 	if p.VertAlign == "superscript" || p.VertAlign == "subscript" {
 		size *= 0.6
+	}
+	// w:fitText horizontal squeeze — pre-computed at cell entry. We shrink
+	// the font size uniformly so the entire cell content stays within its
+	// column width. gopdf has no Tz (horizontal-scale) operator, so this
+	// is an isotropic approximation rather than the asymmetric squash
+	// Word performs; readable, just not pixel-faithful.
+	if r.fitTextScale > 0 && r.fitTextScale != 1.0 {
+		size *= r.fitTextScale
 	}
 	if err := r.pdf.SetFont(family, "", size); err != nil {
 		return err
@@ -241,25 +367,140 @@ func charSpacingFor(p docx.RunProps, fontSize float64) float64 {
 	return spacing
 }
 
-// applyLumModOff approximates Word's HSL luminance adjustments. lumMod
-// scales luminance (we accept 0..1); lumOff brightens toward white.
+// applyLumModOff implements Word's HSL luminance adjustments per the
+// OOXML spec: L' = L * lumMod + lumOff. The transform is performed in
+// HSL space (not RGB) so saturated accent colors shift correctly.
+//
+//	lumMod = 0 OR 1 → no luminance scaling
+//	lumOff > 0      → brighten by adding to L (clamped to 1)
+//	lumOff < 0      → darken (rare; spec allows negative)
+//
+// Special cases:
+//	If both are zero, return the hex unchanged.
+//	Pure grayscale colors (S = 0) keep saturation 0; only L moves.
 func applyLumModOff(hex string, lumMod, lumOff float64) string {
-	if lumMod == 0 && lumOff == 0 {
+	return applyColorMods(hex, lumMod, lumOff, 0, 0)
+}
+
+// applyColorMods extends applyLumModOff with saturation modulation
+// (satMod / satOff), per ECMA-376 §17.18.99. Order is L-then-S so the
+// L derivation matches Word; both transforms run in HSL space.
+func applyColorMods(hex string, lumMod, lumOff, satMod, satOff float64) string {
+	if lumMod == 0 && lumOff == 0 && satMod == 0 && satOff == 0 {
 		return hex
 	}
 	r, g, b := parseHexColor(hex)
-	rf, gf, bf := float64(r), float64(g), float64(b)
-	if lumMod > 0 && lumMod < 1 {
-		rf *= lumMod
-		gf *= lumMod
-		bf *= lumMod
+	h, s, l := rgbToHSL(r, g, b)
+	if lumMod != 0 && lumMod != 1 {
+		l *= lumMod
 	}
-	if lumOff > 0 && lumOff < 1 {
-		rf += (255 - rf) * lumOff
-		gf += (255 - gf) * lumOff
-		bf += (255 - bf) * lumOff
+	if lumOff > 0 {
+		l = l + (1-l)*lumOff
+	} else if lumOff < 0 {
+		l = l + l*lumOff
 	}
+	if satMod != 0 && satMod != 1 {
+		s *= satMod
+	}
+	if satOff > 0 {
+		s = s + (1-s)*satOff
+	} else if satOff < 0 {
+		s = s + s*satOff
+	}
+	if l < 0 {
+		l = 0
+	}
+	if l > 1 {
+		l = 1
+	}
+	if s < 0 {
+		s = 0
+	}
+	if s > 1 {
+		s = 1
+	}
+	rr, gg, bb := hslToRGB(h, s, l)
+	return fmt.Sprintf("%02X%02X%02X", rr, gg, bb)
+}
+
+// rgbToHSL converts 0..255 RGB to HSL in [0,1] for H/S/L.
+func rgbToHSL(r, g, b uint8) (h, s, l float64) {
+	rf := float64(r) / 255.0
+	gf := float64(g) / 255.0
+	bf := float64(b) / 255.0
+	maxV := rf
+	if gf > maxV {
+		maxV = gf
+	}
+	if bf > maxV {
+		maxV = bf
+	}
+	minV := rf
+	if gf < minV {
+		minV = gf
+	}
+	if bf < minV {
+		minV = bf
+	}
+	l = (maxV + minV) / 2
+	if maxV == minV {
+		return 0, 0, l
+	}
+	d := maxV - minV
+	if l > 0.5 {
+		s = d / (2 - maxV - minV)
+	} else {
+		s = d / (maxV + minV)
+	}
+	switch maxV {
+	case rf:
+		h = (gf - bf) / d
+		if gf < bf {
+			h += 6
+		}
+	case gf:
+		h = (bf-rf)/d + 2
+	default:
+		h = (rf-gf)/d + 4
+	}
+	h /= 6
+	return h, s, l
+}
+
+// hslToRGB inverts rgbToHSL.
+func hslToRGB(h, s, l float64) (uint8, uint8, uint8) {
+	if s == 0 {
+		v := uint8(l*255 + 0.5)
+		return v, v, v
+	}
+	q := l + s - l*s
+	if l < 0.5 {
+		q = l * (1 + s)
+	}
+	p := 2*l - q
+	hue2rgb := func(t float64) float64 {
+		if t < 0 {
+			t += 1
+		}
+		if t > 1 {
+			t -= 1
+		}
+		if t < 1.0/6.0 {
+			return p + (q-p)*6*t
+		}
+		if t < 0.5 {
+			return q
+		}
+		if t < 2.0/3.0 {
+			return p + (q-p)*(2.0/3.0-t)*6
+		}
+		return p
+	}
+	r := hue2rgb(h + 1.0/3.0)
+	g := hue2rgb(h)
+	b := hue2rgb(h - 1.0/3.0)
 	clamp := func(v float64) uint8 {
+		v = v*255 + 0.5
 		if v < 0 {
 			return 0
 		}
@@ -268,7 +509,7 @@ func applyLumModOff(hex string, lumMod, lumOff float64) string {
 		}
 		return uint8(v)
 	}
-	return fmt.Sprintf("%02X%02X%02X", clamp(rf), clamp(gf), clamp(bf))
+	return clamp(r), clamp(g), clamp(b)
 }
 
 // highlightRGB resolves Word's predefined w:highlight names to RGB.
@@ -397,7 +638,19 @@ func isCJK(r rune) bool {
 // these (notably Arial on macOS lacks U+2713 CHECK MARK), and any
 // real CJK fallback covers them.
 func (r *renderer) chooseFamily(rn rune, p docx.RunProps) string {
-	if r.fonts[fallbackFamily] && (isCJK(rn) || isSymbolGlyph(rn)) {
+	// Symbol-block runes (ballot box, arrows, dingbats, ...) prefer the
+	// dedicated symbol face when one is registered. CJK fonts often skip
+	// these blocks (WQY Zen Hei lacks U+2610 / U+2612, for example), so
+	// without a symbol font the glyph would render as a missing-GID box.
+	if isSymbolGlyph(rn) {
+		if r.fonts[symbolFamily] {
+			return symbolFamily
+		}
+		if r.fonts[fallbackFamily] {
+			return fallbackFamily
+		}
+	}
+	if r.fonts[fallbackFamily] && isCJK(rn) {
 		return fallbackFamily
 	}
 	return r.selectFont(p)

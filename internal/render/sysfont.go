@@ -14,6 +14,7 @@ import (
 const (
 	envFontRegular  = "DOCX2PDF_FONT"
 	envFontFallback = "DOCX2PDF_FONT_CJK"
+	envFontSymbol   = "DOCX2PDF_FONT_SYMBOL"
 )
 
 // embeddedRegularFont is the MIT-licensed Go font (~150KB, Latin only).
@@ -186,6 +187,49 @@ func systemCJKFontCandidates() []string {
 		"/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
 		"/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
 	}
+}
+
+// systemSymbolFontCandidates returns paths to TTF fonts that specifically
+// cover the Unicode symbol blocks Word's checkbox / arrow / dingbat
+// content controls emit (☐ ☒ ☑ ✓ ✗ → ←). Many fonts present in
+// distros that include "CJK fallback" coverage skip these blocks
+// (WQY Zen Hei is the canonical example), so we look for a dedicated
+// symbol face first.
+func systemSymbolFontCandidates() []string {
+	return []string{
+		// Noto Sans Symbols 2 — explicit symbol font, ~600KB, broadly
+		// packaged via font-noto on Alpine / RHEL / Debian.
+		"/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
+		"/usr/share/fonts/google-noto/NotoSansSymbols2-Regular.ttf",
+		"/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
+		"/usr/share/fonts/noto/NotoSansSymbols-Regular.ttf",
+		"/usr/share/fonts/google-noto/NotoSansSymbols-Regular.ttf",
+		"/usr/share/fonts/truetype/noto/NotoSansSymbols-Regular.ttf",
+		// DejaVu Sans is widely-installed; it covers ☐ ☒ ☑ at GID
+		// positions matching the standard Unicode mapping.
+		"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+		"/usr/share/fonts/dejavu/DejaVuSans.ttf",
+		"/usr/share/fonts/TTF/DejaVuSans.ttf",
+		"/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+		// macOS — Apple Symbols covers ballot box and dingbat ranges.
+		"/System/Library/Fonts/Apple Symbols.ttf",
+		"/Library/Fonts/Apple Symbols.ttf",
+		// Windows — Segoe UI Symbol carries the modern symbol set.
+		`C:\Windows\Fonts\seguisym.ttf`,
+		`C:\Windows\Fonts\segoeuisl.ttf`,
+	}
+}
+
+// findSystemSymbolFont returns the first existing path from
+// systemSymbolFontCandidates, then "". Used when Options.FontSymbol is
+// empty and $DOCX2PDF_FONT_SYMBOL is unset.
+func findSystemSymbolFont() string {
+	for _, p := range systemSymbolFontCandidates() {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
 }
 
 // findSystemCJKFont returns the first existing path from

@@ -18,6 +18,7 @@
 package render
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"image"
@@ -49,6 +50,14 @@ type Options struct {
 	// External callers should use those entry points instead of poking ctx
 	// directly. Public users get cancellation via convert.ConvertContext.
 	ctx context.Context
+	// prepopulatedBookmarkPages, when non-nil, seeds the renderer's
+	// bookmark→page map from a prior dry-run pass. Used for PAGEREF
+	// forward-reference resolution. Internal-only.
+	prepopulatedBookmarkPages map[string]int
+	// skipWrite, when true, asks RenderWriter to do all layout work but
+	// skip the final WriteTo. The dry pass uses this to populate
+	// bookmarkPages without producing a usable PDF.
+	skipWrite bool
 
 	// onHeadingPage is set internally during the TOC discovery render
 	// (see toc.go). drawParagraph invokes it for every heading-styled
@@ -77,6 +86,15 @@ type Options struct {
 	// $DOCX2PDF_FONT_CJK is consulted; missing it just means CJK glyphs
 	// share the regular face (and likely render as boxes).
 	FontFallback string
+	// FontSymbol is an optional TTF dedicated to glyphs in the Unicode
+	// symbol blocks (arrows, ballot boxes, dingbats, math operators) —
+	// runes that most regular and CJK fonts don't cover. When set, the
+	// renderer prefers it over FontFallback for those code points;
+	// otherwise it falls back to FontFallback then FontRegular. The
+	// canonical choice is NotoSansSymbols2-Regular.ttf, which carries the
+	// ballot-box family (☐ ☒ ☑) Word's content-control checkbox SDTs
+	// emit. Resolved from $DOCX2PDF_FONT_SYMBOL when empty.
+	FontSymbol string
 	// DefaultFontSize is the size in points used when the document does
 	// not specify one. Word's default is 11pt.
 	DefaultFontSize float64
@@ -84,6 +102,26 @@ type Options struct {
 	// of every page after the body is rendered.
 	PageNumbers bool
 	Verbose     bool
+	// ShowRevisions controls how tracked-changes runs are rendered.
+	// When false (default), del/moveFrom runs are silently dropped from
+	// the output (Word's "Accept All" semantics). When true, del/moveFrom
+	// runs render with strikethrough in red and ins/moveTo runs render
+	// with underline in blue — Word's "Show Markup" view.
+	ShowRevisions bool
+	// MergeData supplies values for MERGEFIELD fields. Keys are
+	// case-insensitive field names (e.g. "FirstName"). When a MERGEFIELD
+	// resolves through this map, the renderer substitutes the value
+	// (after applying \b prefix, \f suffix, and \* format switches);
+	// otherwise it falls back to Word's cached result region.
+	MergeData map[string]string
+	// MergeRecords drives Word's "Catalog" mail-merge mode: a document
+	// body that contains one record's worth of layout plus NEXT / NEXTIF
+	// / SKIPIF directives between records. Each NEXT directive advances
+	// the active record cursor; subsequent MERGEFIELDs read from
+	// MergeRecords[cursor]. When MergeRecords is non-empty it overrides
+	// MergeData (which becomes the implicit first record only when
+	// MergeRecords is nil).
+	MergeRecords []map[string]string
 }
 
 // RenderWithContext is Render with cancellation.
@@ -127,24 +165,23 @@ func Render(doc *docx.Document, outPath string, opts Options) error {
 // contents picks up real page numbers from a discovery render. The
 // normal single-pass path runs otherwise.
 func RenderWriter(doc *docx.Document, w io.Writer, opts Options) error {
-	if hasTOCField(doc) {
-		return renderWithTOC(doc, w, opts)
+	// Two-pass layout for PAGEREF forward-references. When the doc has any
+	// PAGEREF field and we're not already running the second pass, do a
+	// throwaway render first to populate bookmark→page mapping, then run
+	// the real render with the populated map seeded into Options.
+	if opts.prepopulatedBookmarkPages == nil && needsForwardPageRefPass(doc) {
+		seed := map[string]int{}
+		seedOpts := opts
+		seedOpts.prepopulatedBookmarkPages = seed
+		seedOpts.skipWrite = true
+		seedOpts.OnProgress = nil
+		seedOpts.Logger = nil
+		var discard bytes.Buffer
+		if err := RenderWriter(doc, &discard, seedOpts); err != nil {
+			return err
+		}
+		opts.prepopulatedBookmarkPages = seed
 	}
-	return renderImpl(doc, w, opts)
-}
-
-// renderImpl is the single-pass render loop. RenderWriter calls it
-// directly when no TOC discovery is needed; renderWithTOC in toc.go
-// calls it twice (a discard pass with an onHeadingPage callback set,
-// then the final pass with the populated TOC blocks spliced in).
-func renderImpl(doc *docx.Document, w io.Writer, opts Options) error {
-	// Pull in fonts the document embeds in word/fontTable.xml so that
-	// branded/specialty faces render even on hosts that don't have
-	// them installed. Runs before the env / system-font fallback so
-	// an embedded font wins over a near-match system font but loses
-	// to an explicit caller-supplied path.
-	embeddedFontData := applyEmbeddedDocFonts(&opts, doc)
-
 	if opts.FontRegular == "" {
 		// Resolution order when no explicit font was passed:
 		//   1. DOCX2PDF_FONT env var (set by our Docker image, also a
@@ -170,6 +207,17 @@ func renderImpl(doc *docx.Document, w io.Writer, opts Options) error {
 	}
 	if opts.FontFallback == "" {
 		opts.FontFallback = findSystemCJKFont()
+	}
+	// FontSymbol covers ballot-box / dingbat / arrow blocks that even a
+	// good CJK fallback (WQY Zen Hei in particular) often omits. Resolved
+	// from $DOCX2PDF_FONT_SYMBOL or system auto-detection. When still
+	// empty after both, runs in those blocks fall through to FontFallback
+	// then FontRegular — the legacy behavior.
+	if opts.FontSymbol == "" {
+		opts.FontSymbol = resolveFontFromEnv(envFontSymbol)
+	}
+	if opts.FontSymbol == "" {
+		opts.FontSymbol = findSystemSymbolFont()
 	}
 	if opts.DefaultFontSize == 0 {
 		opts.DefaultFontSize = 11
@@ -197,15 +245,46 @@ func renderImpl(doc *docx.Document, w io.Writer, opts Options) error {
 	firstH := twipsToPt(sections[0].PageSize.HeightTwips)
 	pdf.Start(gopdf.Config{PageSize: gopdf.Rect{W: firstW, H: firstH}})
 
+	parseRFCDate := func(s string) time.Time {
+		if s == "" {
+			return time.Time{}
+		}
+		if t, err := time.Parse(time.RFC3339, s); err == nil {
+			return t
+		}
+		if t, err := time.Parse("2006-01-02T15:04:05Z", s); err == nil {
+			return t
+		}
+		if t, err := time.Parse("2006-01-02", s); err == nil {
+			return t
+		}
+		return time.Time{}
+	}
+	// Prefer the doc's own creation date when present; the new-PDF time
+	// is only a fallback. This preserves provenance information for
+	// archive workflows that audit document age.
+	creationDate := parseRFCDate(doc.Properties.CreateDate)
+	if creationDate.IsZero() {
+		creationDate = time.Now()
+	}
+	// Fold the doc's keywords + custom DOC-properties into the subject
+	// when subject is empty — gopdf's PdfInfo doesn't expose a Keywords
+	// slot, but the Subject field is widely surfaced by readers and
+	// avoids dropping the metadata entirely. When the doc already has a
+	// subject, we leave it alone and the keywords stay accessible via
+	// DOCPROPERTY field expansion in the body.
+	subject := doc.Properties.Subject
+	if subject == "" && doc.Properties.Keywords != "" {
+		subject = doc.Properties.Keywords
+	}
 	pdf.SetInfo(gopdf.PdfInfo{
 		Title:        doc.Properties.Title,
-		Subject:      doc.Properties.Subject,
+		Subject:      subject,
 		Author:       firstNonEmpty(opts.Author, doc.Properties.Author),
-		Creator:      "docx2pdf-go",
+		Creator:      firstNonEmpty(doc.CustomProperties["Application"], "docx2pdf-go"),
 		Producer:     "docx2pdf-go (gopdf)",
-		CreationDate: time.Now(),
+		CreationDate: creationDate,
 	})
-
 	r := &renderer{
 		pdf:              &pdf,
 		doc:              doc,
@@ -214,24 +293,50 @@ func renderImpl(doc *docx.Document, w io.Writer, opts Options) error {
 		counters:         map[int]map[int]int{},
 		embeddedFontData: embeddedFontData,
 		fields: fieldVars{
-			now:         time.Now(),
-			filename:    filepath.Base(opts.SourceFilename),
+			now:           time.Now(),
+			decimalSymbol: doc.Settings.DecimalSymbol,
+			listSeparator: doc.Settings.ListSeparator,
+			filename:      filepath.Base(opts.SourceFilename),
 			author:      firstNonEmpty(opts.Author, doc.Properties.Author),
 			title:       doc.Properties.Title,
 			subject:     doc.Properties.Subject,
-			docProps:    buildDocPropertyMap(&doc.Properties, opts.Author),
-			docVars:     doc.Settings.DocVars,
-			created:     doc.Properties.Created,
-			modified:    doc.Properties.Modified,
-			lastPrinted: doc.Properties.LastPrinted,
-			totalTime:   doc.Properties.TotalTime,
+			company:     doc.Properties.Company,
+			keywords:    doc.Properties.Keywords,
+			comments:    doc.Properties.Comments,
+			numWords:    doc.Properties.Words,
+			numChars:    doc.Properties.Characters,
+			totalMinutes: doc.Properties.TotalTime,
+			createDate:  parseRFCDate(doc.Properties.CreateDate),
+			saveDate:    parseRFCDate(doc.Properties.ModifyDate),
+			printDate:   parseRFCDate(doc.Properties.PrintDate),
 			seqCounters: map[string]int{},
 			bookmarks:   doc.Bookmarks,
+			bookmarkPages: func() map[string]int {
+				// Seed from a prior dry pass when supplied; otherwise
+				// start empty and let atomBookmark populate it.
+				if opts.prepopulatedBookmarkPages != nil {
+					return opts.prepopulatedBookmarkPages
+				}
+				return map[string]int{}
+			}(),
+			docProperties: buildDocProperties(doc),
+			docVars:         doc.DocVars,
+			bibliography:    doc.Bibliography,
+			headings:        collectHeadings(doc),
+			styleParagraphs: collectStyleParagraphs(doc),
+			mergeData:       opts.MergeData,
+			mergeRecords:    opts.MergeRecords,
+			mergeState:      &mergeIterState{},
+			glossary:        doc.Glossary,
+			tcEntries:       collectTCEntries(doc),
+			xeEntries:       collectXEEntries(doc),
 		},
 	}
 	if err := r.registerFonts(); err != nil {
 		return err
 	}
+	r.footnoteLabels = buildNoteLabels(doc, false)
+	r.endnoteLabels = buildNoteLabels(doc, true)
 
 	// Track which sections each PDF page belongs to so stampPageDecorations
 	// can look up the right header/footer per page.
@@ -265,6 +370,8 @@ func renderImpl(doc *docx.Document, w io.Writer, opts Options) error {
 		marL += twipsToPt(sec.GutterTwips)
 		r.marL, r.marR, r.marT, r.marB = marL, marR, marT, marB
 		r.contentW = r.pageW - r.marL - r.marR
+		r.activeDocGrid = sec.DocGrid
+		applyPageBorderMargins(r, sec.Borders)
 		r.lineNumCounter = sec.LineNumbering.Start
 		if r.lineNumCounter < 1 {
 			r.lineNumCounter = 1
@@ -273,20 +380,60 @@ func renderImpl(doc *docx.Document, w io.Writer, opts Options) error {
 		// Section break TYPE is recorded on the section that's ENDING (it
 		// describes how the NEXT section starts), so the decision for
 		// whether section[i] starts on a new page comes from section[i-1].
+		// Beyond "continuous" (stay on page) we also honor:
+		//   "evenPage" — start on an even-numbered page, inserting a
+		//                blank page if the previous section ended odd.
+		//   "oddPage"  — symmetric: blank-insert to land on odd.
+		//   "nextColumn" — column break inside a multi-column section;
+		//                we approximate by advancing to the next column
+		//                slot, falling back to a page break when no
+		//                column context exists.
 		startsNewPage := true
+		extraPage := false
+		colBreak := false
 		if i == 0 {
 			startsNewPage = false
-		} else if sections[i-1].Type == "continuous" {
-			startsNewPage = false
+		} else {
+			switch sections[i-1].Type {
+			case "continuous":
+				startsNewPage = false
+			case "evenPage":
+				// pages before this section: pdf.GetNumberOfPages()
+				if pdf.GetNumberOfPages()%2 == 1 {
+					extraPage = true
+				}
+			case "oddPage":
+				if pdf.GetNumberOfPages()%2 == 0 {
+					extraPage = true
+				}
+			case "nextColumn":
+				colBreak = true
+				startsNewPage = false
+			}
 		}
 		switch {
 		case i == 0:
 			pdf.AddPage()
 			r.cursorY = r.marT
 			primeContentStream(&pdf)
+		case colBreak:
+			// Best-effort: when a column slot is active, advance; otherwise
+			// fall back to a normal page break.
+			if r.numColumns > 1 && r.colIdx+1 < int(r.numColumns) {
+				r.colIdx++
+				r.cursorY = r.marT
+			} else {
+				pdf.AddPageWithOption(gopdf.PageOption{PageSize: &gopdf.Rect{W: r.pageW, H: r.pageH}})
+				r.cursorY = r.marT
+				primeContentStream(&pdf)
+			}
 		case !startsNewPage:
 			// Continuous: stay on the same page, adopt new geometry.
 		default:
+			if extraPage {
+				pdf.AddPageWithOption(gopdf.PageOption{PageSize: &gopdf.Rect{W: r.pageW, H: r.pageH}})
+				primeContentStream(&pdf)
+			}
 			pdf.AddPageWithOption(gopdf.PageOption{
 				PageSize: &gopdf.Rect{W: r.pageW, H: r.pageH},
 			})
@@ -300,19 +447,70 @@ func renderImpl(doc *docx.Document, w io.Writer, opts Options) error {
 			r.numColumns = 1
 		}
 		r.colGap = twipsToPt(sec.ColumnSpaceTwips)
+		r.colDrawSep = sec.ColumnSeparator
+		r.colSpecs = nil
 		if r.numColumns > 1 {
 			full := r.pageW - r.marL - r.marR
-			r.colW = (full - r.colGap*(r.numColumns-1)) / r.numColumns
-			r.contentW = r.colW
-			r.colBaseX = r.marL
+			if !sec.ColumnEqualWidth && len(sec.ColumnSpecs) == int(r.numColumns) {
+				// Unequal widths: derive each column's (x, w) from the spec.
+				r.colSpecs = make([]columnRect, len(sec.ColumnSpecs))
+				x := r.marL
+				for i, c := range sec.ColumnSpecs {
+					w := twipsToPt(c.WidthTwips)
+					r.colSpecs[i] = columnRect{x: x, w: w}
+					x += w
+					gap := twipsToPt(c.SpaceTwips)
+					if i == len(sec.ColumnSpecs)-1 {
+						gap = 0
+					}
+					x += gap
+				}
+				r.colW = r.colSpecs[0].w
+				r.contentW = r.colW
+				r.colBaseX = r.colSpecs[0].x
+			} else {
+				r.colW = (full - r.colGap*(r.numColumns-1)) / r.numColumns
+				r.contentW = r.colW
+				r.colBaseX = r.marL
+			}
 			r.colIdx = 0
+			if r.colDrawSep {
+				drawColumnSeparators(r, sec)
+			}
 		} else {
 			r.colW = 0
 			r.colBaseX = r.marL
 			r.colIdx = 0
 		}
 
-		for _, b := range sec.Blocks {
+		// Section vAlign — when the section's content fits on a single
+		// page, pre-measure it and shift the starting cursorY so the
+		// content lands centered (or bottom-aligned). Cover pages
+		// commonly use "center" to vertically center a title.
+		// "both" (vertical justify) distributes slack between blocks
+		// instead of shifting the starting point: each inter-block gap
+		// grows by slack/(N-1) so content fills the page top-to-bottom.
+		var gapInjection float64
+		if sec.VAlign == "center" || sec.VAlign == "bottom" {
+			h := r.measureBlocks(sec.Blocks)
+			avail := (r.pageH - r.marB) - r.cursorY
+			if h > 0 && h <= avail {
+				slack := avail - h
+				if sec.VAlign == "center" {
+					r.cursorY += slack / 2
+				} else {
+					r.cursorY += slack
+				}
+			}
+		} else if sec.VAlign == "both" {
+			h := r.measureBlocks(sec.Blocks)
+			avail := (r.pageH - r.marB) - r.cursorY
+			n := len(sec.Blocks)
+			if h > 0 && h < avail && n > 1 {
+				gapInjection = (avail - h) / float64(n-1)
+			}
+		}
+		for bi, b := range sec.Blocks {
 			switch v := b.(type) {
 			case docx.Paragraph:
 				if err := r.drawParagraph(v); err != nil {
@@ -331,22 +529,38 @@ func renderImpl(doc *docx.Document, w io.Writer, opts Options) error {
 					return err
 				}
 			}
+			// vAlign="both": insert the per-gap distribution between
+			// every pair of consecutive blocks. The last block doesn't
+			// get a trailing gap.
+			if gapInjection > 0 && bi < len(sec.Blocks)-1 {
+				r.cursorY += gapInjection
+			}
+		}
+		// w:endnotePr w:pos="sectEnd" — emit this section's endnotes at
+		// section end instead of waiting for the doc-end trailer.
+		if sec.EndnotePr != nil && sec.EndnotePr.Pos == "sectEnd" {
+			if err := r.appendSectionEndnotes(sec, i); err != nil {
+				return err
+			}
 		}
 	}
 	r.drawFootnotesAtBottom()
 
 	progressFn(1.0, "done")
 
-	// Endnotes always go at document end as a trailer (Word puts them
-	// there too). Footnotes were already rendered at each page's bottom.
-	if err := r.appendNotesSection(doc.Endnotes, "Endnotes"); err != nil {
-		return err
+	// Endnotes go at document end as a trailer — UNLESS every section
+	// declared w:pos="sectEnd", in which case the endnotes already got
+	// emitted inline above and the trailer would be a duplicate.
+	if !allSectionsHaveSectEndnotes(doc.Sections) {
+		if err := r.appendNotesSection(doc.Endnotes, "Endnotes"); err != nil {
+			return err
+		}
 	}
 	// Comments are reviewer markup; they're not part of the visible body
 	// in Word's default print view, but dropping them silently loses
 	// content. Surface them as a trailing section after endnotes so a
 	// human can still see them in the produced PDF.
-	if err := r.appendNotesSection(doc.Comments, "Comments"); err != nil {
+	if err := r.appendCommentsSection(doc); err != nil {
 		return err
 	}
 
@@ -357,6 +571,14 @@ func renderImpl(doc *docx.Document, w io.Writer, opts Options) error {
 		if err := r.stampPageNumbers(); err != nil {
 			return err
 		}
+	}
+
+	if opts.skipWrite {
+		// Dry-run pass: layout is complete and bookmarkPages is now
+		// populated; the caller seeded their copy of the map into
+		// opts.prepopulatedBookmarkPages so it sees the updates. Skip
+		// the final WriteTo — we never want the discard buffer's bytes.
+		return nil
 	}
 
 	if _, err := pdf.WriteTo(w); err != nil {
@@ -394,6 +616,18 @@ type renderer struct {
 	colGap     float64
 	colBaseX   float64
 	colIdx     int
+	// colSpecs, when non-empty, carries the per-column (width, space) pair
+	// (in points) for unequal-width sections. The renderer uses it to size
+	// each column individually and to know whether to draw separators
+	// between adjacent columns.
+	colSpecs []columnRect
+	// colDrawSep is set when w:cols w:sep="1" — the renderer paints thin
+	// vertical rules between adjacent columns.
+	colDrawSep bool
+
+	// colSepPending records that we need to draw separators on every page
+	// of the active multi-column section. Cleared at section end.
+	colSepPending bool
 	// Line numbering state: counter advances per visible body line; reset
 	// to LineNumbering.Start at each section.
 	lineNumCounter int
@@ -422,9 +656,92 @@ type renderer struct {
 	// drawing; runsToAtoms uses it to reverse the rune sequence inside
 	// RTL word atoms. Cleared at paragraph end.
 	paragraphRTL bool
+	// paragraphKinsoku is true when the current paragraph honors East
+	// Asian line-break rules (forbidden start/end punctuation). Mirrors
+	// w:kinsoku — defaults on for paragraphs that did not opt out.
+	paragraphKinsoku bool
+	// paragraphOverflowPunct is true when trailing CJK punctuation may
+	// overhang the right margin instead of wrapping (w:overflowPunct).
+	// Defaults true; gates the "keep no-start atom on this line"
+	// behavior inside layoutLine.
+	paragraphOverflowPunct bool
+	// paragraphWordWrap is true when long Latin words may be split at
+	// arbitrary code points to fit the line (w:wordWrap). Defaults true.
+	paragraphWordWrap bool
+	// frameLastBottom captures the cursor Y at the end of a drawFrame
+	// call so wrap-around frames can register a float band sized to
+	// the rendered content.
+	frameLastBottom float64
 	// activeTabs is the active paragraph's tab stops, used by layoutLine
 	// to snap atomTab atoms to the next stop.
 	activeTabs []docx.TabStop
+	// embeddedFamilies maps docx font name to its registered gopdf
+	// family slots (populated from doc.EmbeddedFonts).
+	embeddedFamilies map[string]embeddedFamily
+	// activeTableSpacing is the table-level w:tblCellSpacing (twips) for
+	// the table currently being drawn.
+	activeTableSpacing int
+	// fitTextScale, when > 0 and != 1, scales the rendered font size of
+	// every text atom drawn inside a w:fitText cell. We set it before
+	// descending into the cell's blocks and reset it after.
+	fitTextScale float64
+	// activeDocGrid mirrors the current section's w:docGrid. When type
+	// is "lines" or "linesAndChars" with LinePitch > 0, applyLineHeight
+	// snaps to a multiple of the pitch so CJK lines align to the grid.
+	activeDocGrid docx.DocGrid
+	// footnoteLabels / endnoteLabels map a w:id to its formatted display
+	// label (honoring section-level numFmt / numStart / numRestart). The
+	// renderer rewrites the literal "[id]" text on reference runs and on
+	// page-bottom marker paragraphs through these maps.
+	footnoteLabels map[string]string
+	endnoteLabels  map[string]string
+	// suppressedLineNumRanges holds per-page (topY, bottomY) bands where
+	// drawLineNumbers must skip — paragraphs with w:suppressLineNumbers.
+	// Reset on every page boundary; the renderer appends as it draws each
+	// paragraph and consults the list when emitting the page's gutter
+	// numbers.
+	suppressedLineNumRanges []suppressedRange
+	// floatBand, when non-nil, narrows the line/paragraph horizontal band
+	// so subsequent text flows beside a floating image / shape instead of
+	// stacking below it. Implements w:wrap="square" (and best-effort
+	// "tight") for anchored drawings whose positionH aligns left or right.
+	// The band auto-clears the first time the renderer notices cursorY
+	// crossed bottomY, falling back to the natural full-width geometry.
+	floatBand *floatWrapBand
+}
+
+// floatWrapBand is the active text-wrap exclusion zone for a single
+// floating drawing. Coordinates are in renderer (page) space.
+type floatWrapBand struct {
+	leftX   float64 // image's left edge
+	rightX  float64 // image's right edge
+	topY    float64 // y where the band starts (image top)
+	bottomY float64 // y where the band ends (image top + image height)
+	side    string  // "left" or "right" — which side of the page the image hugs
+	gapPt   float64 // horizontal padding between image and flowing text
+	// polygon, when non-empty, carries wp:wrapPolygon vertices in
+	// renderer-space PDF points. The band's edges at any given y become
+	// the polygon's min/max x crossing that scanline instead of the bbox
+	// leftX/rightX. Vertices are already translated to (leftX + dx,
+	// topY + dy) absolute coordinates.
+	polygon []polyVertex
+	// polyMinY / polyMaxY cache the polygon's vertical extent. Outside
+	// this range, the band has no horizontal effect (text flows freely
+	// above the polygon's top and below its bottom even though the bbox
+	// would still exclude).
+	polyMinY, polyMaxY float64
+}
+
+// polyVertex is one wrap-path vertex in PDF-point page coordinates.
+type polyVertex struct {
+	x, y float64
+}
+
+// suppressedRange is one [top, bottom] band in page coordinates where the
+// section's line-number gutter must skip — typically a paragraph whose
+// pPr declared w:suppressLineNumbers.
+type suppressedRange struct {
+	top, bottom float64
 }
 
 // pendingNote is one queued note awaiting page-bottom render.
@@ -440,4 +757,14 @@ type pendingMarker struct {
 	image image.Image // picture-bullet marker (alternative to text)
 	x     float64
 	props docx.RunProps
+	// fontFamily overrides the run-derived font for bullet glyphs that
+	// only render in their source font (Symbol / Wingdings). Empty falls
+	// back to the run's selected family.
+	fontFamily string
+	// jc is w:lvlJc: how the marker sits within its hanging column.
+	// "left"/"start"/"" → left-aligned at x (current behavior).
+	// "right"/"end"     → right-aligned at (x + colWidth).
+	// "center"          → centered within (x, x+colWidth).
+	jc       string
+	colWidth float64
 }

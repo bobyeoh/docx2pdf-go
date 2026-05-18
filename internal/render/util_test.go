@@ -8,6 +8,37 @@ import (
 	"github.com/bobyeoh/docx2pdf-go/internal/docx"
 )
 
+func TestLineBandAdjust(t *testing.T) {
+	r := &renderer{}
+	// No band → no adjustment.
+	if _, _, ok := r.lineBandAdjust(100, 50, 400); ok {
+		t.Errorf("no band: want ok=false")
+	}
+	// Active band on the left, line above the band's bottom.
+	r.floatBand = &floatWrapBand{leftX: 50, rightX: 150, bottomY: 200, side: "left", gapPt: 5}
+	x, w, ok := r.lineBandAdjust(120, 50, 400)
+	if !ok {
+		t.Fatal("left band: ok=false")
+	}
+	if x != 155 || w != 295 {
+		t.Errorf("left band: x=%v w=%v, want 155, 295", x, w)
+	}
+	// Below the band — should clear (caller-side detects ok=false).
+	if _, _, ok := r.lineBandAdjust(250, 50, 400); ok {
+		t.Errorf("below band: want ok=false")
+	}
+	// Right-side band.
+	r.floatBand = &floatWrapBand{leftX: 300, rightX: 400, bottomY: 200, side: "right", gapPt: 4}
+	x, w, ok = r.lineBandAdjust(120, 50, 400)
+	if !ok {
+		t.Fatal("right band: ok=false")
+	}
+	// limit = 300-4 = 296. baseX=50 → newW = 296-50 = 246.
+	if x != 50 || w != 246 {
+		t.Errorf("right band: x=%v w=%v, want 50, 246", x, w)
+	}
+}
+
 func TestTwipsToPt(t *testing.T) {
 	cases := []struct {
 		in   int
@@ -73,13 +104,23 @@ func TestApplyLumModOff(t *testing.T) {
 	if got := applyLumModOff("FF0000", 0, 0); got != "FF0000" {
 		t.Errorf("identity: got %q", got)
 	}
-	// 50% lumMod darkens.
+	// 50% lumMod darkens grey 808080 → 404040 in HSL too (L=0.5 → 0.25).
 	if got := applyLumModOff("808080", 0.5, 0); got != "404040" {
 		t.Errorf("darken: got %q want 404040", got)
 	}
-	// 50% lumOff brightens toward white.
-	if got := applyLumModOff("000000", 0, 0.5); got != "7F7F7F" {
-		t.Errorf("brighten: got %q want 7F7F7F", got)
+	// 50% lumOff brightens toward white per ECMA-376: L=0 → L+(1-L)*0.5
+	// = 0.5 → 128 (0x80).
+	if got := applyLumModOff("000000", 0, 0.5); got != "808080" {
+		t.Errorf("brighten: got %q want 808080", got)
+	}
+	// 80% lumOff applied to a mid-grey: L=0.5 → 0.5 + 0.5*0.8 = 0.9 → 230.
+	if got := applyLumModOff("808080", 0, 0.8); got != "E6E6E6" {
+		t.Errorf("tint mid-grey: got %q want E6E6E6", got)
+	}
+	// Saturated red darkened to 50%: HSL gives (255,0,0) → L=0.5,S=1 →
+	// L=0.25 → 128,0,0 (0x800000), close to "half-red".
+	if got := applyLumModOff("FF0000", 0.5, 0); got != "800000" {
+		t.Errorf("saturated red shade: got %q want 800000", got)
 	}
 }
 
