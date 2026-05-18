@@ -1716,17 +1716,19 @@ func parseDocument(f *zip.File, pctx *parseDocContext) error {
 				}
 			}
 		case "oMathPara":
-			// Display math: a body-level equation. Best-effort — extract
-			// the visible text and emit it as a centered, italic paragraph.
-			// Loses the structural typesetting but keeps the content.
-			txt, err := extractMathText(dec, se)
+			// Display math: a body-level equation. Render the OMML
+			// subtree into a sequence of italic runs that preserve
+			// sub/super-scripts, fractions (as parenthesized num/den),
+			// radicals (√…), and n-ary operators (∑/∏/∫…). Centered
+			// to match Word's display-math layout.
+			runs, err := renderMath(dec, se, doc.Defaults)
 			if err != nil {
 				return err
 			}
-			if txt != "" {
+			if len(runs) > 0 {
 				p := Paragraph{
 					Alignment: AlignCenter,
-					Runs:      []Run{mathRun(txt, doc.Defaults)},
+					Runs:      runs,
 				}
 				pctx.curSection.Blocks = append(pctx.curSection.Blocks, p)
 				doc.Body = append(doc.Body, p)
@@ -1875,15 +1877,14 @@ func decodeParagraph(dec *xml.Decoder, start xml.StartElement, pctx *parseDocCon
 					return p, err
 				}
 			case "oMath":
-				// Inline math equation. Best-effort: pull the visible text
-				// out of the subtree and emit it as one italic run.
-				txt, err := extractMathText(dec, t)
+				// Inline math equation. Render the subtree into italic
+				// runs that keep sub/super-scripts, fractions, radicals,
+				// and n-ary operators readable in the PDF.
+				runs, err := renderMath(dec, t, paraRPr)
 				if err != nil {
 					return p, err
 				}
-				if txt != "" {
-					p.Runs = append(p.Runs, mathRun(txt, paraRPr))
-				}
+				p.Runs = append(p.Runs, runs...)
 			case "fldSimple":
 				// The "simple" form of a field. Its `w:instr` attribute
 				// carries the field code; child runs hold the cached
@@ -1980,14 +1981,14 @@ func decodeWrapper(dec *xml.Decoder, start xml.StartElement, p *Paragraph, paraR
 					return err
 				}
 			case "oMath":
-				txt, err := extractMathText(dec, t)
+				runs, err := renderMath(dec, t, paraRPr)
 				if err != nil {
 					return err
 				}
-				if drop || txt == "" {
+				if drop {
 					continue
 				}
-				p.Runs = append(p.Runs, mathRun(txt, paraRPr))
+				p.Runs = append(p.Runs, runs...)
 			case "fldSimple":
 				if drop {
 					_ = dec.Skip()
