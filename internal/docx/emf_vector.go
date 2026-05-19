@@ -56,9 +56,15 @@ func emfBytesToVMLShape(data []byte) *VMLShape {
 		emrSelectObject = 37
 		emrEllipse      = 42
 		emrRectangle    = 43
+		emrRoundRect    = 44
+		emrArc          = 45
+		emrChord        = 46
+		emrPie          = 47
 		emrLineTo       = 54
+		emrPolyBezier16 = 85
 		emrPolygon16    = 86
 		emrPolyline16   = 87
+		emrPolyBezier   = 2
 		emrExtTextOutW  = 84
 	)
 	var children []VMLShape
@@ -177,6 +183,85 @@ func emfBytesToVMLShape(data []byte) *VMLShape {
 					kind = "polygon"
 				}
 				children = append(children, makePolyShape(kind, pts, int(n), true, curStroke, curWeight))
+			}
+		case emrRoundRect:
+			// EMR_ROUNDRECT: 16 bytes for the bounding rect (l,t,r,b) +
+			// 8 bytes for the corner ellipse (cornerWidth, cornerHeight).
+			// The corners are quarter-ellipses; we collapse to roundrect.
+			if len(body) >= 16 {
+				l := readI32(body, 0)
+				t := readI32(body, 4)
+				r := readI32(body, 8)
+				bt := readI32(body, 12)
+				children = append(children, VMLShape{
+					Kind:           "roundrect",
+					OffsetXPt:      float64(l),
+					OffsetYPt:      float64(t),
+					WidthPt:        float64(r - l),
+					HeightPt:       float64(bt - t),
+					StrokeColor:    curStroke,
+					StrokeWeightPt: curWeight,
+				})
+			}
+		case emrArc, emrChord, emrPie:
+			// EMR_ARC / EMR_CHORD / EMR_PIE: 16 bytes for the bounding
+			// rect + 16 bytes for two control points (start/end of the
+			// arc). For PDF we can't easily draw a partial ellipse with
+			// our primitives, so we degrade to the full oval bounded by
+			// the same rect. PIE further degrades to oval (the chord
+			// segments would need path support to draw correctly).
+			if len(body) >= 16 {
+				l := readI32(body, 0)
+				t := readI32(body, 4)
+				r := readI32(body, 8)
+				bt := readI32(body, 12)
+				children = append(children, VMLShape{
+					Kind:           "oval",
+					OffsetXPt:      float64(l),
+					OffsetYPt:      float64(t),
+					WidthPt:        float64(r - l),
+					HeightPt:       float64(bt - t),
+					StrokeColor:    curStroke,
+					StrokeWeightPt: curWeight,
+				})
+			}
+		case emrPolyBezier, emrPolyBezier16:
+			// EMR_POLYBEZIER(16): bounds rect (16) + count (4) + (count*8 or 4)
+			// bytes of points. A polybezier is N cubic Bezier segments;
+			// we don't have cubic-path primitives, so we collapse to a
+			// polyline through the anchor points (every 3rd vertex
+			// starting from the first). This loses the curvature but
+			// preserves the path's gross outline and footprint.
+			if len(body) >= 20 {
+				n := binary.LittleEndian.Uint32(body[16:])
+				pts := body[20:]
+				packed := recType == emrPolyBezier16
+				stride := 8
+				if packed {
+					stride = 4
+				}
+				// Sample every 3rd point (the anchors); leave control
+				// points out so the polyline approximation hugs the curve.
+				var sampled []float64
+				for i := uint32(0); i < n && int(i)*stride+stride <= len(pts); i += 3 {
+					var x, y int32
+					if packed {
+						x = int32(readI16(pts, int(i)*stride))
+						y = int32(readI16(pts, int(i)*stride+2))
+					} else {
+						x = readI32(pts, int(i)*stride)
+						y = readI32(pts, int(i)*stride+4)
+					}
+					sampled = append(sampled, float64(x), float64(y))
+				}
+				if len(sampled) >= 4 {
+					children = append(children, VMLShape{
+						Kind:           "polyline",
+						Points:         emfPolyPoints(sampled),
+						StrokeColor:    curStroke,
+						StrokeWeightPt: curWeight,
+					})
+				}
 			}
 		case emrExtTextOutW:
 			// Already handled by extractEMFText. Skip here so the

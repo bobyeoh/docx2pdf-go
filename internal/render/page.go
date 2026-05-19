@@ -108,6 +108,7 @@ func (r *renderer) stampPageDecorations(sections []docx.Section, sectionPageStar
 			listSeparator:   savedFields.listSeparator,
 			now:             savedFields.now,
 			filename:        savedFields.filename,
+			filenameFull:    savedFields.filenameFull,
 			author:          savedFields.author,
 			title:           savedFields.title,
 			subject:         savedFields.subject,
@@ -577,20 +578,43 @@ func (r *renderer) appendCommentsSection(doc *docx.Document) error {
 		if meta.Date != "" {
 			header += " • " + meta.Date
 		}
+		resolved := false
 		if ext, ok := doc.CommentsExtended[meta.ParaID]; ok && ext.Done {
+			resolved = true
 			header += " (resolved)"
 		}
 		indent := float64(depths[id]) * 18.0
 		// Author color-coding: re-use the revision palette so a reviewer
 		// who appears as both a tracked-change author and a comment author
-		// shows the same color across the document. Empty author falls
-		// back to default black.
+		// shows the same color across the document. Prefer a per-person
+		// identifier (provider id / email) over the display name when
+		// available so two reviewers with the same display name still get
+		// distinct colors. Resolved comments mute the color toward grey.
+		colorKey := meta.Author
+		if doc.PeopleByID != nil {
+			if person, ok := doc.PeopleByID[meta.Author]; ok {
+				if person.ProviderID != "" {
+					colorKey = person.ProviderID
+				} else if person.Email != "" {
+					colorKey = person.Email
+				}
+			}
+		}
 		headerColor := ""
-		if meta.Author != "" {
-			headerColor = revisionColorForAuthor(meta.Author, "")
+		if colorKey != "" {
+			headerColor = revisionColorForAuthor(colorKey, "")
+		}
+		if resolved {
+			headerColor = "808080" // mute resolved-comment header
+		}
+		markerProps := docx.RunProps{Bold: true, Color: headerColor}
+		// Resolved-comment styling: strikethrough the bold header so it
+		// reads as visually "done" rather than just textually-labeled.
+		if resolved {
+			markerProps.Strike = true
 		}
 		marker := docx.Paragraph{
-			Runs:         []docx.Run{{Text: header, Props: docx.RunProps{Bold: true, Color: headerColor}}},
+			Runs:         []docx.Run{{Text: header, Props: markerProps}},
 			IndentLeftPt: indent,
 		}
 		if err := r.drawParagraph(marker); err != nil {
@@ -600,6 +624,17 @@ func (r *renderer) appendCommentsSection(doc *docx.Document) error {
 			switch v := b.(type) {
 			case docx.Paragraph:
 				v.IndentLeftPt += indent
+				// Resolved comments: mute body text to grey so the
+				// reader's eye glides over "done" threads. Done at the
+				// run-prop level (only overrides when the run had no
+				// explicit color of its own).
+				if resolved {
+					for i := range v.Runs {
+						if v.Runs[i].Props.Color == "" {
+							v.Runs[i].Props.Color = "808080"
+						}
+					}
+				}
 				if err := r.drawParagraph(v); err != nil {
 					return err
 				}
@@ -703,6 +738,20 @@ func allSectionsHaveSectEndnotes(secs []docx.Section) bool {
 		}
 	}
 	return true
+}
+
+// anySectionDocEndFootnotes reports whether any section declares
+// w:footnotePr w:pos="docEnd" — in which case the doc-end trailer prints
+// footnotes (instead of per-page bottom-of-page render). "sectEnd" is
+// approximated by docEnd here since our footnote queue is process-global,
+// not per-section; "beneathText" falls back to default pageBottom.
+func anySectionDocEndFootnotes(secs []docx.Section) bool {
+	for _, s := range secs {
+		if s.FootnotePr != nil && (s.FootnotePr.Pos == "docEnd" || s.FootnotePr.Pos == "sectEnd") {
+			return true
+		}
+	}
+	return false
 }
 
 // appendSectionEndnotes renders the endnotes referenced from sec.Blocks

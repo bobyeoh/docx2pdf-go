@@ -371,6 +371,7 @@ func RenderWriter(doc *docx.Document, w io.Writer, opts Options) error {
 			decimalSymbol: doc.Settings.DecimalSymbol,
 			listSeparator: doc.Settings.ListSeparator,
 			filename:      filepath.Base(opts.SourceFilename),
+			filenameFull:  opts.SourceFilename,
 			author:        firstNonEmpty(opts.Author, doc.Properties.Author),
 			title:         doc.Properties.Title,
 			subject:       doc.Properties.Subject,
@@ -651,6 +652,17 @@ func RenderWriter(doc *docx.Document, w io.Writer, opts Options) error {
 	// emitted inline above and the trailer would be a duplicate.
 	if !allSectionsHaveSectEndnotes(doc.Sections) {
 		if err := r.appendNotesSection(doc.Endnotes, "Endnotes"); err != nil {
+			return err
+		}
+	}
+	// w:footnotePr w:pos="docEnd" / "sectEnd": when any section declares
+	// non-default footnote placement, emit a doc-end footnote trailer too.
+	// Page-bottom render still ran above, but with an empty queue (the
+	// enqueue path skipped when this flag is set). When mixed (some
+	// docEnd, some pageBottom), we currently bias toward docEnd for the
+	// whole document — a coarser approximation than per-section gating.
+	if anySectionDocEndFootnotes(doc.Sections) {
+		if err := r.appendNotesSection(doc.Footnotes, "Footnotes"); err != nil {
 			return err
 		}
 	}

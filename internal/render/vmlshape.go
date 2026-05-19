@@ -82,6 +82,22 @@ func drawVMLShape(r *renderer, s *docx.VMLShape, x, y, w, h float64) {
 		r.pdf.SetStrokeColor(sr, sg, sb)
 	}
 	r.pdf.SetLineWidth(width)
+	// DrawingML a:prstDash → gopdf custom dash array. gopdf only ships
+	// "dashed"/"dotted" presets which don't cover the OOXML enum, so we
+	// emit a numeric dash array via SetCustomLineType. Reset to solid
+	// after the shape draws so dash state can't leak. We also accept the
+	// legacy VML alias (v:stroke@dashstyle, "shortdash" etc.) when the
+	// DrawingML side didn't fire — same enum space, broader prefix.
+	dashName := s.DashStyle
+	if dashName == "" {
+		dashName = s.StrokeDash
+	}
+	dashApplied := applyDashStyle(r, dashName, width)
+	defer func() {
+		if dashApplied {
+			r.pdf.SetCustomLineType([]float64{}, 0)
+		}
+	}()
 	if hasFill {
 		fr, fg, fb := parseHexColor(s.FillColor)
 		r.pdf.SetFillColor(fr, fg, fb)
@@ -172,6 +188,10 @@ func drawVMLShape(r *renderer, s *docx.VMLShape, x, y, w, h float64) {
 		drawShapeRegularPolygon(r, 7, left, top, right, bottom, hasFill, hasStroke)
 	case "octagon":
 		drawShapeRegularPolygon(r, 8, left, top, right, bottom, hasFill, hasStroke)
+	case "decagon":
+		drawShapeRegularPolygon(r, 10, left, top, right, bottom, hasFill, hasStroke)
+	case "dodecagon":
+		drawShapeRegularPolygon(r, 12, left, top, right, bottom, hasFill, hasStroke)
 	case "star4":
 		drawShapeStar(r, 4, left, top, right, bottom, hasFill, hasStroke)
 	case "star5":
@@ -438,6 +458,28 @@ func drawVMLShape(r *renderer, s *docx.VMLShape, x, y, w, h float64) {
 			{X: left + (right-left)*0.15, Y: top + (bottom-top)*0.6},
 			{X: left + (right-left)*0.15, Y: bottom},
 		})
+	case "scroll":
+		// Scroll: a rectangle with two rolled ends (horizontal/vertical
+		// variants both collapse here). Approximate with a rounded rect plus
+		// two small rolled-corner indicators at the appropriate ends.
+		w, h := right-left, bottom-top
+		curl := h * 0.18
+		drawShapePolygon(r, hasFill, hasStroke, []gopdf.Point{
+			{X: left, Y: top + curl},
+			{X: left + curl, Y: top},
+			{X: right - curl, Y: top},
+			{X: right, Y: top + curl},
+			{X: right, Y: bottom - curl},
+			{X: right - curl, Y: bottom},
+			{X: left + curl, Y: bottom},
+			{X: left, Y: bottom - curl},
+		})
+		// Two roll indicators: small arc on each tall edge.
+		if hasStroke {
+			r.pdf.Line(left+curl, top, left+curl, bottom)
+			r.pdf.Line(right-curl, top, right-curl, bottom)
+		}
+		_ = w
 	case "ribbon", "ribbon2":
 		// Ribbon: horizontal banner with notched tails. ribbon2 is the
 		// upside-down variant (curls down vs up).
@@ -1944,4 +1986,67 @@ func drawLineArrowHead(r *renderer, kind string, fromX, fromY, tipX, tipY float6
 			{X: baseX - px, Y: baseY - py},
 		})
 	}
+}
+
+// applyDashStyle maps a DrawingML a:prstDash@val (or VML v:stroke@dashstyle)
+// to a gopdf dash array sized by the current line width and applies it. The
+// returned bool says whether dash state was actually changed so the caller
+// can reset it after stroking. Empty / "solid" → false (no change).
+func applyDashStyle(r *renderer, name string, lineWidth float64) bool {
+	if name == "" {
+		return false
+	}
+	if lineWidth <= 0 {
+		lineWidth = 0.5
+	}
+	// Pattern units in OOXML are roughly multiples of the line width.
+	// Matching Word's on-screen rendering: short dot ~1×lw, dash ~4×lw,
+	// long dash ~8×lw, gap ~3×lw. Same numerator/denominator pattern
+	// docx4j uses (org.docx4j.dml.STPresetLineDashVal handling).
+	u := lineWidth
+	var pat []float64
+	switch strings.ToLower(name) {
+	case "solid":
+		return false
+	case "dot":
+		pat = []float64{u, 3 * u}
+	case "dash":
+		pat = []float64{4 * u, 3 * u}
+	case "dashdot":
+		pat = []float64{4 * u, 3 * u, u, 3 * u}
+	case "lgdash":
+		pat = []float64{8 * u, 3 * u}
+	case "lgdashdot":
+		pat = []float64{8 * u, 3 * u, u, 3 * u}
+	case "lgdashdotdot":
+		pat = []float64{8 * u, 3 * u, u, 3 * u, u, 3 * u}
+	case "sysdash":
+		pat = []float64{3 * u, u}
+	case "sysdashdot":
+		pat = []float64{3 * u, u, u, u}
+	case "sysdashdotdot":
+		pat = []float64{3 * u, u, u, u, u, u}
+	case "sysdot":
+		pat = []float64{u, u}
+	// VML aliases: shortdash / shortdot / longdash / dashdot / longdashdot
+	// etc. Map to the closest preset above.
+	case "shortdash":
+		pat = []float64{3 * u, 2 * u}
+	case "shortdot":
+		pat = []float64{u, 2 * u}
+	case "shortdashdot":
+		pat = []float64{3 * u, 2 * u, u, 2 * u}
+	case "shortdashdotdot":
+		pat = []float64{3 * u, 2 * u, u, 2 * u, u, 2 * u}
+	case "longdash":
+		pat = []float64{8 * u, 3 * u}
+	case "longdashdot":
+		pat = []float64{8 * u, 3 * u, u, 3 * u}
+	case "longdashdotdot":
+		pat = []float64{8 * u, 3 * u, u, 3 * u, u, 3 * u}
+	default:
+		return false
+	}
+	r.pdf.SetCustomLineType(pat, 0)
+	return true
 }

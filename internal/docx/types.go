@@ -1315,10 +1315,10 @@ type VMLShape struct {
 	// The TextBox carries the visible string; renderer treats it as a
 	// decorative title (bold, larger size, shape-fill color) so it reads
 	// as WordArt rather than plain inline text.
-	WordArt          bool
-	WordArtFitShape  bool   // v:textpath fitshape="t"
-	WordArtFitPath   bool   // v:textpath fitpath="t"
-	WordArtStyle     string // CSS-shape style string Word wrote on textpath
+	WordArt         bool
+	WordArtFitShape bool   // v:textpath fitshape="t"
+	WordArtFitPath  bool   // v:textpath fitpath="t"
+	WordArtStyle    string // CSS-shape style string Word wrote on textpath
 	// GradientKind is "linear" / "radial" / "" (no gradient — fall back to
 	// FillColor). When set, GradientStops drives the gradient color ramp.
 	GradientKind string
@@ -1340,6 +1340,21 @@ type VMLShape struct {
 	// "thinThick", "thickThin", "thickBetweenThin"). The renderer maps
 	// the compound styles to double-stroked outlines.
 	StrokeLineStyle string
+	// DashStyle is the DrawingML a:prstDash@val (solid / dash / dashDot /
+	// lgDash / lgDashDot / lgDashDotDot / sysDash / sysDashDot /
+	// sysDashDotDot / sysDot / dot) — populated when a vector shape was
+	// synthesized from a w:drawing a:ln. Empty means "solid stroke" (no
+	// dash pattern). Renderer maps each enum to a gopdf dash array.
+	DashStyle string
+	// CapStyle is the DrawingML a:ln@cap value ("flat" / "rnd" / "sq").
+	// "" → "flat". Renderer maps "rnd"→round, "sq"→square via gopdf's
+	// SetLineCapStyle.
+	CapStyle string
+	// CompoundLn mirrors a:ln@cmpd: "" (sng / single) is the default,
+	// "dbl" / "thickThin" / "thinThick" / "tri" call for compound
+	// strokes. Renderer paints these as 2 or 3 parallel strokes at the
+	// appropriate inset for the shape's outline.
+	CompoundLn string
 	// Shadow, when non-nil, adds an outer drop shadow drawn before the
 	// shape itself.
 	Shadow *ShadowEffect
@@ -1622,8 +1637,8 @@ type RunProps struct {
 	W14TextFillColor string
 	// W14GlowColor + W14GlowRadiusPt drive a soft outline halo at draw
 	// time. Radius is converted from w14:rad EMUs to points.
-	W14GlowColor     string
-	W14GlowRadiusPt  float64
+	W14GlowColor    string
+	W14GlowRadiusPt float64
 	// W14Reflection asks the renderer to mirror the run text below the
 	// baseline. We render with a fixed dist/fade — Word's exact angular
 	// gradient is approximated as a 50% alpha drop with vertical flip.
@@ -2121,6 +2136,13 @@ type NumLevel struct {
 	// The renderer uses it to select an appropriate font when painting
 	// the marker.
 	MarkerFontFamily string
+	// MarkerProps captures the rest of the level's w:rPr (bold / italic /
+	// color / size / underline / strike) so the bullet glyph picks up the
+	// formatting Word painted on it — many legal-style lists ship bold
+	// markers on non-bold body text. MarkerFontFamily takes precedence
+	// over MarkerProps.FontFamily when both are set; consumers may treat
+	// MarkerProps as a starting overlay on the run's own rPr.
+	MarkerProps RunProps
 	// MarkerJc is w:lvlJc: the marker's alignment inside its column —
 	// "left" (default), "center", "right", "start", "end". Used by the
 	// renderer to push the marker glyph to the right edge of the hanging

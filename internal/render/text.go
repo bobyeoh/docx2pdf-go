@@ -306,9 +306,21 @@ func (r *renderer) runsToAtoms(runs []docx.Run) []atom {
 			continue
 		}
 		if run.FootnoteID != "" && !r.drawingFootnotes {
-			r.pendingFootnotes = append(r.pendingFootnotes, pendingNote{
-				id: run.FootnoteID, endnote: run.IsEndnote,
-			})
+			// Skip page-bottom queueing for footnotes when the doc
+			// declared w:footnotePr w:pos="docEnd"/"sectEnd" — those get
+			// emitted as a single trailer at doc end via
+			// appendNotesSection. Endnotes already defer either to
+			// section end or doc end, so the gate only fires on the
+			// footnote half.
+			deferToTrailer := false
+			if !run.IsEndnote && r.doc != nil && anySectionDocEndFootnotes(r.doc.Sections) {
+				deferToTrailer = true
+			}
+			if !deferToTrailer {
+				r.pendingFootnotes = append(r.pendingFootnotes, pendingNote{
+					id: run.FootnoteID, endnote: run.IsEndnote,
+				})
+			}
 			// Rewrite the reference text from "[id]" to the configured
 			// label (decimal/roman/letter/symbol).
 			labels := r.footnoteLabels
@@ -354,6 +366,8 @@ func (r *renderer) runsToAtoms(runs []docx.Run) []atom {
 				anchorSimplePosUsed: run.AnchorSimplePosUsed,
 				anchorSimplePosXPt:  run.AnchorSimplePosXPt,
 				anchorSimplePosYPt:  run.AnchorSimplePosYPt,
+				linkRID:             run.LinkURL,
+				linkAnchor:          run.LinkAnchor,
 			})
 			continue
 		}
@@ -1174,6 +1188,16 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 				if err := r.drawTransformedImage(img, imgX, r.cursorY, a.width, a.height, a.imageRotationDeg, a.imageFlipH, a.imageFlipV); err != nil {
 					return err
 				}
+				// Image hyperlink: a:hlinkClick on wp:docPr / pic:cNvPr.
+				// LinkURL holds the relationship rId (resolved here); LinkAnchor
+				// is an in-document bookmark name. Emit a PDF link annotation
+				// covering the drawn image bounds. Also applies to anchored
+				// images — they get their click target where they land.
+				if url := r.resolveURL(a.linkRID); url != "" {
+					r.pdf.AddExternalLink(url, imgX, r.cursorY, a.width, a.height)
+				} else if a.linkAnchor != "" {
+					r.pdf.AddInternalLink(a.linkAnchor, imgX, r.cursorY, a.width, a.height)
+				}
 				if a.anchored {
 					// Anchored image — don't advance the inline cursor.
 				} else {
@@ -1182,6 +1206,13 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 			case atomVMLShape:
 				if a.shape != nil {
 					drawVMLShape(r, a.shape, cx, r.cursorY, a.width, a.height)
+				}
+				// Shape hyperlink: a:hlinkClick / v:shape@href / o:OLEObject
+				// @href all converge onto the run's LinkURL or LinkAnchor.
+				if url := r.resolveURL(a.linkRID); url != "" {
+					r.pdf.AddExternalLink(url, cx, r.cursorY, a.width, a.height)
+				} else if a.linkAnchor != "" {
+					r.pdf.AddInternalLink(a.linkAnchor, cx, r.cursorY, a.width, a.height)
 				}
 				cx += a.width
 			case atomMath:

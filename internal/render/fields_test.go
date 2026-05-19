@@ -31,19 +31,22 @@ func TestFieldCodeAndArgs(t *testing.T) {
 
 func TestHyperlinkFieldInstr(t *testing.T) {
 	cases := []struct {
-		in         string
-		wantTgt    string
-		wantAnchor bool
+		in          string
+		wantTgt     string
+		wantAnchor  bool
+		wantTooltip string
 	}{
-		{"HYPERLINK \"http://a.example/page\"", "http://a.example/page", false},
-		{"HYPERLINK \\l \"Section1\"", "Section1", true},
-		{"HYPERLINK \\o \"tooltip\" \"http://b.example\"", "http://b.example", false},
+		{"HYPERLINK \"http://a.example/page\"", "http://a.example/page", false, ""},
+		{"HYPERLINK \\l \"Section1\"", "Section1", true, ""},
+		{"HYPERLINK \\o \"tooltip\" \"http://b.example\"", "http://b.example", false, "tooltip"},
+		{"HYPERLINK \"http://c.example\" \\o \"Multi word tip\"", "http://c.example", false, "Multi word tip"},
+		{"HYPERLINK \\t \"_blank\" \"http://d.example\"", "http://d.example", false, ""},
 	}
 	for _, c := range cases {
-		tgt, anchor := hyperlinkFieldInstr(c.in)
-		if tgt != c.wantTgt || anchor != c.wantAnchor {
-			t.Errorf("hyperlinkFieldInstr(%q) = (%q,%v), want (%q,%v)",
-				c.in, tgt, anchor, c.wantTgt, c.wantAnchor)
+		tgt, anchor, tip := hyperlinkFieldInstr(c.in)
+		if tgt != c.wantTgt || anchor != c.wantAnchor || tip != c.wantTooltip {
+			t.Errorf("hyperlinkFieldInstr(%q) = (%q,%v,%q), want (%q,%v,%q)",
+				c.in, tgt, anchor, tip, c.wantTgt, c.wantAnchor, c.wantTooltip)
 		}
 	}
 }

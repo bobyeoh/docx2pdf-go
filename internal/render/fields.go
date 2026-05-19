@@ -69,15 +69,16 @@ type fieldVars struct {
 	decimalSymbol string
 	listSeparator string
 
-	now      time.Time
-	filename string
-	author   string
-	title    string
-	subject  string
-	keywords string
-	comments string
-	company  string
-	username string
+	now          time.Time
+	filename     string
+	filenameFull string // full path (for FILENAME \p); empty falls back to filename
+	author       string
+	title        string
+	subject      string
+	keywords     string
+	comments     string
+	company      string
+	username     string
 
 	// Document-level metadata used by NUMWORDS / NUMCHARS / EDITTIME.
 	numWords     int
@@ -881,33 +882,74 @@ func fieldCodeAndArgs(s string) (code, primary string) {
 	return code, primary
 }
 
-// hyperlinkFieldInstr decodes a HYPERLINK instrText into (target, isAnchor).
-// `\l` means the primary arg is an internal bookmark name, not a URL.
-func hyperlinkFieldInstr(s string) (target string, isAnchor bool) {
-	s = strings.TrimSpace(s)
-	parts := strings.Fields(s)
-	skipNext := false
+// hyperlinkFieldInstr decodes a HYPERLINK instrText into (target, isAnchor,
+// tooltip). `\l` means the primary arg is an internal bookmark name; `\o`
+// carries a screentip (PDF link annotation /Contents). `\m` (image-map
+// coords) and `\n` (new-window flag) have no PDF surface so we drop them.
+// `\t` carries a target-frame name — also dropped.
+func hyperlinkFieldInstr(s string) (target string, isAnchor bool, tooltip string) {
+	parts := splitFieldArgs(strings.TrimSpace(s))
+	if len(parts) == 0 {
+		return "", false, ""
+	}
+	// parts[0] is "HYPERLINK"; arguments follow. Walk and consume.
 	for i := 1; i < len(parts); i++ {
-		if skipNext {
-			skipNext = false
-			continue
-		}
 		p := parts[i]
 		switch p {
 		case "\\l":
 			isAnchor = true
-			continue
-		case "\\o", "\\t", "\\m", "\\n":
-			skipNext = true
-			continue
+		case "\\o":
+			if i+1 < len(parts) {
+				tooltip = strings.Trim(parts[i+1], `"`)
+				i++
+			}
+		case "\\t", "\\m", "\\n":
+			// Skip the switch and its argument.
+			if i+1 < len(parts) {
+				i++
+			}
+		default:
+			if strings.HasPrefix(p, "\\") {
+				continue
+			}
+			if target == "" {
+				target = strings.Trim(p, `"`)
+			}
 		}
-		if strings.HasPrefix(p, "\\") {
-			continue
-		}
-		target = strings.Trim(p, `"`)
-		return target, isAnchor
 	}
-	return "", isAnchor
+	return target, isAnchor, tooltip
+}
+
+// splitFieldArgs is a quote-aware tokenizer for Word field instrText.
+// It preserves double-quoted spans (which may contain spaces) as a single
+// token including the quotes; backslash-prefixed switches stay as their own
+// token. Single-quotes are left as-is because Word numeric/date pictures
+// use them to wrap literals.
+func splitFieldArgs(s string) []string {
+	var out []string
+	var buf strings.Builder
+	inQuote := false
+	flush := func() {
+		if buf.Len() > 0 {
+			out = append(out, buf.String())
+			buf.Reset()
+		}
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '"' {
+			buf.WriteByte(c)
+			inQuote = !inQuote
+			continue
+		}
+		if !inQuote && (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+			flush()
+			continue
+		}
+		buf.WriteByte(c)
+	}
+	flush()
+	return out
 }
 
 // flattenFields walks a paragraph's raw Run stream and resolves
@@ -922,6 +964,7 @@ func flattenFields(runs []docx.Run, vars fieldVars) []docx.Run {
 		substituted bool
 		linkURL     string
 		linkAnchor  string
+		linkTooltip string
 		suppress    bool
 		// lockResult is set when the field instruction carries `\!` —
 		// "lock result". The cached glyphs pass through verbatim; we
@@ -956,11 +999,14 @@ func flattenFields(runs []docx.Run, vars fieldVars) []docx.Run {
 				}
 				switch f.code {
 				case "HYPERLINK":
-					target, isAnchor := hyperlinkFieldInstr(f.instrFull)
+					target, isAnchor, tip := hyperlinkFieldInstr(f.instrFull)
 					if isAnchor {
 						f.linkAnchor = target
 					} else {
 						f.linkURL = target
+					}
+					if tip != "" {
+						f.linkTooltip = tip
 					}
 				case "REF", "PAGEREF", "NOTEREF":
 					// \h turns the cross-reference into an internal link
@@ -1106,6 +1152,9 @@ func flattenFields(runs []docx.Run, vars fieldVars) []docx.Run {
 				if f.linkAnchor != "" {
 					rr.LinkAnchor = f.linkAnchor
 				}
+				if f.linkTooltip != "" {
+					rr.LinkTooltip = f.linkTooltip
+				}
 				out = append(out, rr)
 				continue
 			}
@@ -1226,6 +1275,15 @@ func lookupFieldValueFull(code, arg, instrFull string, vars fieldVars) (string, 
 		}
 		return "", false
 	case "FILENAME":
+		// FILENAME \p — full path. We carry the full SourceFilename on
+		// vars.filenameFull (callers set it; falls back to the basename
+		// when unset). Without \p Word returns the file name without
+		// the path, matching the legacy default.
+		if hasFlagSwitch(instrFull, "p") {
+			if vars.filenameFull != "" {
+				return vars.filenameFull, true
+			}
+		}
 		if vars.filename != "" {
 			return vars.filename, true
 		}

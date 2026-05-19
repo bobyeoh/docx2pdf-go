@@ -344,6 +344,19 @@ func ParseWithPassword(r io.ReaderAt, size int64, password string) (*Document, e
 	if f, ok := files["word/commentsIds.xml"]; ok {
 		_ = parseCommentsIds(f, doc)
 	}
+	// Word 2016+: word/threadedComments.xml carries an alternative threaded
+	// comment store with explicit parentId / done state and its own author
+	// metadata. When present, fold its records into doc.CommentsExtended so
+	// the renderer's existing "resolved" + threading logic picks them up.
+	if f, ok := files["word/threadedComments.xml"]; ok {
+		_ = parseThreadedComments(f, doc)
+	}
+	// Word 365: word/commentsExtensible.xml (w16cex) is an even newer comment-id
+	// store; we treat any commentExtensible's durable id as an additional
+	// fallback durable identifier alongside w16cid:commentsIds.
+	if f, ok := files["word/commentsExtensible.xml"]; ok {
+		_ = parseCommentsExtensible(f, doc)
+	}
 	if f, ok := files["word/people.xml"]; ok {
 		_ = parsePeople(f, doc)
 	}
@@ -542,6 +555,13 @@ type openDopeRepeatFrame struct {
 
 // finalizeSection appends the in-progress section to doc.Sections, applies
 // defaults for any unset page properties, and resets the accumulator.
+//
+// Word's section model inherits header/footer references from the previous
+// section when the current sectPr omits a particular context (default /
+// first / even). docx4j's HeaderFooterPolicy does the same cascade. Without
+// it, Word docs that declare headers in section 1 only would render blank
+// headers from section 2 onward — a P0 fidelity loss. We perform the
+// inheritance here so every section in p.doc.Sections is self-contained.
 func (p *parseDocContext) finalizeSection() {
 	sec := p.curSection
 	if sec.PageSize.WidthTwips == 0 || sec.PageSize.HeightTwips == 0 {
@@ -549,6 +569,34 @@ func (p *parseDocContext) finalizeSection() {
 	}
 	if sec.Margins == (Margins{}) {
 		sec.Margins = DefaultMarginsTwips
+	}
+	// Header/footer inheritance from the most-recent finalized section.
+	if n := len(p.doc.Sections); n > 0 {
+		prev := p.doc.Sections[n-1]
+		if sec.HeaderBlocks == nil {
+			sec.HeaderBlocks = prev.HeaderBlocks
+		}
+		if sec.HeaderFirstBlocks == nil {
+			sec.HeaderFirstBlocks = prev.HeaderFirstBlocks
+		}
+		if sec.HeaderEvenBlocks == nil {
+			sec.HeaderEvenBlocks = prev.HeaderEvenBlocks
+		}
+		if sec.FooterBlocks == nil {
+			sec.FooterBlocks = prev.FooterBlocks
+		}
+		if sec.FooterFirstBlocks == nil {
+			sec.FooterFirstBlocks = prev.FooterFirstBlocks
+		}
+		if sec.FooterEvenBlocks == nil {
+			sec.FooterEvenBlocks = prev.FooterEvenBlocks
+		}
+		// EvenAndOddHeaders is a flag the renderer ORs with the doc-level
+		// setting; if a prior section turned it on the inheritance should
+		// carry the even blocks AND the flag.
+		if !sec.EvenAndOddHeaders {
+			sec.EvenAndOddHeaders = prev.EvenAndOddHeaders
+		}
 	}
 	p.doc.Sections = append(p.doc.Sections, sec)
 	p.curSection = Section{}
@@ -2641,12 +2689,11 @@ func decodeLevel(dec *xml.Decoder, start xml.StartElement) (NumLevel, error) {
 	}
 }
 
-// decodeLevelRPr extracts only the bullet-font hint from a level's
-// w:rPr. Most attributes inside a level rPr (color, size, bold) are
-// irrelevant to PDF list-marker rendering — those are inherited from the
-// paragraph's run properties — but the font family matters because legacy
-// bullets are private-area Symbol / Wingdings glyphs that fall back to
-// tofu in the default text font.
+// decodeLevelRPr scans a level's w:rPr for the bullet-marker formatting:
+// font family (legacy Symbol/Wingdings bullet glyphs), bold/italic, color,
+// and size. These get folded onto the run that renders the marker so a
+// bold black "1." in front of a non-bold gray paragraph still looks like
+// Word's painter ran it.
 func decodeLevelRPr(dec *xml.Decoder, start xml.StartElement, lv *NumLevel) error {
 	for {
 		tok, err := dec.Token()
@@ -2655,7 +2702,8 @@ func decodeLevelRPr(dec *xml.Decoder, start xml.StartElement, lv *NumLevel) erro
 		}
 		switch t := tok.(type) {
 		case xml.StartElement:
-			if t.Name.Local == "rFonts" {
+			switch t.Name.Local {
+			case "rFonts":
 				// Prefer w:ascii, fall back to w:hAnsi, then w:cs.
 				for _, a := range t.Attr {
 					switch a.Name.Local {
@@ -2667,6 +2715,33 @@ func decodeLevelRPr(dec *xml.Decoder, start xml.StartElement, lv *NumLevel) erro
 						if lv.MarkerFontFamily == "" {
 							lv.MarkerFontFamily = a.Value
 						}
+					}
+				}
+			case "b":
+				if v := attr(t, "val"); v == "" || v == "1" || v == "true" {
+					lv.MarkerProps.Bold = true
+				}
+			case "i":
+				if v := attr(t, "val"); v == "" || v == "1" || v == "true" {
+					lv.MarkerProps.Italic = true
+				}
+			case "strike":
+				if v := attr(t, "val"); v == "" || v == "1" || v == "true" {
+					lv.MarkerProps.Strike = true
+				}
+			case "u":
+				if v := attr(t, "val"); v != "" && v != "none" {
+					lv.MarkerProps.Underline = true
+				}
+			case "color":
+				if v := attr(t, "val"); v != "" && v != "auto" {
+					lv.MarkerProps.Color = strings.ToUpper(strings.TrimPrefix(v, "#"))
+				}
+			case "sz":
+				if v := attr(t, "val"); v != "" {
+					if x, err := strconv.Atoi(v); err == nil && x > 0 {
+						// w:sz is in half-points.
+						lv.MarkerProps.FontSize = float64(x) / 2.0
 					}
 				}
 			}
@@ -2879,12 +2954,12 @@ type xmlRPr struct {
 	W14NumSpacing *struct {
 		Val string `xml:"val,attr"`
 	} `xml:"numSpacing"`
-	W14CntxtAlts    *xmlValAttr        `xml:"cntxtAlts"`
-	W14Shadow       *xmlW14Fill        `xml:"shadow"`
-	W14TextOutline  *xmlW14TextOutline `xml:"textOutline"`
-	W14TextFill     *xmlW14TextFill    `xml:"textFill"`
-	W14Glow         *xmlW14Glow        `xml:"glow"`
-	W14Reflection   *xmlW14Reflection  `xml:"reflection"`
+	W14CntxtAlts   *xmlValAttr        `xml:"cntxtAlts"`
+	W14Shadow      *xmlW14Fill        `xml:"shadow"`
+	W14TextOutline *xmlW14TextOutline `xml:"textOutline"`
+	W14TextFill    *xmlW14TextFill    `xml:"textFill"`
+	W14Glow        *xmlW14Glow        `xml:"glow"`
+	W14Reflection  *xmlW14Reflection  `xml:"reflection"`
 	// W14Scene3D / W14Props3D mark the run as having WordprocessingML
 	// 2010+ 3D text effects. We capture only presence (Word stores a
 	// rich scene/material tree we can't actually project in 2D); the
@@ -3429,16 +3504,25 @@ func parseDocument(f *zip.File, pctx *parseDocContext) error {
 			if txt != "" || tree != nil {
 				run := mathRun(txt, doc.Defaults)
 				run.Math = tree
+				// Default per Word UX is centered; but m:oMathParaPr/m:jc
+				// on this oMathPara wins, and when absent the document's
+				// settings.xml m:mathPr/m:defJc is consulted before the
+				// hard-coded center fallback.
 				align := AlignCenter
+				jc := ""
 				if tree != nil {
-					switch tree.Align {
-					case "left":
-						align = AlignLeft
-					case "right":
-						align = AlignRight
-					case "centerGroup", "center":
-						align = AlignCenter
-					}
+					jc = tree.Align
+				}
+				if jc == "" {
+					jc = doc.Settings.MathProps.DefJc
+				}
+				switch jc {
+				case "left":
+					align = AlignLeft
+				case "right":
+					align = AlignRight
+				case "centerGroup", "center":
+					align = AlignCenter
 				}
 				p := Paragraph{
 					Alignment: align,
@@ -4553,6 +4637,9 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 						ImagePctRelFromH:    di.RelFromH,
 						ImagePctRelFromV:    di.RelFromV,
 						AltText:             di.AltText,
+						LinkURL:             di.HyperlinkRID,
+						LinkAnchor:          di.HyperlinkAnchor,
+						LinkTooltip:         di.HyperlinkTooltip,
 						Props:               rp,
 					})
 				} else if di.IsGroup && di.GroupChildShapeCount > 1 && di.ShapePrst == "" && di.CustPath == "" {
@@ -4606,6 +4693,9 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 						TextBoxBlocks:     di.TxbxBlocks,
 						HeadEnd:           di.ShapeHeadEnd,
 						TailEnd:           di.ShapeTailEnd,
+						DashStyle:         di.ShapeDashStyle,
+						CapStyle:          di.ShapeCapStyle,
+						CompoundLn:        di.ShapeCompoundLn,
 						TextAnchor:        di.TextAnchor,
 						TextLeftInsetPt:   di.TextLeftInsetPt,
 						TextTopInsetPt:    di.TextTopInsetPt,
@@ -4633,6 +4723,9 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 						AnchorSimplePosUsed: di.SimplePosUsed,
 						AnchorSimplePosXPt:  di.SimplePosXPt,
 						AnchorSimplePosYPt:  di.SimplePosYPt,
+						LinkURL:             di.HyperlinkRID,
+						LinkAnchor:          di.HyperlinkAnchor,
+						LinkTooltip:         di.HyperlinkTooltip,
 						Props:               rp,
 					})
 					// Done — text-box content is carried by the shape
@@ -4760,10 +4853,17 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 						CropLeftPct:   vi.CropLPct,
 						CropRightPct:  vi.CropRPct,
 						ChromaKey:     vi.ChromaKey,
+						LinkURL:       vi.HyperlinkRID,
+						LinkAnchor:    vi.HyperlinkAnchor,
 						Props:         rp,
 					})
 				} else if vi.Shape != nil {
-					atoms = append(atoms, Run{VMLShape: vi.Shape, Props: rp})
+					atoms = append(atoms, Run{
+						VMLShape:   vi.Shape,
+						LinkURL:    vi.HyperlinkRID,
+						LinkAnchor: vi.HyperlinkAnchor,
+						Props:      rp,
+					})
 				}
 			case "AlternateContent":
 				// Markup Compatibility wrapper: prefer mc:Choice over
@@ -5169,6 +5269,18 @@ type drawingInfo struct {
 	// "rightOnly", or "largest" — controlling which side(s) of the
 	// drawing text flows around.
 	WrapSide string
+	// HyperlinkRID captures <a:hlinkClick r:id="…"> attached to the drawing's
+	// non-visual properties (wp:docPr or pic:cNvPr / pic:nvSpPr / a:spPr).
+	// When non-empty the renderer emits a PDF link annotation over the image
+	// or shape's bounds, resolving the rId through the document rels.
+	HyperlinkRID string
+	// HyperlinkAnchor mirrors a:hlinkClick/@w:anchor — an internal bookmark
+	// jump target (alternative to HyperlinkRID for in-document links).
+	HyperlinkAnchor string
+	// HyperlinkTooltip mirrors a:hlinkClick/@tooltip — ScreenTip text. We
+	// thread it onto Run.LinkTooltip so downstream consumers can attach it
+	// to the link annotation /Contents (gopdf doesn't expose this today).
+	HyperlinkTooltip string
 	// PctWidth / PctHeight capture wp14:sizeRelH/wp14:pctWidth and
 	// wp14:sizeRelV/wp14:pctHeight — fractional sizing relative to the
 	// page/margin frame. Values are in thousandths of a percent (50000 =
@@ -5404,6 +5516,23 @@ func findDrawingInfo(dec *xml.Decoder, start xml.StartElement, doc *Document) (i
 					info.AltText = v
 				} else if v := attr(t, "title"); v != "" {
 					info.AltText = v
+				}
+			case "hlinkClick":
+				// a:hlinkClick attaches a click hyperlink to the enclosing
+				// drawing — it may appear inside wp:docPr (top-level drawing
+				// link), pic:cNvPr (inner picture link), or a:spPr (shape
+				// link). All three converge here. First non-empty wins.
+				if info.HyperlinkRID == "" && info.HyperlinkAnchor == "" {
+					for _, a := range t.Attr {
+						switch a.Name.Local {
+						case "id":
+							info.HyperlinkRID = a.Value
+						case "anchor":
+							info.HyperlinkAnchor = a.Value
+						case "tooltip":
+							info.HyperlinkTooltip = a.Value
+						}
+					}
 				}
 			case "xfrm":
 				// a:xfrm carries rotation + flip flags for the entire
@@ -5852,6 +5981,10 @@ func shapeKindForPrst(prst string) string {
 		return "heptagon"
 	case "octagon":
 		return "octagon"
+	case "decagon":
+		return "decagon"
+	case "dodecagon":
+		return "dodecagon"
 	case "star4":
 		return "star4"
 	case "star5":
@@ -5886,6 +6019,32 @@ func shapeKindForPrst(prst string) string {
 		return "upDownArrow"
 	case "bentArrow":
 		return "bentArrow"
+	case "quadArrow", "leftRightUpArrow":
+		// Four-headed arrow (quadArrow) and three-headed L/R/U variant —
+		// degrade to leftRightArrow since both still convey
+		// "multi-directional" intent at the right footprint.
+		return "leftRightArrow"
+	case "curvedRightArrow", "curvedLeftArrow", "curvedUpArrow", "curvedDownArrow":
+		// Curved arrow variants: pick the closest straight arrow.
+		switch prst {
+		case "curvedLeftArrow":
+			return "leftArrow"
+		case "curvedUpArrow":
+			return "upArrow"
+		case "curvedDownArrow":
+			return "downArrow"
+		default:
+			return "rightArrow"
+		}
+	case "uturnArrow", "circularArrow", "leftCircularArrow", "leftRightCircularArrow":
+		// U-turn / circular arrows — visualize as the closest straight arrow
+		// (the curve itself needs full path rendering).
+		return "rightArrow"
+	case "swooshArrow":
+		return "rightArrow"
+	case "rightArrowCallout", "leftArrowCallout", "upArrowCallout", "downArrowCallout",
+		"leftRightArrowCallout", "upDownArrowCallout", "quadArrowCallout":
+		return "callout"
 	case "callout1", "callout2", "callout3", "borderCallout1", "borderCallout2", "borderCallout3":
 		return "callout"
 	case "wedgeRectCallout":
@@ -5997,6 +6156,12 @@ func shapeKindForPrst(prst string) string {
 		return "teardrop"
 	case "doubleWave", "wave":
 		return "wave"
+	case "ribbon", "ribbon2", "ellipseRibbon", "ellipseRibbon2":
+		return "ribbon"
+	case "horizontalScroll", "verticalScroll":
+		return "scroll"
+	case "cloudCallout":
+		return "callout"
 	case "irregularSeal1", "irregularSeal2":
 		return "seal"
 	case "gear6", "gear9":
@@ -6598,6 +6763,12 @@ type pictInfo struct {
 	// ChromaKey is the hex color v:imagedata declared as the transparency
 	// key. Renderer can substitute transparent pixels; empty when unset.
 	ChromaKey string
+	// HyperlinkRID / HyperlinkAnchor capture <v:shape href="…"> (when the
+	// href is rId-resolved) or a bare anchor. Mostly the href is a literal
+	// URL; we keep both shapes for symmetry with the DrawingML path. The
+	// renderer wires Run.LinkURL / LinkAnchor accordingly.
+	HyperlinkRID    string
+	HyperlinkAnchor string
 }
 
 // findPictInfo walks a w:pict subtree pulling out imagedata + shape info.
@@ -6643,6 +6814,9 @@ func findPictInfo(dec *xml.Decoder, start xml.StartElement, doc *Document) (info
 				if meta.ChromaKey != "" {
 					info.ChromaKey = meta.ChromaKey
 				}
+				if meta.HRef != "" && info.HyperlinkRID == "" {
+					info.HyperlinkRID = meta.HRef
+				}
 				continue
 			case "OLEObject", "objectLink", "objectEmbed":
 				// Inside w:object: <o:OLEObject r:id="…" ProgID="…"/>
@@ -6658,6 +6832,10 @@ func findPictInfo(dec *xml.Decoder, start xml.StartElement, doc *Document) (info
 						}
 					case "ProgID":
 						info.OLEProgID = a.Value
+					case "href":
+						if info.HyperlinkRID == "" {
+							info.HyperlinkRID = a.Value
+						}
 					}
 				}
 				_ = dec.Skip()
@@ -6706,6 +6884,10 @@ func findPictInfo(dec *xml.Decoder, start xml.StartElement, doc *Document) (info
 type vmlImageMeta struct {
 	CropTPct, CropBPct, CropLPct, CropRPct float64
 	ChromaKey                              string
+	// HRef captures v:shape@href and o:OLEObject@href for shape-level
+	// hyperlinks. Most often a literal URL; occasionally a rId resolvable
+	// via the document rels (the renderer's resolveURL handles either).
+	HRef string
 }
 
 func decodeVMLShape(dec *xml.Decoder, start xml.StartElement, doc *Document) (*VMLShape, bool, string, float64, float64, vmlImageMeta) {
@@ -6717,6 +6899,14 @@ func decodeVMLShape(dec *xml.Decoder, start xml.StartElement, doc *Document) (*V
 	sh := &VMLShape{Kind: kind}
 	var rid string
 	var isHR bool
+
+	// v:shape@href — legacy VML's shape-level hyperlink. Most often a
+	// literal URL; sometimes also a relationship rId. We surface it via
+	// the imgMeta-like channel by stuffing onto a sentinel field of
+	// VMLShape so the caller can wire it to Run.LinkURL.
+	if href := attr(start, "href"); href != "" {
+		imgMeta.HRef = href
+	}
 
 	if style := attr(start, "style"); style != "" {
 		w, h := parseVMLSize(style)
@@ -7161,9 +7351,35 @@ func decodeSdtRowsInTable(dec *xml.Decoder, start xml.StartElement, pctx *parseD
 					}
 					continue
 				}
-				// w15:repeatingSection without an od:repeat binding: just
-				// keep the rows as-is. (Word's RepeatingSection control
-				// without a data binding renders only the template row.)
+				// w15:repeatingSection + w:dataBinding: count how many XML
+				// nodes the xpath matches in the customXml store and emit
+				// that many copies of the template content. This is the
+				// modern Word 2013+ form-template path (no OpenDoPE
+				// annotations needed). Falls back to single occurrence
+				// when the count is 0 or 1 — Word's behavior when the
+				// store is empty is to render the template once.
+				if props.isRepeatingSection && props.xpath != "" {
+					n := countXPathMatches(pctx.doc.CustomXMLRoots, props.xpath)
+					if n > 1 {
+						buf, err := captureElementXML(dec, t)
+						if err != nil {
+							return rows, err
+						}
+						for i := 0; i < n; i++ {
+							sub := xml.NewDecoder(strings.NewReader(buf))
+							subStart, err := readNextStart(sub)
+							if err == nil {
+								iterRows, err := decodeSdtRowsInTable(sub, subStart, pctx)
+								if err == nil {
+									rows = append(rows, iterRows...)
+								}
+							}
+						}
+						continue
+					}
+				}
+				// w15:repeatingSection without binding (or binding with 0/1
+				// matches) renders the template once.
 				depth++
 				_ = t
 			case "tr":

@@ -66,6 +66,40 @@ type sdtProps struct {
 	// PDF surface has no native edit-permission marker, but consumers
 	// inspecting the AST (e.g. for tag-aware exports) can read it.
 	lock string
+	// isRepeatingSection mirrors w15:repeatingSection — when combined with
+	// w:dataBinding, Word's RepeatingSection content control clones the
+	// inner content once per matching custom-XML node. Without a binding
+	// the marker is purely structural (the user can add more iterations
+	// at runtime in Word but the document carries only one copy).
+	isRepeatingSection bool
+}
+
+// lookupImageByRefOrName resolves a picture SDT's bound text to one of the
+// package's known image rIds. Accepts: a literal rId ("rId7"), a path that
+// matches a relationship target ("media/image1.png"), or the trailing
+// basename ("image1.png"). Returns the rId on hit, "" on miss.
+func (d *Document) lookupImageByRefOrName(ref string) string {
+	if d == nil || ref == "" {
+		return ""
+	}
+	if _, ok := d.Images[ref]; ok {
+		return ref
+	}
+	// Match against relationship targets.
+	for rid, tgt := range d.RelTargets {
+		if tgt == ref {
+			if _, ok := d.Images[rid]; ok {
+				return rid
+			}
+		}
+		// Trailing basename match: "media/image1.png" matches "image1.png".
+		if i := strings.LastIndexByte(tgt, '/'); i >= 0 && tgt[i+1:] == ref {
+			if _, ok := d.Images[rid]; ok {
+				return rid
+			}
+		}
+	}
+	return ""
 }
 
 // decodeBlockSdt walks a block-level <w:sdt> subtree and returns the
@@ -112,10 +146,28 @@ func decodeBlockSdt(dec *xml.Decoder, start xml.StartElement, pctx *parseDocCont
 					continue
 				}
 				if bindingResolved {
-					_ = dec.Skip()
-					p := Paragraph{Runs: []Run{{Text: boundText, Props: pctx.doc.Defaults}}}
-					out = append(out, p)
-					continue
+					// Picture content controls bind their xpath to an image
+					// URL/path/rId in custom XML. We can't fetch arbitrary
+					// URLs at parse time, so when the binding's text happens
+					// to name a known package image (rId or filename), render
+					// THAT image. Otherwise, fall through to the embedded
+					// sdtContent picture rather than dropping the picture in
+					// favor of a bogus text paragraph.
+					if props.kind == "picture" {
+						if img := pctx.doc.lookupImageByRefOrName(boundText); img != "" {
+							_ = dec.Skip()
+							r := Run{ImageID: img, Props: pctx.doc.Defaults}
+							out = append(out, Paragraph{Runs: []Run{r}})
+							continue
+						}
+						// No matching image found — fall through to render
+						// whatever picture sdtContent already carries.
+					} else {
+						_ = dec.Skip()
+						p := Paragraph{Runs: []Run{{Text: boundText, Props: pctx.doc.Defaults}}}
+						out = append(out, p)
+						continue
+					}
 				}
 				// OpenDoPE repeat: capture the content's raw token stream
 				// once, then RE-DECODE it for each iteration with a fresh
@@ -157,6 +209,28 @@ func decodeBlockSdt(dec *xml.Decoder, start xml.StartElement, pctx *parseDocCont
 						pctx.repeatStack = pctx.repeatStack[:len(pctx.repeatStack)-1]
 					}
 					continue
+				}
+				// w15:repeatingSection on a block-level SDT bound to multiple
+				// XML nodes: clone the inner block content N times. Same as
+				// the row-level pass in decodeSdtRowsInTable.
+				if props.isRepeatingSection && props.xpath != "" {
+					n := countXPathMatches(pctx.doc.CustomXMLRoots, props.xpath)
+					if n > 1 {
+						buf, err := captureElementXML(dec, t)
+						if err != nil {
+							return nil, err
+						}
+						for i := 0; i < n; i++ {
+							sub := xml.NewDecoder(strings.NewReader(buf))
+							subStart, err := readNextStart(sub)
+							if err == nil {
+								captured := []Block{}
+								_ = decodeSdtContentBlocks(sub, subStart, pctx, &captured)
+								out = append(out, captured...)
+							}
+						}
+						continue
+					}
 				}
 				if err := decodeSdtContentBlocks(dec, t, pctx, &out); err != nil {
 					return nil, err
@@ -309,6 +383,11 @@ func scanSdtProps(dec *xml.Decoder, start xml.StartElement) sdtProps {
 				if p.xpathPrefix == "" {
 					p.xpathPrefix = attr(t, "prefixMappings")
 				}
+			case "repeatingSection", "repeatingSectionItem":
+				// w15:repeatingSection (per-section template) and
+				// w15:repeatingSectionItem (per-item wrapper inside it).
+				// Both flag the SDT as iterating per data node.
+				p.isRepeatingSection = true
 			case "tag":
 				val := attr(t, "val")
 				if val != "" {
@@ -408,6 +487,37 @@ func scanSdtProps(dec *xml.Decoder, start xml.StartElement) sdtProps {
 				if p.kind == "" {
 					p.kind = "picture"
 				}
+			case "docPartObj", "docPartList":
+				// w:docPartObj references a single AutoText / building-block
+				// entry by name (via w:docPartGallery + w:docPartCategory).
+				// w:docPartList exposes a picker. Both ultimately surface
+				// glossary content; we mark the kind so sdtSyntheticText
+				// can attempt a glossary lookup via placeholderText.
+				if p.kind == "" {
+					if t.Name.Local == "docPartList" {
+						p.kind = "docPartList"
+					} else {
+						p.kind = "docPartObj"
+					}
+				}
+				// Capture the building-block name from any nested
+				// w:docPart val attr (a few Word versions emit it here
+				// rather than via w:placeholder). scanDocPartName drains
+				// the entire subtree including its own end tag, so we
+				// must counter-balance the depth++ at the top of this
+				// case (the outer loop won't see the matching end).
+				if name := scanDocPartName(dec, t); name != "" && p.placeholderText == "" {
+					p.placeholderText = name
+				}
+				depth--
+				continue
+			case "group", "bibliography", "citation", "equation":
+				// Pure structural markers — they wrap content but don't
+				// drive synthesis. Record the kind so callers can branch
+				// on it (e.g. to suppress placeholder text for these).
+				if p.kind == "" {
+					p.kind = t.Name.Local
+				}
 			case "placeholder":
 				// <w:placeholder><w:docPart w:val="DocPartName"/></w:placeholder>
 				// names a glossary doc-part whose body Word substitutes when
@@ -434,6 +544,33 @@ func scanSdtProps(dec *xml.Decoder, start xml.StartElement) sdtProps {
 // sdtPr subtree, kept for callers that don't need the typed metadata.
 func scanSdtBinding(dec *xml.Decoder, start xml.StartElement) string {
 	return scanSdtProps(dec, start).xpath
+}
+
+// scanDocPartName walks a w:docPartObj / w:docPartList subtree and returns
+// the w:docPart val attribute when present. Same lookup convention as
+// scanPlaceholderDocPart but for direct building-block references rather
+// than placeholders.
+func scanDocPartName(dec *xml.Decoder, start xml.StartElement) string {
+	depth := 1
+	var name string
+	for depth > 0 {
+		tok, err := dec.Token()
+		if err != nil {
+			return name
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			depth++
+			if t.Name.Local == "docPart" {
+				if v := attr(t, "val"); v != "" && name == "" {
+					name = v
+				}
+			}
+		case xml.EndElement:
+			depth--
+		}
+	}
+	return name
 }
 
 // scanPlaceholderDocPart walks a w:placeholder subtree and returns the
@@ -607,11 +744,25 @@ func decodeInlineSdt(dec *xml.Decoder, start xml.StartElement, p *Paragraph, par
 					continue
 				}
 				if bindingResolved {
-					_ = dec.Skip()
-					if !drop {
-						p.Runs = append(p.Runs, Run{Text: boundText, Props: paraRPr})
+					// Picture SDTs: when the bound value names a known
+					// package image, replace with that image; otherwise
+					// fall through so the embedded sdtContent picture
+					// renders rather than emitting the URL/path as text.
+					if props.kind == "picture" {
+						if img := pctx.doc.lookupImageByRefOrName(boundText); img != "" {
+							_ = dec.Skip()
+							if !drop {
+								p.Runs = append(p.Runs, Run{ImageID: img, Props: paraRPr})
+							}
+							continue
+						}
+					} else {
+						_ = dec.Skip()
+						if !drop {
+							p.Runs = append(p.Runs, Run{Text: boundText, Props: paraRPr})
+						}
+						continue
 					}
-					continue
 				}
 				if err := decodeWrapper(dec, t, p, paraRPr, pctx, drop); err != nil {
 					return err

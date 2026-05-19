@@ -36,6 +36,22 @@ func (r *renderer) buildMathBox(n *docx.MathNode, fontSize float64) mathBox {
 	if n == nil {
 		return mathBox{}
 	}
+	// m:argPr/m:argSz: per-argument relative size hint in [-2, +2]. Each
+	// step is ~0.85× scaling (mirrors Word's UI "smaller/larger" choices).
+	// Applied here so every code path that recurses through buildMathBox
+	// picks up the size shift uniformly.
+	if n.ArgSz != 0 {
+		switch n.ArgSz {
+		case -2:
+			fontSize *= 0.72
+		case -1:
+			fontSize *= 0.85
+		case 1:
+			fontSize *= 1.18
+		case 2:
+			fontSize *= 1.4
+		}
+	}
 	switch n.Kind {
 	case "t":
 		return r.mathStyledTextBox(applyMathScript(n.Text, n.Script), fontSize, runPropsForMath(n))
@@ -587,7 +603,23 @@ func (r *renderer) mathNaryBox(n *docx.MathNode, fontSize float64) mathBox {
 	// operator (rather than stacked above/below). The default is
 	// limLoc=undOvr for sum-like operators and subSup for integrals;
 	// when the spec says subSup explicitly we shift positions.
-	subSupStyle := n.NaryLimLoc == "subSup"
+	limLoc := n.NaryLimLoc
+	if limLoc == "" && r.doc != nil {
+		// Fall back to document-level m:mathPr defaults: m:intLim for
+		// integral-like operators (∫ ∬ ∭ ∮ ∯ ∰), m:naryLim for ∑/∏/⋃/⋂ etc.
+		if isIntegralNaryChar(glyph) {
+			limLoc = r.doc.Settings.MathProps.IntLim
+		} else {
+			limLoc = r.doc.Settings.MathProps.NaryLim
+		}
+	}
+	subSupStyle := limLoc == "subSup"
+	// When no document or element preference is recorded, integrals default
+	// to subSup (Word's display behavior) and other n-ary operators default
+	// to undOvr.
+	if limLoc == "" && isIntegralNaryChar(glyph) {
+		subSupStyle = true
+	}
 	if subSupStyle {
 		w := op.w + lo.w + base.w + 4
 		if hi.w > lo.w {
@@ -664,6 +696,17 @@ func (r *renderer) mathNaryBox(n *docx.MathNode, fontSize float64) mathBox {
 	}
 }
 
+// isIntegralNaryChar reports whether the n-ary operator glyph belongs to
+// the integral family — used to pick the right document-level limLoc
+// fallback (m:intLim vs m:naryLim).
+func isIntegralNaryChar(g string) bool {
+	switch g {
+	case "∫", "∬", "∭", "∮", "∯", "∰", "∱", "∲", "∳":
+		return true
+	}
+	return false
+}
+
 // mathDelimBox surrounds a body with paired delimiters (paren / bracket /
 // brace / pipe). Delimiters stretch by simply scaling their font size to
 // match the body height.
@@ -719,6 +762,17 @@ func (r *renderer) mathDelimBox(n *docx.MathNode, fontSize float64) mathBox {
 	// fraction look stunted.
 	if n.DGrow && bodyH > fontSize {
 		want := bodyH / (fontSize * 1.0)
+		if want > delimScale {
+			delimScale = want
+		}
+	}
+	// m:dPr/m:shp val="match" — delimiters must stretch to the full body
+	// height instead of using Word's "centered" fixed-glyph aesthetic.
+	// "centered" (the default) keeps the brace centered on the body
+	// midline; with "match" we force the delimiter to fully envelop the
+	// body, bumping the scale beyond the bodyH/1.1 heuristic when needed.
+	if n.DShape == "match" && bodyH > 0 {
+		want := bodyH / fontSize
 		if want > delimScale {
 			delimScale = want
 		}
@@ -971,8 +1025,10 @@ func (r *renderer) mathGroupChrBox(n *docx.MathNode, fontSize float64) mathBox {
 	}
 }
 
-// mathEqArrBox renders m:eqArr — a vertical stack of equations centered
-// on each other. Used for systems of equations.
+// mathEqArrBox renders m:eqArr — a vertical stack of equations. Honors
+// EqMaxDist (extra row padding, "Maximize Distance" toggle), EqRowSpRule
+// (custom row spacing rule, 1..4), and falls back to centered alignment
+// when none of those drive a more specific layout.
 func (r *renderer) mathEqArrBox(n *docx.MathNode, fontSize float64) mathBox {
 	rows := []mathBox{}
 	maxW := 0.0
@@ -988,7 +1044,22 @@ func (r *renderer) mathEqArrBox(n *docx.MathNode, fontSize float64) mathBox {
 	if len(rows) == 0 {
 		return mathBox{}
 	}
-	const rowGap = 2.0
+	rowGap := 2.0
+	// EqMaxDist asks for the maximum vertical separation between rows so
+	// stacked subscripts/superscripts don't visually touch. Bumping the
+	// gap by ~30% of the font matches Word's spacing in practice.
+	if n.EqMaxDist {
+		rowGap = fontSize * 0.35
+	}
+	// EqRowSpRule: 1=single, 2=1.5x, 3=double, 4=at-least. We approximate
+	// 1.5/double by multiplying the gap; "at-least" keeps the default
+	// since callers can't supply the minimum from here.
+	switch n.EqRowSpRule {
+	case 2:
+		rowGap *= 1.5
+	case 3:
+		rowGap *= 2
+	}
 	totalH := 0.0
 	for _, b := range rows {
 		totalH += b.height() + rowGap

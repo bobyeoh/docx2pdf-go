@@ -128,15 +128,17 @@ func (r *renderer) drawParagraph(p docx.Paragraph) error {
 	var listMarkerImg image.Image
 	var listMarkerFont string
 	var listMarkerJc string
+	var listMarkerProps docx.RunProps
 	var lvlHangPt float64
 	listIndent := 0.0
 	if p.List != nil {
-		markerText, markerImg, indentPt, hangPt, font, jc := r.resolveListMarker(*p.List)
+		markerText, markerImg, indentPt, hangPt, font, jc, mProps := r.resolveListMarker(*p.List)
 		listIndent = indentPt
 		listMarkerText = markerText
 		listMarkerImg = markerImg
 		listMarkerFont = font
 		listMarkerJc = jc
+		listMarkerProps = mProps
 		lvlHangPt = hangPt
 	}
 
@@ -175,6 +177,7 @@ func (r *renderer) drawParagraph(p docx.Paragraph) error {
 			fontFamily: listMarkerFont,
 			jc:         listMarkerJc,
 			colWidth:   lvlHangPt,
+			props:      listMarkerProps,
 		}
 	}
 
@@ -326,18 +329,18 @@ func (r *renderer) restoreParagraphState(savedColIdx int, savedMarL, savedConten
 // Returns empty values when the list isn't defined — some Word docs
 // reference numIds that aren't in numbering.xml, and we fall back gracefully
 // rather than failing the render.
-func (r *renderer) resolveListMarker(li docx.ListInfo) (marker string, img image.Image, indentPt, hangPt float64, fontFamily, markerJc string) {
+func (r *renderer) resolveListMarker(li docx.ListInfo) (marker string, img image.Image, indentPt, hangPt float64, fontFamily, markerJc string, props docx.RunProps) {
 	absID, ok := r.doc.Numbering.NumToAbs[li.NumID]
 	if !ok {
-		return "", nil, 0, 0, "", ""
+		return
 	}
 	an, ok := r.doc.Numbering.Abstract[absID]
 	if !ok {
-		return "", nil, 0, 0, "", ""
+		return
 	}
 	lv, ok := an.Levels[li.Level]
 	if !ok {
-		return "", nil, 0, 0, "", ""
+		return
 	}
 
 	// w:lvlOverride lives on the w:num, not the abstractNum. A num that
@@ -426,10 +429,13 @@ func (r *renderer) resolveListMarker(li docx.ListInfo) (marker string, img image
 	}
 
 	markerJc = lv.MarkerJc
+	// Level-rPr bold/italic/color/size flow onto the marker glyph so a
+	// "1." that Word painted bold in a non-bold body actually renders bold.
+	props = lv.MarkerProps
 	if lv.PicBulletID > 0 {
 		if rid, ok := r.doc.Numbering.PicBullets[lv.PicBulletID]; ok {
 			if image, ok := r.doc.Images[rid]; ok {
-				return "", image, indentPt, hangPt, "", markerJc
+				return "", image, indentPt, hangPt, "", markerJc, props
 			}
 		}
 	}
@@ -455,7 +461,7 @@ func (r *renderer) resolveListMarker(li docx.ListInfo) (marker string, img image
 			indentPt = 0
 		}
 	}
-	return marker, nil, indentPt, hangPt, fontFamily, markerJc
+	return marker, nil, indentPt, hangPt, fontFamily, markerJc, props
 }
 
 // formatLevelText expands lvlText placeholders like "%1.%2" using the

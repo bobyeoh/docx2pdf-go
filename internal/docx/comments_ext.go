@@ -103,6 +103,129 @@ func parseCommentsIds(f *zip.File, doc *Document) error {
 	}
 }
 
+// parseThreadedComments reads word/threadedComments.xml (Office 2016+
+// w15 namespace). Each w15:threadedComment carries:
+//   - w15:id     — comment id (matches the w:comment/@w:id in comments.xml)
+//   - w15:done   — resolved flag ("1"/"true")
+//   - parent     — id of the comment this is a reply to
+//   - author / personId / dT — author metadata
+//
+// We fold this back into doc.CommentsExtended (keyed by paraId, which we
+// recover from doc.CommentMeta) so the renderer's existing thread sort and
+// resolved-state rendering keep working without duplicating logic.
+func parseThreadedComments(f *zip.File, doc *Document) error {
+	rc, err := openZipFile(f)
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+	dec := xml.NewDecoder(rc)
+	if doc.CommentsExtended == nil {
+		doc.CommentsExtended = map[string]CommentExtended{}
+	}
+	// Build a reverse map commentID → paraID so we can join with the
+	// existing keying.
+	commentIDToPara := map[string]string{}
+	for cid, meta := range doc.CommentMeta {
+		if meta.ParaID != "" {
+			commentIDToPara[cid] = meta.ParaID
+		}
+	}
+	for {
+		tok, err := dec.Token()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		se, ok := tok.(xml.StartElement)
+		if !ok {
+			continue
+		}
+		if se.Name.Local != "threadedComment" {
+			continue
+		}
+		id := attr(se, "id")
+		parent := attr(se, "parent")
+		done := attr(se, "done")
+		paraID := commentIDToPara[id]
+		// If we don't have a paraId mapping yet (threaded-only docs that
+		// skip the w:comment surface), keyed by the threaded id directly.
+		if paraID == "" {
+			paraID = id
+		}
+		ex := doc.CommentsExtended[paraID]
+		ex.ParaID = paraID
+		if parent != "" {
+			// Convert parent comment id → parent paraId when known.
+			if pp := commentIDToPara[parent]; pp != "" {
+				ex.ParentParaID = pp
+			} else if ex.ParentParaID == "" {
+				ex.ParentParaID = parent
+			}
+		}
+		if done == "1" || done == "true" {
+			ex.Done = true
+		}
+		doc.CommentsExtended[paraID] = ex
+		_ = dec.Skip()
+	}
+}
+
+// parseCommentsExtensible reads word/commentsExtensible.xml (Office 365
+// w16cex namespace). Each w16cex:commentExtensible declares:
+//   - w16cex:durableId  — yet another stable id
+//   - w16cex:dateUtc    — round-trippable timestamp
+//
+// We store the durable id alongside the existing CommentsExtended record
+// (keyed by paraId via the comments.xml mapping). When both w16cid and
+// w16cex declare the same comment, the w16cex value wins because it's the
+// newer format.
+func parseCommentsExtensible(f *zip.File, doc *Document) error {
+	rc, err := openZipFile(f)
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+	dec := xml.NewDecoder(rc)
+	if doc.CommentsExtended == nil {
+		doc.CommentsExtended = map[string]CommentExtended{}
+	}
+	for {
+		tok, err := dec.Token()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		se, ok := tok.(xml.StartElement)
+		if !ok {
+			continue
+		}
+		if se.Name.Local != "commentExtensible" {
+			continue
+		}
+		// The element keys itself by durableId (w16cex's primary id) and
+		// optionally carries paraId. Match either form.
+		paraID := attr(se, "paraId")
+		durable := attr(se, "durableId")
+		if paraID == "" {
+			paraID = durable
+		}
+		if paraID != "" {
+			ex := doc.CommentsExtended[paraID]
+			ex.ParaID = paraID
+			if durable != "" {
+				ex.DurableID = durable
+			}
+			doc.CommentsExtended[paraID] = ex
+		}
+		_ = dec.Skip()
+	}
+}
+
 func parseCommentsExtended(f *zip.File, doc *Document) error {
 	rc, err := openZipFile(f)
 	if err != nil {
