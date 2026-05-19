@@ -1,6 +1,7 @@
 package render
 
 import (
+	"image"
 	"strconv"
 	"strings"
 	"time"
@@ -46,6 +47,17 @@ type fieldVars struct {
 	page     int
 	numPages int
 	pageFmt  string
+	// chapStyle is the section's w:pgNumType@w:chapStyle (1..9). When >0,
+	// PAGE/NUMPAGES field output is prefixed by the chapter number
+	// (derived from the most recent heading at chapStyle level) and the
+	// chapSep glyph.
+	chapStyle int
+	// chapSep is one of "hyphen","period","colon","emDash","enDash".
+	chapSep string
+	// chapNumber is the resolved chapter number string for the current
+	// page, computed by the dry pass and seeded at the start of each
+	// page's stamp. Empty when no chapStyle heading precedes the page.
+	chapNumber string
 	// numSectionPages is the page count for the section the current page
 	// belongs to. Surfaced by the SECTIONPAGES field. Zero when unknown.
 	numSectionPages int
@@ -57,15 +69,16 @@ type fieldVars struct {
 	decimalSymbol string
 	listSeparator string
 
-	now      time.Time
-	filename string
-	author   string
-	title    string
-	subject  string
-	keywords string
-	comments string
-	company  string
-	username string
+	now          time.Time
+	filename     string
+	filenameFull string // full path (for FILENAME \p); empty falls back to filename
+	author       string
+	title        string
+	subject      string
+	keywords     string
+	comments     string
+	company      string
+	username     string
 
 	// Document-level metadata used by NUMWORDS / NUMCHARS / EDITTIME.
 	numWords     int
@@ -76,7 +89,11 @@ type fieldVars struct {
 	printDate    time.Time
 
 	seqCounters map[string]int
-	bookmarks   map[string]string
+	// seqResetMarkers tracks heading-fingerprints per SEQ name × level
+	// for the \s switch. Stored on vars so all flattenFields calls
+	// across paragraphs share the same scoreboard.
+	seqResetMarkers map[string]int
+	bookmarks       map[string]string
 	// bookmarkPages maps bookmark name → 1-based PDF page number where it
 	// landed. Populated as the renderer walks bookmark markers; used by
 	// PAGEREF for cross-references that fall after the body has been
@@ -128,6 +145,87 @@ type fieldVars struct {
 	tcEntries []tocEntry
 	// xeEntries collects XE field markers — explicit Index entries.
 	xeEntries []string
+	// xePages, when non-nil, accumulates page numbers per XE title
+	// during the dry-run / live pass. INDEX uses these to emit a page
+	// column alongside each entry. Pointer-shared across the value
+	// copies of fieldVars so writes from any flattenFields call are
+	// visible to the INDEX render.
+	xePages *map[string][]int
+	// taEntries collects TA (Table of Authorities Entry) field markers.
+	// Each TA carries a long citation, an optional short form, and a
+	// category id (1..16 by spec; 1=Cases by default). TOA groups them.
+	taEntries []taEntry
+	// altChunks maps a rels Id to the parsed Block tree of an
+	// AlternativeFormatInputPart. Lets INCLUDETEXT "rId7" splice in
+	// same-package HTML/RTF/Word2003-XML content that already came
+	// through extras.loadAltChunks at parse time.
+	altChunks map[string][]docx.Block
+	// allImages and imageTargets give INCLUDEPICTURE access to the
+	// host document's image registry: allImages by relationship id,
+	// imageTargets by the source target (e.g. "media/image1.png").
+	allImages    map[string]image.Image
+	imageTargets map[string]string
+	// autoNumCounter is the per-document AUTONUM* counter shared across
+	// every AUTONUM, AUTONUMLGL, AUTONUMOUT instance in document order.
+	// Pointer so a copy of fieldVars participates in the same counter.
+	autoNumCounter *int
+	// doc gives field handlers access to document-wide metadata
+	// (CoreProperties, RawByteSize, etc.) for fields like REVNUM,
+	// FILESIZE, USERADDRESS.
+	doc *docx.Document
+}
+
+// blocksPlainText flattens a list of Blocks to a single newline-joined
+// plain-text string. Used by INCLUDETEXT when an altChunk reference is
+// resolved at field time — the field's text replaces the cached result.
+func blocksPlainText(blocks []docx.Block) string {
+	var b strings.Builder
+	for i, blk := range blocks {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		switch v := blk.(type) {
+		case docx.Paragraph:
+			for _, r := range v.Runs {
+				b.WriteString(r.Text)
+			}
+		case docx.Table:
+			for ri, row := range v.Rows {
+				if ri > 0 {
+					b.WriteByte('\n')
+				}
+				for ci, cell := range row.Cells {
+					if ci > 0 {
+						b.WriteByte('\t')
+					}
+					b.WriteString(blocksPlainText(cell.Blocks))
+				}
+			}
+		}
+	}
+	return b.String()
+}
+
+// taEntry is one TA field marker: a citation that TOA aggregates.
+type taEntry struct {
+	// Long is the full citation text from `\l "…"`.
+	Long string
+	// Short is the abbreviated form from `\s "…"`. Empty when unset.
+	Short string
+	// Category is the 1-based group id from `\c N`. 1 by default.
+	Category int
+	// Bookmark anchors the entry's location for TOA page-number lookup.
+	Bookmark string
+	// PageNum is the 1-based page where the marker landed. Resolved on
+	// the second pass.
+	PageNum int
+	// Bold / Italic mark the TA citation for bolded / italicized output in
+	// the corresponding TOA entry. Sourced from \b and \i on the TA field.
+	Bold, Italic bool
+	// CategoryOnly is the \f switch: the citation contributes only to the
+	// category total, never to the entry list. Honored by TOA's pass that
+	// emits per-category header counts.
+	CategoryOnly bool
 }
 
 // parseTCInstr parses a TC field instruction like
@@ -176,6 +274,297 @@ func parseTCInstr(instrFull string) (tocEntry, bool) {
 		}
 	}
 	return tocEntry{Level: level, Text: title, Seq: seq}, true
+}
+
+// prefixWithChapter prepends "chapter<sep>" to a page-number string when
+// the active section requested chapter numbering via w:pgNumType@w:chapStyle.
+// Returns s unchanged when no chapter context is set or no preceding
+// heading at chapStyle level has been resolved for this page.
+func prefixWithChapter(s string, vars fieldVars) string {
+	if vars.chapStyle == 0 || vars.chapNumber == "" {
+		return s
+	}
+	sep := "-"
+	switch vars.chapSep {
+	case "period":
+		sep = "."
+	case "colon":
+		sep = ":"
+	case "emDash":
+		sep = "—"
+	case "enDash":
+		sep = "–"
+	case "hyphen", "":
+		sep = "-"
+	}
+	return vars.chapNumber + sep + s
+}
+
+// parseTAInstr extracts the long/short citation and category from a TA
+// field instruction. Syntax:
+//
+//	TA \l "Long citation" \s "Short form" \c 2 \b \i
+//
+// `\l` is the long citation (also accepted as a positional arg).
+// `\s` is the short form used for "subsequent" citations in TOA.
+// `\c` is the category (1..16). When absent, category=1 (Cases).
+// Returns ok=false when no usable citation can be extracted.
+func parseTAInstr(instrFull string) (taEntry, bool) {
+	s := strings.TrimSpace(instrFull)
+	if !strings.HasPrefix(strings.ToUpper(s), "TA") {
+		return taEntry{}, false
+	}
+	s = strings.TrimSpace(s[2:])
+	entry := taEntry{Category: 1}
+	toks := tokenizeFieldArgs(s)
+	for i := 0; i < len(toks); i++ {
+		t := toks[i]
+		switch {
+		case strings.EqualFold(t, `\l`):
+			if i+1 < len(toks) {
+				entry.Long = strings.Trim(toks[i+1], `"`)
+				i++
+			}
+		case strings.EqualFold(t, `\s`):
+			if i+1 < len(toks) {
+				entry.Short = strings.Trim(toks[i+1], `"`)
+				i++
+			}
+		case strings.EqualFold(t, `\c`):
+			if i+1 < len(toks) {
+				if n, err := strconv.Atoi(strings.Trim(toks[i+1], `"`)); err == nil {
+					entry.Category = n
+					i++
+				}
+			}
+		case strings.EqualFold(t, `\b`):
+			entry.Bold = true
+		case strings.EqualFold(t, `\i`):
+			entry.Italic = true
+		case strings.EqualFold(t, `\f`):
+			entry.CategoryOnly = true
+		case strings.EqualFold(t, `\r`):
+			// Range filter — out of scope (we'd need bookmark span info).
+		default:
+			if !strings.HasPrefix(t, `\`) && entry.Long == "" {
+				entry.Long = strings.Trim(t, `"`)
+			}
+		}
+	}
+	if entry.Long == "" {
+		return taEntry{}, false
+	}
+	return entry, true
+}
+
+// parseTOASwitches decodes the relevant TOA field switches:
+//
+//	\c <category>   restrict output to one category (1..16)
+//	\f              omit the category header (just the entries)
+//	\h              include category header (default unless \f)
+//	\l "leader"     leader between entry text and page (default dot)
+//	\p              print page numbers (the default)
+//	\d "sep"        page-range separator (rare; we accept but ignore)
+//	\s "identifier" sequence identifier — out of scope; cached result wins
+//	\e "separator"  entry/page separator (in place of leader); accept the
+//	                literal as-is between text and page
+type toaSwitches struct {
+	Category   int
+	OmitHeader bool
+	Leader     string
+	NoPage     bool
+}
+
+func parseTOASwitches(instrFull string) toaSwitches {
+	var sw toaSwitches
+	sw.Leader = "."
+	toks := tokenizeFieldArgs(strings.TrimSpace(instrFull))
+	if len(toks) > 0 && strings.EqualFold(toks[0], "TOA") {
+		toks = toks[1:]
+	}
+	for i := 0; i < len(toks); i++ {
+		t := toks[i]
+		switch {
+		case strings.EqualFold(t, `\c`):
+			if i+1 < len(toks) {
+				if n, err := strconv.Atoi(strings.Trim(toks[i+1], `"`)); err == nil {
+					sw.Category = n
+					i++
+				}
+			}
+		case strings.EqualFold(t, `\f`):
+			sw.OmitHeader = true
+		case strings.EqualFold(t, `\l`), strings.EqualFold(t, `\e`):
+			if i+1 < len(toks) {
+				sw.Leader = strings.Trim(toks[i+1], `"`)
+				i++
+			}
+		case strings.EqualFold(t, `\n`):
+			sw.NoPage = true
+		}
+	}
+	return sw
+}
+
+// taCategoryNames maps the spec-defined category ids to their default
+// localized header strings. Word lets users customize this list per
+// document; we surface the spec defaults.
+var taCategoryNames = map[int]string{
+	1:  "Cases",
+	2:  "Statutes",
+	3:  "Other Authorities",
+	4:  "Rules",
+	5:  "Treatises",
+	6:  "Regulations",
+	7:  "Constitutional Provisions",
+	8:  "Category 8",
+	9:  "Category 9",
+	10: "Category 10",
+	11: "Category 11",
+	12: "Category 12",
+	13: "Category 13",
+	14: "Category 14",
+	15: "Category 15",
+	16: "Category 16",
+}
+
+// formatTOA produces a Table of Authorities listing. Entries are grouped
+// by category and sorted alphabetically within each group. When a long
+// citation appears multiple times the page numbers are concatenated.
+func formatTOA(entries []taEntry, sw toaSwitches) string {
+	if len(entries) == 0 {
+		return ""
+	}
+	// Group + dedupe by category × long citation.
+	type acc struct {
+		long  string
+		pages []int
+	}
+	groups := map[int]map[string]*acc{}
+	categories := []int{}
+	for _, e := range entries {
+		if sw.Category > 0 && e.Category != sw.Category {
+			continue
+		}
+		if _, ok := groups[e.Category]; !ok {
+			groups[e.Category] = map[string]*acc{}
+			categories = append(categories, e.Category)
+		}
+		a, ok := groups[e.Category][e.Long]
+		if !ok {
+			a = &acc{long: e.Long}
+			groups[e.Category][e.Long] = a
+		}
+		if e.PageNum > 0 {
+			a.pages = append(a.pages, e.PageNum)
+		}
+	}
+	if len(categories) == 0 {
+		return ""
+	}
+	// Stable sort categories ascending.
+	for i := 1; i < len(categories); i++ {
+		for j := i; j > 0 && categories[j] < categories[j-1]; j-- {
+			categories[j], categories[j-1] = categories[j-1], categories[j]
+		}
+	}
+	var b strings.Builder
+	for ci, cat := range categories {
+		if ci > 0 {
+			b.WriteByte('\n')
+		}
+		if !sw.OmitHeader {
+			name := taCategoryNames[cat]
+			if name == "" {
+				name = "Category " + strconv.Itoa(cat)
+			}
+			b.WriteString(name)
+			b.WriteByte('\n')
+		}
+		// Sort longs alphabetically.
+		longs := make([]string, 0, len(groups[cat]))
+		for k := range groups[cat] {
+			longs = append(longs, k)
+		}
+		for i := 1; i < len(longs); i++ {
+			for j := i; j > 0 && longs[j] < longs[j-1]; j-- {
+				longs[j], longs[j-1] = longs[j-1], longs[j]
+			}
+		}
+		for i, long := range longs {
+			a := groups[cat][long]
+			if i > 0 {
+				b.WriteByte('\n')
+			}
+			b.WriteString(long)
+			if !sw.NoPage && len(a.pages) > 0 {
+				// De-dupe + sort pages for a clean comma list.
+				seen := map[int]bool{}
+				pages := make([]int, 0, len(a.pages))
+				for _, p := range a.pages {
+					if !seen[p] {
+						seen[p] = true
+						pages = append(pages, p)
+					}
+				}
+				for i := 1; i < len(pages); i++ {
+					for j := i; j > 0 && pages[j] < pages[j-1]; j-- {
+						pages[j], pages[j-1] = pages[j-1], pages[j]
+					}
+				}
+				if sw.Leader != "" {
+					b.WriteString(" ")
+					// Render leader as a short tab-like fill.
+					b.WriteString(strings.Repeat(sw.Leader, 3))
+					b.WriteString(" ")
+				} else {
+					b.WriteString("\t")
+				}
+				for i, p := range pages {
+					if i > 0 {
+						b.WriteString(", ")
+					}
+					b.WriteString(strconv.Itoa(p))
+				}
+			}
+		}
+	}
+	return b.String()
+}
+
+// collectTAEntries gathers TA field markers from the document body.
+func collectTAEntries(doc *docx.Document) []taEntry {
+	var out []taEntry
+	var walk func(blocks []docx.Block)
+	walk = func(blocks []docx.Block) {
+		for _, b := range blocks {
+			switch v := b.(type) {
+			case docx.Paragraph:
+				for _, r := range v.Runs {
+					if r.InstrText == "" {
+						continue
+					}
+					if e, ok := parseTAInstr(r.InstrText); ok {
+						out = append(out, e)
+					}
+				}
+			case docx.Table:
+				for _, row := range v.Rows {
+					for _, cell := range row.Cells {
+						walk(cell.Blocks)
+					}
+				}
+			}
+		}
+	}
+	if len(doc.Sections) > 0 {
+		for _, sec := range doc.Sections {
+			walk(sec.Blocks)
+		}
+	} else {
+		walk(doc.Body)
+	}
+	return out
 }
 
 // parseXEInstr extracts the visible title from an XE field instruction.
@@ -493,33 +882,74 @@ func fieldCodeAndArgs(s string) (code, primary string) {
 	return code, primary
 }
 
-// hyperlinkFieldInstr decodes a HYPERLINK instrText into (target, isAnchor).
-// `\l` means the primary arg is an internal bookmark name, not a URL.
-func hyperlinkFieldInstr(s string) (target string, isAnchor bool) {
-	s = strings.TrimSpace(s)
-	parts := strings.Fields(s)
-	skipNext := false
+// hyperlinkFieldInstr decodes a HYPERLINK instrText into (target, isAnchor,
+// tooltip). `\l` means the primary arg is an internal bookmark name; `\o`
+// carries a screentip (PDF link annotation /Contents). `\m` (image-map
+// coords) and `\n` (new-window flag) have no PDF surface so we drop them.
+// `\t` carries a target-frame name — also dropped.
+func hyperlinkFieldInstr(s string) (target string, isAnchor bool, tooltip string) {
+	parts := splitFieldArgs(strings.TrimSpace(s))
+	if len(parts) == 0 {
+		return "", false, ""
+	}
+	// parts[0] is "HYPERLINK"; arguments follow. Walk and consume.
 	for i := 1; i < len(parts); i++ {
-		if skipNext {
-			skipNext = false
-			continue
-		}
 		p := parts[i]
 		switch p {
 		case "\\l":
 			isAnchor = true
-			continue
-		case "\\o", "\\t", "\\m", "\\n":
-			skipNext = true
-			continue
+		case "\\o":
+			if i+1 < len(parts) {
+				tooltip = strings.Trim(parts[i+1], `"`)
+				i++
+			}
+		case "\\t", "\\m", "\\n":
+			// Skip the switch and its argument.
+			if i+1 < len(parts) {
+				i++
+			}
+		default:
+			if strings.HasPrefix(p, "\\") {
+				continue
+			}
+			if target == "" {
+				target = strings.Trim(p, `"`)
+			}
 		}
-		if strings.HasPrefix(p, "\\") {
-			continue
-		}
-		target = strings.Trim(p, `"`)
-		return target, isAnchor
 	}
-	return "", isAnchor
+	return target, isAnchor, tooltip
+}
+
+// splitFieldArgs is a quote-aware tokenizer for Word field instrText.
+// It preserves double-quoted spans (which may contain spaces) as a single
+// token including the quotes; backslash-prefixed switches stay as their own
+// token. Single-quotes are left as-is because Word numeric/date pictures
+// use them to wrap literals.
+func splitFieldArgs(s string) []string {
+	var out []string
+	var buf strings.Builder
+	inQuote := false
+	flush := func() {
+		if buf.Len() > 0 {
+			out = append(out, buf.String())
+			buf.Reset()
+		}
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '"' {
+			buf.WriteByte(c)
+			inQuote = !inQuote
+			continue
+		}
+		if !inQuote && (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+			flush()
+			continue
+		}
+		buf.WriteByte(c)
+	}
+	flush()
+	return out
 }
 
 // flattenFields walks a paragraph's raw Run stream and resolves
@@ -534,6 +964,7 @@ func flattenFields(runs []docx.Run, vars fieldVars) []docx.Run {
 		substituted bool
 		linkURL     string
 		linkAnchor  string
+		linkTooltip string
 		suppress    bool
 		// lockResult is set when the field instruction carries `\!` —
 		// "lock result". The cached glyphs pass through verbatim; we
@@ -568,11 +999,14 @@ func flattenFields(runs []docx.Run, vars fieldVars) []docx.Run {
 				}
 				switch f.code {
 				case "HYPERLINK":
-					target, isAnchor := hyperlinkFieldInstr(f.instrFull)
+					target, isAnchor, tip := hyperlinkFieldInstr(f.instrFull)
 					if isAnchor {
 						f.linkAnchor = target
 					} else {
 						f.linkURL = target
+					}
+					if tip != "" {
+						f.linkTooltip = tip
 					}
 				case "REF", "PAGEREF", "NOTEREF":
 					// \h turns the cross-reference into an internal link
@@ -595,8 +1029,9 @@ func flattenFields(runs []docx.Run, vars fieldVars) []docx.Run {
 					f.suppress = true
 				case "ADVANCE":
 					f.suppress = true
-				case "TC", "XE", "RD", "PRIVATE":
+				case "TC", "XE", "TA", "RD", "PRIVATE":
 					// TC: TOC entry marker. XE: Index entry marker.
+					// TA: Table of Authorities entry marker.
 					// RD: Reference document. PRIVATE: app-specific data.
 					// All have no visible result; recorded so the caller can
 					// later mine them. We harvest below in vars.
@@ -610,6 +1045,16 @@ func flattenFields(runs []docx.Run, vars fieldVars) []docx.Run {
 					} else if f.code == "XE" {
 						if title := parseXEInstr(f.instrFull); title != "" {
 							vars.xeEntries = append(vars.xeEntries, title)
+							// Capture page on every encounter so the
+							// INDEX renderer can emit "term … p, q".
+							if vars.xePages != nil && vars.page > 0 {
+								m := *vars.xePages
+								m[title] = append(m[title], vars.page)
+							}
+						}
+					} else if f.code == "TA" {
+						if entry, ok := parseTAInstr(f.instrFull); ok {
+							vars.taEntries = append(vars.taEntries, entry)
 						}
 					}
 					f.suppress = true
@@ -617,22 +1062,15 @@ func flattenFields(runs []docx.Run, vars fieldVars) []docx.Run {
 					// Form fields: synthesize visible output from the
 					// parsed ffData, replacing whatever Word cached.
 					if v, ok := formFieldOutput(f.formField, f.code); ok {
-						sample := docx.Run{Text: v}
-						// Look ahead for the next non-marker run's props
-						// to inherit font/size; otherwise fall back to
-						// default props. We use a placeholder Run carrying
-						// just text — applied by the substitute branch.
-						_ = sample
 						f.substituted = false
-						// Treat as "value supplied at result time": we'll
-						// catch the visible run below and override its text.
 						// Mark suppress=true so cached glyphs are dropped;
-						// we then emit a single synthetic run after.
+						// we then emit a single synthetic run after with a
+						// visible control border so the placeholder reads
+						// as an interactive form widget rather than text.
 						f.suppress = true
-						// Emit the synthesized run immediately so it
-						// renders even if the cached result region was
-						// empty (common for FORMCHECKBOX).
-						out = append(out, docx.Run{Text: v, Props: r.Props})
+						props := r.Props
+						props.TextBorder = decorationBorderForField(f.code)
+						out = append(out, docx.Run{Text: v, Props: props})
 					}
 				}
 			}
@@ -643,7 +1081,9 @@ func flattenFields(runs []docx.Run, vars fieldVars) []docx.Run {
 				if f.formField != nil && f.code == "" {
 					_, fallbackCode := formFieldKindCode(f.formField)
 					if v, ok := formFieldOutput(f.formField, fallbackCode); ok {
-						out = append(out, docx.Run{Text: v, Props: r.Props})
+						props := r.Props
+						props.TextBorder = decorationBorderForField(fallbackCode)
+						out = append(out, docx.Run{Text: v, Props: props})
 					}
 				}
 				stack = stack[:n-1]
@@ -712,6 +1152,9 @@ func flattenFields(runs []docx.Run, vars fieldVars) []docx.Run {
 				if f.linkAnchor != "" {
 					rr.LinkAnchor = f.linkAnchor
 				}
+				if f.linkTooltip != "" {
+					rr.LinkTooltip = f.linkTooltip
+				}
 				out = append(out, rr)
 				continue
 			}
@@ -741,9 +1184,9 @@ func lookupFieldValueFull(code, arg, instrFull string, vars fieldVars) (string, 
 			// too — Word lets users zero-pad page numbers in TOC contexts.
 			// Honors the doc's decimal/grouping symbols.
 			if v := numericSwitchLocale(float64(vars.page), instrFull, vars); v != "" {
-				return v, true
+				return prefixWithChapter(v, vars), true
 			}
-			return s, true
+			return prefixWithChapter(s, vars), true
 		}
 	case "NUMPAGES":
 		if vars.numPages > 0 {
@@ -832,6 +1275,15 @@ func lookupFieldValueFull(code, arg, instrFull string, vars fieldVars) (string, 
 		}
 		return "", false
 	case "FILENAME":
+		// FILENAME \p — full path. We carry the full SourceFilename on
+		// vars.filenameFull (callers set it; falls back to the basename
+		// when unset). Without \p Word returns the file name without
+		// the path, matching the legacy default.
+		if hasFlagSwitch(instrFull, "p") {
+			if vars.filenameFull != "" {
+				return vars.filenameFull, true
+			}
+		}
 		if vars.filename != "" {
 			return vars.filename, true
 		}
@@ -861,6 +1313,8 @@ func lookupFieldValueFull(code, arg, instrFull string, vars fieldVars) (string, 
 		if arg != "" && vars.seqCounters != nil {
 			// Switches:
 			//   \r N   — reset counter to N (then return N)
+			//   \s N   — reset when the most recent heading at level N
+			//            advanced since the previous SEQ at this name
 			//   \c     — repeat last value, do not increment
 			//   \h     — increment but emit no visible text
 			//   \n     — explicit "next" (default)
@@ -868,6 +1322,22 @@ func lookupFieldValueFull(code, arg, instrFull string, vars fieldVars) (string, 
 			if n, ok := seqResetSwitch(instrFull); ok {
 				vars.seqCounters[arg] = n
 				return strconv.Itoa(n), true
+			}
+			if lvl, ok := seqHeadingResetSwitch(instrFull); ok && vars.bookmarkParaNums != nil {
+				// \s N — when a heading at level N has been seen since
+				// the last SEQ-this-name, reset to 1. We approximate
+				// "seen since last" by tracking a per-name heading
+				// fingerprint (count of headings at that level so far).
+				key := arg + "\x00seq_s_" + strconv.Itoa(lvl)
+				h := vars.headingCountByLevel(lvl)
+				if vars.seqResetMarkers == nil {
+					vars.seqResetMarkers = map[string]int{}
+				}
+				if h != vars.seqResetMarkers[key] {
+					vars.seqResetMarkers[key] = h
+					vars.seqCounters[arg] = 1
+					return strconv.Itoa(1), true
+				}
 			}
 			if seqHasFlag(instrFull, "c") {
 				v := vars.seqCounters[arg]
@@ -886,15 +1356,23 @@ func lookupFieldValueFull(code, arg, instrFull string, vars fieldVars) (string, 
 		// REF consults SET-assigned variables first, then bookmarks.
 		if arg != "" {
 			// Paragraph-number switches reach into the numbering engine.
-			// \r = relative number ("1.2.3"), \w = full paragraph number
-			// up to the cross-reference's level, \p = paragraph number
-			// only (the most specific component). We approximate via the
-			// bookmark's paragraph marker if the caller indexed it.
-			if hasFlagSwitch(instrFull, "r") || hasFlagSwitch(instrFull, "w") || hasFlagSwitch(instrFull, "p") {
+			//   \r = relative paragraph number ("1.2.3", full path)
+			//   \w = paragraph number with full context ("1.2.3", same path)
+			//   \n = paragraph number with NO context (last segment only,
+			//        e.g. "3" for "1.2.3" — the minimum unique component)
+			//   \p = relative position word: "above" or "below" depending on
+			//        whether the bookmark precedes or follows the field site.
+			//        We approximate via bookmark page vs. current page; when
+			//        unknown we default to "above" since most cross-references
+			//        point backward to earlier numbered content.
+			if hasFlagSwitch(instrFull, "p") {
+				return refPositionWord(arg, vars), true
+			}
+			if hasFlagSwitch(instrFull, "r") || hasFlagSwitch(instrFull, "w") || hasFlagSwitch(instrFull, "n") {
 				if vars.bookmarkParaNums != nil {
 					if n, ok := vars.bookmarkParaNums[arg]; ok && n != "" {
-						if hasFlagSwitch(instrFull, "p") {
-							// "paragraph only" = last segment
+						if hasFlagSwitch(instrFull, "n") {
+							// "no context" = last segment only
 							if idx := strings.LastIndex(n, "."); idx >= 0 {
 								return n[idx+1:], true
 							}
@@ -959,11 +1437,34 @@ func lookupFieldValueFull(code, arg, instrFull string, vars fieldVars) (string, 
 		// STYLEREF prints the most-recent text styled with the named
 		// style. The ideal implementation needs per-page state we don't
 		// track; instead we return the FIRST paragraph that uses the
-		// named style, which is the typical "current chapter" answer for
-		// headers on every page of a single-chapter section.
+		// named style — the typical "current chapter" answer for headers
+		// on a single-chapter section. Modifier switches honored:
+		//   \l  Lowest — return the last matching paragraph (typical
+		//        "current section" use case from chapter footers).
+		//   \f  Footer/from-end — alias for \l.
+		//   \t  Trim — strip leading numbering prefix ("1.2 ") from the
+		//        result so STYLEREF "Heading 1" \t prints just the title.
+		//   \n  Suppress non-delimiter text — keep only digits/punct.
+		//   \w  Walk — include parent levels so "1.2" inherits chapter "1".
+		//   \r  Relative — first text after this position; we fall back to
+		//        \l (last) since we can't truly walk in reverse.
+		//   \s  STYLEREF \s "headingStyle" — only paragraphs after the
+		//        current page with the named style; renderer-state-less,
+		//        falls back to first match.
 		if arg != "" && vars.styleParagraphs != nil {
 			if texts, ok := vars.styleParagraphs[arg]; ok && len(texts) > 0 {
-				return texts[0], true
+				val := texts[0]
+				if styleRefSwitch(instrFull, 'l') || styleRefSwitch(instrFull, 'f') ||
+					styleRefSwitch(instrFull, 'r') {
+					val = texts[len(texts)-1]
+				}
+				if styleRefSwitch(instrFull, 't') {
+					val = trimStyleRefPrefix(val)
+				}
+				if styleRefSwitch(instrFull, 'n') {
+					val = onlyDigitsAndPunct(val)
+				}
+				return val, true
 			}
 		}
 		return "", false
@@ -1111,6 +1612,26 @@ func lookupFieldValueFull(code, arg, instrFull string, vars fieldVars) (string, 
 		// Interactive prompts: the cached result region carries whatever
 		// the user typed last time, so fall through to it.
 		return "", false
+	case "DISPLAYBARCODE", "MERGEBARCODE":
+		// Render barcode fields as a labeled placeholder. Real
+		// scannable encoders (Code 128 / QR / EAN) would need bitmap
+		// generation outside this package's current scope; the
+		// placeholder at least preserves the encoded payload so a
+		// human reader sees the intent.
+		toks := tokenizeFieldArgs(arg)
+		if len(toks) == 0 {
+			return "[barcode]", true
+		}
+		data := strings.Trim(toks[0], `"`)
+		kind := "barcode"
+		// Second positional is the symbology (CODE128, QR, EAN13, etc.).
+		if len(toks) >= 2 {
+			t := strings.ToUpper(strings.Trim(toks[1], `"`))
+			if t != "" {
+				kind = t
+			}
+		}
+		return "[" + kind + ": " + data + "]", true
 	case "DATABASE":
 		// DATABASE inlines an external query result. We never run the
 		// query; cached result is the best surface.
@@ -1121,20 +1642,64 @@ func lookupFieldValueFull(code, arg, instrFull string, vars fieldVars) (string, 
 	case "INCLUDETEXT":
 		// INCLUDETEXT references an external file or rel target. We can't
 		// safely read arbitrary host-filesystem paths from PDF rendering,
-		// but we DO honor the "bookmark" reference form
-		//   INCLUDETEXT <path> <bookmark>
-		// when the bookmark resolves locally — useful for self-referential
-		// templates. Falls back to the cached result otherwise.
+		// but we DO honor three local forms:
+		//   1. INCLUDETEXT <path> <bookmark>  → vars.bookmarks lookup
+		//   2. INCLUDETEXT "rId12"             → AltChunk by relationship id
+		//   3. INCLUDETEXT "section://N"       → first paragraph of section N
+		// Falls back to the cached result otherwise.
 		toks := tokenizeFieldArgs(arg)
 		if len(toks) >= 2 {
 			if v, ok := vars.bookmarks[toks[1]]; ok {
 				return v, true
 			}
 		}
+		if len(toks) >= 1 {
+			path := strings.Trim(toks[0], `"`)
+			// Same-package altChunk reference by rId.
+			if strings.HasPrefix(path, "rId") && vars.altChunks != nil {
+				if blocks, ok := vars.altChunks[path]; ok {
+					return blocksPlainText(blocks), true
+				}
+			}
+		}
 		return "", false
 	case "INCLUDEPICTURE":
-		// External picture: we can't open arbitrary paths. The result
-		// region (a w:drawing) already carries the image — let it through.
+		// INCLUDEPICTURE forms we recognize:
+		//   1. INCLUDEPICTURE "rIdN"          — same-package image rel
+		//   2. INCLUDEPICTURE "media/foo.png" — package-relative path
+		// In both cases the result we synthesize is a marker token
+		// ("[Image rIdN]") that the renderer's run-decorator path turns
+		// into an actual image atom by attaching the relationship via
+		// the field cache. When the path doesn't resolve we leave the
+		// cached result alone (the result region typically contains a
+		// w:drawing already, so the image is shown anyway).
+		toks := tokenizeFieldArgs(arg)
+		if len(toks) == 0 {
+			return "", false
+		}
+		path := strings.Trim(toks[0], `"`)
+		if strings.HasPrefix(path, "rId") {
+			if vars.allImages != nil {
+				if _, ok := vars.allImages[path]; ok {
+					return "[image:" + path + "]", true
+				}
+			}
+		}
+		// Path-relative form: scan known media file names to see if any
+		// rel target ends with the same basename. Picks the first
+		// match — Word renames freshly-embedded INCLUDEPICTURE files
+		// to media/imageN.* anyway, so this matches typical exports.
+		base := path
+		if i := strings.LastIndexAny(base, "/\\"); i >= 0 {
+			base = base[i+1:]
+		}
+		if base != "" {
+			for rid, target := range vars.imageTargets {
+				if strings.EqualFold(target, base) || strings.HasSuffix(strings.ToLower(target), "/"+strings.ToLower(base)) {
+					return "[image:" + rid + "]", true
+				}
+			}
+		}
 		return "", false
 	case "TOC":
 		sw := parseTOCSwitches(instrFull)
@@ -1157,10 +1722,13 @@ func lookupFieldValueFull(code, arg, instrFull string, vars fieldVars) (string, 
 		// INDEX synthesizes an index from XE entries. We emit a simple
 		// alphabetical list when XE markers were found.
 		if len(vars.xeEntries) > 0 {
-			return formatIndex(vars.xeEntries), true
+			return formatIndexWithPages(vars.xeEntries, vars.xePages), true
 		}
 		return "", false
 	case "TOA":
+		if len(vars.taEntries) > 0 {
+			return formatTOA(vars.taEntries, parseTOASwitches(instrFull)), true
+		}
 		return "", false
 	case "AUTOTEXT", "GLOSSARY":
 		// Both fields look up a docPart by name. AUTOTEXT and GLOSSARY
@@ -1215,6 +1783,37 @@ func lookupFieldValueFull(code, arg, instrFull string, vars fieldVars) (string, 
 		return "", false
 	case "HYPERLINK":
 		return "", false
+	case "USERADDRESS":
+		// Mail-merge author address. Word substitutes the user's
+		// Outlook address; we have no merge context. Show the AUTHOR
+		// metadata as a best-effort fallback.
+		if vars.doc != nil && vars.doc.Properties.Author != "" {
+			return vars.doc.Properties.Author, true
+		}
+		return "", false
+	case "REVNUM":
+		// Document revision number from docProps/app.xml.
+		if vars.doc != nil && vars.doc.Revision != "" {
+			return vars.doc.Revision, true
+		}
+		return "1", true
+	case "FILESIZE":
+		// Whole-document byte count, if the loader recorded it.
+		if vars.doc != nil && vars.doc.RawByteSize > 0 {
+			return strconv.FormatInt(vars.doc.RawByteSize, 10), true
+		}
+		return "0", true
+	case "AUTONUM", "AUTONUMLGL", "AUTONUMOUT":
+		// Auto-numbering: each occurrence increments a private counter
+		// and emits the resulting decimal. The LGL/OUT variants share
+		// the counter — they only differ in punctuation, which is what
+		// Word inserts before formatting. We expose the plain decimal;
+		// callers can format around it.
+		if vars.autoNumCounter == nil {
+			vars.autoNumCounter = new(int)
+		}
+		*vars.autoNumCounter++
+		return strconv.Itoa(*vars.autoNumCounter), true
 	case "SYMBOL":
 		// SYMBOL embeds a single glyph by code point + font.
 		if cp, ok := parseSymbolCodePointWithSwitches(arg, instrFull); ok {
@@ -1448,6 +2047,34 @@ func seqResetSwitch(instrFull string) (int, bool) {
 // like \h or \c. The check is case-sensitive (Word writes lowercase).
 func seqHasFlag(instrFull, flag string) bool {
 	return hasFlagSwitch(instrFull, flag)
+}
+
+// seqHeadingResetSwitch parses ` SEQ Figure \s 1 ` and returns the
+// heading level (1..9) the counter should reset at. Returns ok=false
+// when \s is absent or its argument isn't a valid level.
+func seqHeadingResetSwitch(instrFull string) (int, bool) {
+	parts := strings.Fields(instrFull)
+	for i := 0; i < len(parts)-1; i++ {
+		if parts[i] == `\s` {
+			if n, err := strconv.Atoi(parts[i+1]); err == nil && n >= 1 && n <= 9 {
+				return n, true
+			}
+		}
+	}
+	return 0, false
+}
+
+// headingCountByLevel returns how many headings at the given outline
+// level appear in vars.headings. Used by SEQ's \s switch to detect
+// "another heading at this level appeared since the last increment".
+func (v fieldVars) headingCountByLevel(level int) int {
+	n := 0
+	for _, h := range v.headings {
+		if h.Level == level {
+			n++
+		}
+	}
+	return n
 }
 
 // hasFlagSwitch is the shared no-arg switch detector used by SEQ / REF /
@@ -1834,6 +2461,106 @@ func formatTOCWithSwitches(entries []tocEntry, sw tocSwitches) string {
 // formatIndex synthesizes a simple alphabetical index from XE entries.
 // Duplicates collapse; "Major:Minor" entries indent the minor part under
 // the major heading.
+// formatIndexWithPages is formatIndex enriched with a per-title page
+// list. When xePages is nil or empty, falls back to formatIndex's
+// page-less layout. Pages are de-duped and emitted as a comma-separated
+// "term ... 3, 5, 8" trailer.
+func formatIndexWithPages(entries []string, xePages *map[string][]int) string {
+	if xePages == nil || len(*xePages) == 0 {
+		return formatIndex(entries)
+	}
+	pageList := func(title string) string {
+		raw := (*xePages)[title]
+		if len(raw) == 0 {
+			return ""
+		}
+		seen := map[int]bool{}
+		out := make([]int, 0, len(raw))
+		for _, p := range raw {
+			if !seen[p] {
+				seen[p] = true
+				out = append(out, p)
+			}
+		}
+		for i := 1; i < len(out); i++ {
+			for j := i; j > 0 && out[j] < out[j-1]; j-- {
+				out[j], out[j-1] = out[j-1], out[j]
+			}
+		}
+		var b strings.Builder
+		for i, p := range out {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(strconv.Itoa(p))
+		}
+		return b.String()
+	}
+	if len(entries) == 0 {
+		return ""
+	}
+	type indexLine struct {
+		major string
+		minor map[string]bool
+	}
+	majorOrder := []string{}
+	lines := map[string]*indexLine{}
+	majorPages := map[string]string{}
+	minorPages := map[string]string{}
+	for _, raw := range entries {
+		major, minor, _ := strings.Cut(raw, ":")
+		major = strings.TrimSpace(major)
+		minor = strings.TrimSpace(minor)
+		if major == "" {
+			continue
+		}
+		if _, ok := lines[major]; !ok {
+			lines[major] = &indexLine{major: major, minor: map[string]bool{}}
+			majorOrder = append(majorOrder, major)
+		}
+		if minor != "" {
+			lines[major].minor[minor] = true
+			minorPages[major+"\x00"+minor] = pageList(raw)
+		} else {
+			majorPages[major] = pageList(raw)
+		}
+	}
+	for i := 1; i < len(majorOrder); i++ {
+		for j := i; j > 0 && majorOrder[j] < majorOrder[j-1]; j-- {
+			majorOrder[j], majorOrder[j-1] = majorOrder[j-1], majorOrder[j]
+		}
+	}
+	var b strings.Builder
+	for i, m := range majorOrder {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(m)
+		if pp := majorPages[m]; pp != "" {
+			b.WriteString(", ")
+			b.WriteString(pp)
+		}
+		mins := make([]string, 0, len(lines[m].minor))
+		for k := range lines[m].minor {
+			mins = append(mins, k)
+		}
+		for i := 1; i < len(mins); i++ {
+			for j := i; j > 0 && mins[j] < mins[j-1]; j-- {
+				mins[j], mins[j-1] = mins[j-1], mins[j]
+			}
+		}
+		for _, mn := range mins {
+			b.WriteString("\n  ")
+			b.WriteString(mn)
+			if pp := minorPages[m+"\x00"+mn]; pp != "" {
+				b.WriteString(", ")
+				b.WriteString(pp)
+			}
+		}
+	}
+	return b.String()
+}
+
 func formatIndex(entries []string) string {
 	if len(entries) == 0 {
 		return ""
@@ -1999,19 +2726,55 @@ func formFieldOutput(ff *docx.FormFieldInfo, code string) (string, bool) {
 		}
 		return "☐", true
 	case "dropdown":
+		var sel string
 		if ff.Selected >= 0 && ff.Selected < len(ff.Choices) {
-			return ff.Choices[ff.Selected], true
+			sel = ff.Choices[ff.Selected]
+		} else if len(ff.Choices) > 0 {
+			sel = ff.Choices[0]
 		}
-		if len(ff.Choices) > 0 {
-			return ff.Choices[0], true
+		if sel != "" {
+			return sel + " ▾", true
 		}
 		return "▾", true
 	case "text":
 		if ff.Default != "" {
 			return ff.Default, true
 		}
+		// Empty FORMTEXT: synthesize a placeholder that hints at the
+		// expected content. We honor TextType for the common variants
+		// Word ships ("number" / "date" / "currentDate" / "currentTime"
+		// / "calculation"); fall back to a blank slot for regular text.
+		switch ff.TextType {
+		case "number":
+			return "0", true
+		case "date":
+			return "MM/DD/YYYY", true
+		case "currentDate":
+			return time.Now().Format("01/02/2006"), true
+		case "currentTime":
+			return time.Now().Format("15:04"), true
+		case "calculation":
+			return "=", true
+		default:
+			return "          ", true
+		}
 	}
 	return "", false
+}
+
+// decorationBorderForField returns a soft outlined border style that
+// reads as a form widget. Checkbox/dropdown use a 1pt outline; text
+// fields use a thicker bottom rule via a single style hint (the renderer
+// draws all four sides — close enough). Color stays gray so the control
+// doesn't compete with the surrounding text.
+func decorationBorderForField(code string) docx.BorderEdge {
+	switch code {
+	case "FORMCHECKBOX", "FORMDROPDOWN":
+		return docx.BorderEdge{Style: "single", Sz: 0.5, Color: "808080"}
+	case "FORMTEXT":
+		return docx.BorderEdge{Style: "single", Sz: 0.5, Color: "B0B0B0"}
+	}
+	return docx.BorderEdge{}
 }
 
 // formFieldKindCode derives the field code from a FormFieldInfo when
@@ -2944,4 +3707,22 @@ func splitTopLevelCommas(s string) []string {
 	}
 	out = append(out, strings.TrimSpace(s[last:]))
 	return out
+}
+
+// refPositionWord returns the word that REF \p substitutes for a bookmark
+// cross-reference. Word emits "above" when the bookmark precedes the field
+// site and "below" otherwise; when page positions aren't known we default
+// to "above" because most authored cross-references point backward.
+func refPositionWord(name string, vars fieldVars) string {
+	bmPage, ok := vars.bookmarkPages[name]
+	if !ok || bmPage <= 0 {
+		return "above"
+	}
+	// vars.page is the page-being-stamped; when the bookmark lands on an
+	// earlier page the reference looks "above", on the same page or later
+	// it reads "below".
+	if vars.page > 0 && bmPage >= vars.page {
+		return "below"
+	}
+	return "above"
 }

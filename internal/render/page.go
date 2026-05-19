@@ -3,6 +3,7 @@ package render
 import (
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/bobyeoh/docx2pdf-go/internal/docx"
 	"github.com/signintech/gopdf"
@@ -90,16 +91,24 @@ func (r *renderer) stampPageDecorations(sections []docx.Section, sectionPageStar
 			secPagesEnd = sectionPageStart[secIdx+1] - 1
 		}
 		numSecPages := secPagesEnd - sectionPageStart[secIdx] + 1
+		chapNum := ""
+		if sec.PageNumber.ChapStyle > 0 {
+			chapNum = resolveChapterNumber(r, i, sec.PageNumber.ChapStyle)
+		}
 		r.fields = fieldVars{
 			page:            displayPage,
 			numPages:        n,
 			pageFmt:         sec.PageNumber.Fmt,
 			numSectionPages: numSecPages,
 			section:         secIdx + 1,
+			chapStyle:       sec.PageNumber.ChapStyle,
+			chapSep:         sec.PageNumber.ChapSep,
+			chapNumber:      chapNum,
 			decimalSymbol:   savedFields.decimalSymbol,
 			listSeparator:   savedFields.listSeparator,
 			now:             savedFields.now,
 			filename:        savedFields.filename,
+			filenameFull:    savedFields.filenameFull,
 			author:          savedFields.author,
 			title:           savedFields.title,
 			subject:         savedFields.subject,
@@ -314,6 +323,70 @@ func (r *renderer) drawAt(blocks []docx.Block, x, y, w float64) error {
 	return nil
 }
 
+// resolveChapterNumber returns the chapter-number string for the given
+// page when w:pgNumType@w:chapStyle is in effect. Strategy: among
+// pre-collected headings at chapStyle outline level, count those whose
+// bookmark resolves to a page ≤ pageNum. If the heading text itself
+// begins with a numeric prefix (e.g. "3 Background", "Chapter 12 — …")
+// we surface that number instead of the sequential count. Returns "" when
+// no chapStyle heading precedes this page.
+func resolveChapterNumber(r *renderer, pageNum, chapStyle int) string {
+	if r == nil || pageNum <= 0 || chapStyle <= 0 || chapStyle > 9 {
+		return ""
+	}
+	headings := r.fields.headings
+	bp := r.fields.bookmarkPages
+	if len(headings) == 0 {
+		return ""
+	}
+	count := 0
+	last := ""
+	for _, h := range headings {
+		if h.Level != chapStyle {
+			continue
+		}
+		hp := 0
+		if h.Bookmark != "" && bp != nil {
+			hp = bp[h.Bookmark]
+		}
+		if hp == 0 || hp > pageNum {
+			continue
+		}
+		count++
+		// Try to extract a leading numeric token from the heading text
+		// ("3 Introduction" / "12. Implementation" / "Chapter 5 — Notes").
+		if n := leadingHeadingNumber(h.Text); n != "" {
+			last = n
+		} else {
+			last = strconv.Itoa(count)
+		}
+	}
+	return last
+}
+
+// leadingHeadingNumber returns the first integer that looks like a
+// chapter marker in s. Accepts forms like "3 Title", "12. Title",
+// "Chapter 7 — Title", "Part II" (Roman numerals not honored here —
+// we surface only Arabic). Returns "" when no leading number is found.
+func leadingHeadingNumber(s string) string {
+	s = strings.TrimSpace(s)
+	// Skip a leading english "Chapter " / "Part " / "Section " keyword.
+	for _, kw := range []string{"Chapter ", "chapter ", "CHAPTER ", "Part ", "Section "} {
+		if strings.HasPrefix(s, kw) {
+			s = s[len(kw):]
+			break
+		}
+	}
+	i := 0
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		i++
+	}
+	if i == 0 {
+		return ""
+	}
+	return s[:i]
+}
+
 // stampPageNumbers walks every page after the body has been laid out and
 // draws "i / n" centered in the bottom margin.
 func (r *renderer) stampPageNumbers() error {
@@ -414,6 +487,49 @@ func (r *renderer) activeCharSpacePt() float64 {
 	return float64(r.activeDocGrid.CharSpace) / 100.0
 }
 
+// appendPermissionRangesSection lists w:permStart / w:permEnd protected
+// ranges as a trailing reference section so the audit information is
+// visible in the PDF. Word's edit-protection has no PDF analogue beyond
+// the read-only flag; surfacing the editor/group lets reviewers see who
+// could change which section in the source document.
+func (r *renderer) appendPermissionRangesSection(doc *docx.Document) error {
+	if len(doc.PermissionRanges) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(doc.PermissionRanges))
+	for k := range doc.PermissionRanges {
+		ids = append(ids, k)
+	}
+	sortStringDecimals(ids)
+	r.ensureRoom(36)
+	r.cursorY += 18
+	title := docx.Paragraph{
+		Runs:         []docx.Run{{Text: "Protected Ranges", Props: docx.RunProps{Bold: true, FontSize: 14}}},
+		SpacingAfter: 6,
+	}
+	if err := r.drawParagraph(title); err != nil {
+		return err
+	}
+	for _, id := range ids {
+		pr := doc.PermissionRanges[id]
+		desc := "[" + pr.ID + "]"
+		who := pr.Editor
+		if who == "" {
+			who = pr.EditorGroup
+		}
+		if who != "" {
+			desc += " " + who
+		}
+		entry := docx.Paragraph{
+			Runs: []docx.Run{{Text: desc, Props: docx.RunProps{Color: "BF8F00"}}},
+		}
+		if err := r.drawParagraph(entry); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // appendCommentsSection renders the Comments trailer with author/date
 // headers and reply-thread indentation. Threads are reconstructed from
 // w:commentsExtended (paraId / paraIdParent), with replies sorted right
@@ -456,23 +572,49 @@ func (r *renderer) appendCommentsSection(doc *docx.Document) error {
 			author = "Reviewer"
 		}
 		header := "[" + id + "] " + author
+		if meta.Initials != "" {
+			header += " (" + meta.Initials + ")"
+		}
 		if meta.Date != "" {
 			header += " • " + meta.Date
 		}
+		resolved := false
 		if ext, ok := doc.CommentsExtended[meta.ParaID]; ok && ext.Done {
+			resolved = true
 			header += " (resolved)"
 		}
 		indent := float64(depths[id]) * 18.0
 		// Author color-coding: re-use the revision palette so a reviewer
 		// who appears as both a tracked-change author and a comment author
-		// shows the same color across the document. Empty author falls
-		// back to default black.
+		// shows the same color across the document. Prefer a per-person
+		// identifier (provider id / email) over the display name when
+		// available so two reviewers with the same display name still get
+		// distinct colors. Resolved comments mute the color toward grey.
+		colorKey := meta.Author
+		if doc.PeopleByID != nil {
+			if person, ok := doc.PeopleByID[meta.Author]; ok {
+				if person.ProviderID != "" {
+					colorKey = person.ProviderID
+				} else if person.Email != "" {
+					colorKey = person.Email
+				}
+			}
+		}
 		headerColor := ""
-		if meta.Author != "" {
-			headerColor = revisionColorForAuthor(meta.Author, "")
+		if colorKey != "" {
+			headerColor = revisionColorForAuthor(colorKey, "")
+		}
+		if resolved {
+			headerColor = "808080" // mute resolved-comment header
+		}
+		markerProps := docx.RunProps{Bold: true, Color: headerColor}
+		// Resolved-comment styling: strikethrough the bold header so it
+		// reads as visually "done" rather than just textually-labeled.
+		if resolved {
+			markerProps.Strike = true
 		}
 		marker := docx.Paragraph{
-			Runs:         []docx.Run{{Text: header, Props: docx.RunProps{Bold: true, Color: headerColor}}},
+			Runs:         []docx.Run{{Text: header, Props: markerProps}},
 			IndentLeftPt: indent,
 		}
 		if err := r.drawParagraph(marker); err != nil {
@@ -482,6 +624,17 @@ func (r *renderer) appendCommentsSection(doc *docx.Document) error {
 			switch v := b.(type) {
 			case docx.Paragraph:
 				v.IndentLeftPt += indent
+				// Resolved comments: mute body text to grey so the
+				// reader's eye glides over "done" threads. Done at the
+				// run-prop level (only overrides when the run had no
+				// explicit color of its own).
+				if resolved {
+					for i := range v.Runs {
+						if v.Runs[i].Props.Color == "" {
+							v.Runs[i].Props.Color = "808080"
+						}
+					}
+				}
 				if err := r.drawParagraph(v); err != nil {
 					return err
 				}
@@ -585,6 +738,20 @@ func allSectionsHaveSectEndnotes(secs []docx.Section) bool {
 		}
 	}
 	return true
+}
+
+// anySectionDocEndFootnotes reports whether any section declares
+// w:footnotePr w:pos="docEnd" — in which case the doc-end trailer prints
+// footnotes (instead of per-page bottom-of-page render). "sectEnd" is
+// approximated by docEnd here since our footnote queue is process-global,
+// not per-section; "beneathText" falls back to default pageBottom.
+func anySectionDocEndFootnotes(secs []docx.Section) bool {
+	for _, s := range secs {
+		if s.FootnotePr != nil && (s.FootnotePr.Pos == "docEnd" || s.FootnotePr.Pos == "sectEnd") {
+			return true
+		}
+	}
+	return false
 }
 
 // appendSectionEndnotes renders the endnotes referenced from sec.Blocks
@@ -723,7 +890,14 @@ func drawLineNumbers(r *renderer, sec docx.Section) {
 		countBy = 1
 	}
 	lineH := r.opts.DefaultFontSize * 1.2
-	x := r.marL - 18
+	// w:distance is the horizontal gap between the body text edge and the
+	// line-number column, in twips. When unset (zero) fall back to the
+	// historical 18pt inset.
+	distance := 18.0
+	if sec.LineNumbering.DistanceTwips > 0 {
+		distance = float64(sec.LineNumbering.DistanceTwips) / 20.0
+	}
+	x := r.marL - distance
 	if x < 2 {
 		x = 2
 	}
@@ -838,24 +1012,185 @@ func shouldDrawPageBorder(display string, pageInSection int, isLastSecPage bool)
 }
 
 // drawPageBorders draws the four w:pgBorders edges. Position respects
-// w:offsetFrom + each edge's w:space (offsets in points).
+// w:offsetFrom + each edge's w:space (offsets in points). Edges that
+// carry a w:art preset render as a tiled motif glyph instead of a line.
 func drawPageBorders(r *renderer, b docx.PageBorders) {
 	if !(b.Top.Has() || b.Bottom.Has() || b.Left.Has() || b.Right.Has()) {
 		return
 	}
 	x1, y1, x2, y2 := pageBorderRect(r, b)
+	drawEdge := func(e docx.BorderEdge, ax1, ay1, ax2, ay2 float64) {
+		if e.Art != "" {
+			drawArtBorder(r, e, ax1, ay1, ax2, ay2)
+			return
+		}
+		drawCellEdge(r, e, ax1, ay1, ax2, ay2)
+	}
 	if b.Top.Has() {
-		drawCellEdge(r, b.Top, x1, y1, x2, y1)
+		drawEdge(b.Top, x1, y1, x2, y1)
 	}
 	if b.Bottom.Has() {
-		drawCellEdge(r, b.Bottom, x1, y2, x2, y2)
+		drawEdge(b.Bottom, x1, y2, x2, y2)
 	}
 	if b.Left.Has() {
-		drawCellEdge(r, b.Left, x1, y1, x1, y2)
+		drawEdge(b.Left, x1, y1, x1, y2)
 	}
 	if b.Right.Has() {
-		drawCellEdge(r, b.Right, x2, y1, x2, y2)
+		drawEdge(b.Right, x2, y1, x2, y2)
 	}
+}
+
+// artBorderGlyph returns the unicode tile glyph + a default tint for one
+// of the 165 w:pgBorders/@art preset IDs. Unknown IDs fall back to a
+// generic block. Glyphs are chosen from the BMP so embedded TTFs without
+// emoji coverage still render them; tint matches Word's typical color.
+func artBorderGlyph(art string) (glyph string, hex string) {
+	switch art {
+	case "hearts", "heartGray", "heartBalloon":
+		return "♥", "C00000" // ♥
+	case "stars", "starsBlack", "starsShadowed", "stars3d", "starsTop":
+		return "★", "FFC000" // ★
+	case "snowflakes", "snowflakeFancy":
+		return "❄", "5B9BD5" // ❄
+	case "moons":
+		return "☾", "808080" // ☾
+	case "sun":
+		return "☼", "FFC000" // ☼
+	case "musicNotes":
+		return "♫", "000000" // ♫
+	case "flowersBlockPrint", "flowersDaisies", "flowersModern1",
+		"flowersModern2", "flowersPansy", "flowersRedRose",
+		"flowersRoses", "flowersTeacup", "flowersTiny",
+		"whiteFlowers":
+		return "⚘", "C00060" // ⚘
+	case "christmasTree", "trees":
+		return "⛄", "00B050" // ⛄ (close enough; trees rare)
+	case "apples":
+		return "☘", "C00000" // ☘ leaf as fallback
+	case "checkered", "checkedBarBlack", "checkedBarColor":
+		return "■", "000000" // ■
+	case "basicBlackDots", "basicWhiteDots":
+		return "•", "000000" // •
+	case "basicBlackSquares", "basicWhiteSquares", "decoBlocks":
+		return "■", "000000"
+	case "basicBlackDashes", "basicWhiteDashes", "basicThinLines",
+		"basicWideInline", "basicWideMidline", "basicWideOutline":
+		return "─", "000000" // ─
+	case "triangles", "triangle1", "triangle2",
+		"triangleParty", "triangleCircle1", "triangleCircle2",
+		"zanyTriangles":
+		return "▲", "000000" // ▲
+	case "circlesLines", "circlesRectangles", "rings", "ovals":
+		return "○", "000000" // ○
+	case "diamondsGray", "doubleDiamonds":
+		return "◆", "808080" // ◆
+	case "zigZag", "zigZagStitch":
+		return "≀", "000000" // ⊀ zigzag
+	case "sawtooth", "sawtoothGray":
+		return "⁄", "000000"
+	case "waveline", "classicalWave":
+		return "∿", "5B9BD5" // ∿
+	case "lightning1", "lightning2":
+		return "⚡", "FFC000" // ⚡
+	case "lightBulb":
+		return "☀", "FFC000"
+	case "pencils":
+		return "✎", "000000" // ✎
+	case "paperClips":
+		return "⁂", "808080"
+	case "compass":
+		return "⌖", "000000" // ⌖
+	case "clocks":
+		return "⏰", "000000"
+	case "earth1", "earth2", "earth3":
+		return "♁", "0070C0" // ♁ earth
+	case "fans":
+		return "¤", "C00000" // ¤
+	case "confetti", "confettiGrays", "confettiOutline",
+		"confettiStreamers", "confettiWhite":
+		return "✴", "C00060"
+	case "celticKnotwork":
+		return "⚝", "000000"
+	case "scaredCat":
+		return "¤", "000000"
+	case "bats":
+		return "¤", "5B5B5B"
+	case "birds", "birdsFlight", "shorebirdTracks":
+		return "¤", "000000"
+	case "creaturesButterfly", "creaturesFish",
+		"creaturesInsects", "creaturesLadyBug":
+		return "⚘", "C00060"
+	case "people", "peopleHats", "peopleWaving":
+		return "☺", "000000" // ☺
+	case "swirligig", "hypnotic":
+		return "≋", "000000"
+	case "vine":
+		return "⚘", "00B050"
+	case "holly", "poinsettias", "mapleLeaf":
+		return "⚘", "00B050"
+	case "gradient":
+		return "█", "808080"
+	case "marquee", "marqueeToothed":
+		return "□", "000000" // □
+	case "":
+		return "", ""
+	default:
+		// Unknown art ID — use a small filled square so the frame is at
+		// least visible as something decorative.
+		return "■", "808080"
+	}
+}
+
+// drawArtBorder paints a tile-glyph border for one edge. Step size is
+// driven by edge.Sz (interpreted as the tile size in points; defaults to
+// 10pt). Direction is inferred from coordinate equality.
+func drawArtBorder(r *renderer, e docx.BorderEdge, x1, y1, x2, y2 float64) {
+	glyph, fallbackHex := artBorderGlyph(e.Art)
+	if glyph == "" {
+		return
+	}
+	hex := e.Color
+	if hex == "" || hex == "auto" {
+		hex = fallbackHex
+	}
+	if hex == "" {
+		hex = "000000"
+	}
+	size := e.Sz
+	if size <= 0 {
+		size = 10
+	}
+	if size < 4 {
+		size = 4
+	}
+	if size > 36 {
+		size = 36
+	}
+	rr, gg, bb := parseHexColor(hex)
+	savedFontSize := r.opts.DefaultFontSize
+	if err := r.pdf.SetFont(defaultFamily, "", size); err != nil {
+		_ = r.pdf.SetFont(defaultFamily, "", savedFontSize)
+		return
+	}
+	r.pdf.SetTextColor(rr, gg, bb)
+	// Step along the edge by ~tile width with a small overlap so the
+	// motif looks continuous.
+	step := size * 0.95
+	if x1 == x2 { // vertical edge
+		for y := y1; y <= y2-size*0.5; y += step {
+			r.pdf.SetX(x1 - size*0.5)
+			r.pdf.SetY(y)
+			_ = r.pdf.Cell(nil, glyph)
+		}
+	} else if y1 == y2 { // horizontal edge
+		for x := x1; x <= x2-size*0.25; x += step {
+			r.pdf.SetX(x)
+			r.pdf.SetY(y1 - size*0.5)
+			_ = r.pdf.Cell(nil, glyph)
+		}
+	}
+	r.pdf.SetTextColor(0, 0, 0)
+	_ = r.pdf.SetFont(defaultFamily, "", savedFontSize)
 }
 
 // applyPageBorderMargins enlarges the current marL/marR/marT/marB so they

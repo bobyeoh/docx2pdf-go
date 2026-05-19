@@ -1,6 +1,7 @@
 package render
 
 import (
+	"image"
 	"testing"
 	"time"
 
@@ -30,19 +31,22 @@ func TestFieldCodeAndArgs(t *testing.T) {
 
 func TestHyperlinkFieldInstr(t *testing.T) {
 	cases := []struct {
-		in         string
-		wantTgt    string
-		wantAnchor bool
+		in          string
+		wantTgt     string
+		wantAnchor  bool
+		wantTooltip string
 	}{
-		{"HYPERLINK \"http://a.example/page\"", "http://a.example/page", false},
-		{"HYPERLINK \\l \"Section1\"", "Section1", true},
-		{"HYPERLINK \\o \"tooltip\" \"http://b.example\"", "http://b.example", false},
+		{"HYPERLINK \"http://a.example/page\"", "http://a.example/page", false, ""},
+		{"HYPERLINK \\l \"Section1\"", "Section1", true, ""},
+		{"HYPERLINK \\o \"tooltip\" \"http://b.example\"", "http://b.example", false, "tooltip"},
+		{"HYPERLINK \"http://c.example\" \\o \"Multi word tip\"", "http://c.example", false, "Multi word tip"},
+		{"HYPERLINK \\t \"_blank\" \"http://d.example\"", "http://d.example", false, ""},
 	}
 	for _, c := range cases {
-		tgt, anchor := hyperlinkFieldInstr(c.in)
-		if tgt != c.wantTgt || anchor != c.wantAnchor {
-			t.Errorf("hyperlinkFieldInstr(%q) = (%q,%v), want (%q,%v)",
-				c.in, tgt, anchor, c.wantTgt, c.wantAnchor)
+		tgt, anchor, tip := hyperlinkFieldInstr(c.in)
+		if tgt != c.wantTgt || anchor != c.wantAnchor || tip != c.wantTooltip {
+			t.Errorf("hyperlinkFieldInstr(%q) = (%q,%v,%q), want (%q,%v,%q)",
+				c.in, tgt, anchor, tip, c.wantTgt, c.wantAnchor, c.wantTooltip)
 		}
 	}
 }
@@ -187,5 +191,52 @@ func TestFirstNonEmpty(t *testing.T) {
 	}
 	if got := firstNonEmpty("", ""); got != "" {
 		t.Errorf("firstNonEmpty: got %q want empty", got)
+	}
+}
+
+func TestLookupFieldValue_INCLUDEPICTURE_RID(t *testing.T) {
+	img := newTestImage(2, 2)
+	v := fieldVars{
+		allImages:    map[string]image.Image{"rId7": img},
+		imageTargets: map[string]string{"rId7": "media/diagram.png"},
+		seqCounters:  map[string]int{},
+	}
+	// rId form: directly maps to an image we have.
+	got, ok := lookupFieldValueWith("INCLUDEPICTURE", `"rId7"`, v)
+	if !ok || got != "[image:rId7]" {
+		t.Errorf("rId lookup = (%q,%v), want ([image:rId7], true)", got, ok)
+	}
+	// Path/basename form: scans imageTargets for a basename match.
+	got, ok = lookupFieldValueWith("INCLUDEPICTURE", `"C:\\Users\\alice\\diagram.png"`, v)
+	if !ok || got != "[image:rId7]" {
+		t.Errorf("path lookup = (%q,%v), want ([image:rId7], true)", got, ok)
+	}
+	// Miss: empty (so caller keeps cached drawing).
+	got, ok = lookupFieldValueWith("INCLUDEPICTURE", `"nowhere.png"`, v)
+	if ok || got != "" {
+		t.Errorf("miss lookup = (%q,%v), want (\"\", false)", got, ok)
+	}
+}
+
+// newTestImage is the minimal stand-in image used by the INCLUDEPICTURE
+// test: a 2×2 NRGBA the field code's allImages registry can index by rId.
+func newTestImage(w, h int) image.Image {
+	return image.NewNRGBA(image.Rect(0, 0, w, h))
+}
+
+func TestLookupFieldValue_DISPLAYBARCODE(t *testing.T) {
+	v := fieldVars{seqCounters: map[string]int{}}
+	cases := []struct {
+		arg, want string
+	}{
+		{`"1234567890" CODE128`, "[CODE128: 1234567890]"},
+		{`"https://example.com" QR`, "[QR: https://example.com]"},
+		{`"product-x"`, "[barcode: product-x]"},
+	}
+	for _, c := range cases {
+		got, ok := lookupFieldValueWith("DISPLAYBARCODE", c.arg, v)
+		if !ok || got != c.want {
+			t.Errorf("DISPLAYBARCODE %q = (%q,%v), want (%q,true)", c.arg, got, ok, c.want)
+		}
 	}
 }

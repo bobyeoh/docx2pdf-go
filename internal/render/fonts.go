@@ -578,7 +578,33 @@ func (r *renderer) chooseFamily(rn rune, p docx.RunProps) string {
 	if r.fonts[fallbackFamily] && isCJK(rn) {
 		return fallbackFamily
 	}
+	// Private Use Area (E000-F8FF / F0000-10FFFF) holds EUDC characters
+	// — GB18030 user-defined codepoints, Apple Last Resort, vendor logo
+	// fonts, etc. The chosen face for an EUDC rune is almost never the
+	// run's nominal Latin font, so prefer the fallback (which typically
+	// is a comprehensive CJK font that ships with EUDC coverage) when
+	// registered.
+	if isPUA(rn) {
+		if r.fonts[fallbackFamily] {
+			return fallbackFamily
+		}
+	}
 	return r.selectFont(p)
+}
+
+// isPUA reports whether a rune sits in a Unicode Private Use Area.
+// These ranges aren't covered by any standard font and are commonly
+// used for vendor-specific glyphs, custom logos, or EUDC entries.
+func isPUA(r rune) bool {
+	switch {
+	case r >= 0xE000 && r <= 0xF8FF: // BMP PUA
+		return true
+	case r >= 0xF0000 && r <= 0xFFFFD: // SupplemenA PUA-A
+		return true
+	case r >= 0x100000 && r <= 0x10FFFD: // SupplementB PUA-B
+		return true
+	}
+	return false
 }
 
 // isSymbolGlyph reports whether a rune sits in one of the Unicode

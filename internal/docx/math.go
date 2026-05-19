@@ -2,6 +2,7 @@ package docx
 
 import (
 	"encoding/xml"
+	"strconv"
 	"strings"
 )
 
@@ -124,6 +125,53 @@ type MathNode struct {
 	// "right", "centerGroup". Only meaningful on the root node when its
 	// Kind is "oMathPara".
 	Align string
+	// MatrixColJc holds per-column alignments parsed from m:mPr/m:mcs.
+	// Each entry is "l", "c", or "r"; an entry expands to cover m:count
+	// columns via repetition during decode. Empty → all columns center.
+	MatrixColJc []string
+	// Strike flags from m:borderBoxPr (a m:box variant). A single node
+	// may carry one or more strikes overlaid on its base.
+	StrikeH    bool // horizontal cancel line
+	StrikeV    bool // vertical cancel line
+	StrikeBLTR bool // bottom-left to top-right diagonal
+	StrikeTLBR bool // top-left to bottom-right diagonal
+	// Per-edge hide flags from m:borderBoxPr — when set, the matching
+	// border edge of the surrounding box is suppressed.
+	HideTop, HideBot, HideLeft, HideRight bool
+	// DShape carries m:dPr/m:shp val (e.g. "centered" / "match"). When
+	// "match" the brackets are drawn to match the content height; when
+	// empty Word uses its default vertical centering.
+	DShape string
+	// DegHide is m:radPr/m:degHide — when true the radical's degree is
+	// suppressed even if a non-empty m:deg subtree was provided.
+	DegHide bool
+	// Phantom variants from m:phantPr. Show=false hides the rendered glyph
+	// but reserves layout space (default phantom semantics). ZeroWid /
+	// ZeroAsc / ZeroDesc collapse the phantom's width / ascent / descent
+	// to zero. Transp draws the phantom in the background color.
+	PhShow, PhZeroWid, PhZeroAsc, PhZeroDesc, PhTransp bool
+	// MatRowSpRule and MatColSpRule are m:mPr/m:rSpRule and m:cSpRule:
+	// 1=single, 2=1.5 lines, 3=double, 4=at least, 5=exactly, 6=multiple.
+	// Combined with the (unimplemented) m:rSp / m:cSp gap to position rows.
+	MatRowSpRule, MatColSpRule int
+	// MatPlcHide is m:mPr/m:plcHide — when true, empty cells skip their
+	// placeholder rendering.
+	MatPlcHide bool
+	// EqMaxDist / EqObjDist / EqRowSpRule from m:eqArrPr. EqMaxDist=true
+	// puts the rows of an equation array at the maximum needed distance;
+	// EqObjDist=true centers each row's object on the row's vertical
+	// midline.
+	EqMaxDist, EqObjDist bool
+	EqRowSpRule          int
+	// Operator-emulator and break/align hints from m:boxPr.
+	OpEmu      bool
+	BoxBrk     int    // m:brk val (1-based break point)
+	BoxAln     string // m:aln val (alignment hint within box)
+	BoxNoBreak bool   // m:noBreak — disallow line break inside this box
+	BoxDiff    bool   // m:diff — operator differentiates the base
+	// ArgSz is m:argPr/m:argSz val — an integer in [-2, 2] that scales
+	// the argument's display size relative to its parent.
+	ArgSz int
 }
 
 func newMathNode(kind string) *mathNode { return &mathNode{Kind: kind} }
@@ -188,6 +236,9 @@ func decodeMathNode(dec *xml.Decoder, start xml.StartElement) (*mathNode, error)
 				n.SepChar = child.SepChar
 				if child.DGrow {
 					n.DGrow = true
+				}
+				if child.DShape != "" {
+					n.DShape = child.DShape
 				}
 			case "fPr":
 				// Fraction-properties wrapper. m:type val carries the
@@ -353,6 +404,274 @@ func decodeMathNode(dec *xml.Decoder, start xml.StartElement) (*mathNode, error)
 							n.Script = a.Value
 						}
 					}
+				}
+			case "mPr":
+				// Matrix properties — propagate column-alignment list to
+				// the enclosing m:m node.
+				if len(child.MatrixColJc) > 0 {
+					n.MatrixColJc = append(n.MatrixColJc, child.MatrixColJc...)
+				}
+			case "mcs":
+				// m:mcs is the list of m:mc column-property definitions
+				// inside m:mPr. The decoded child carries the assembled
+				// MatrixColJc slice.
+				if len(child.MatrixColJc) > 0 {
+					n.MatrixColJc = append(n.MatrixColJc, child.MatrixColJc...)
+				}
+			case "mc":
+				// One column-property entry — assembled in child.MatrixColJc
+				// (mcPr/mcJc + count repetitions).
+				if len(child.MatrixColJc) > 0 {
+					n.MatrixColJc = append(n.MatrixColJc, child.MatrixColJc...)
+				}
+			case "mcPr":
+				// Inside m:mc: holds m:mcJc + m:count.
+				if len(child.MatrixColJc) > 0 {
+					n.MatrixColJc = append(n.MatrixColJc, child.MatrixColJc...)
+				}
+			case "mcJc":
+				// m:mcJc val="l|c|r" — recorded on m:mcPr; combined with
+				// m:count it expands during this same decode step. We stash
+				// the single-column value here; m:count widens later.
+				if n.Kind == "mcPr" {
+					jc := "c"
+					for _, a := range t.Attr {
+						if a.Name.Local == "val" && a.Value != "" {
+							jc = a.Value
+						}
+					}
+					n.MatrixColJc = []string{jc}
+				}
+			case "count":
+				// Inside m:mcPr: repeat the captured mcJc value N times.
+				if n.Kind == "mcPr" {
+					reps := 1
+					for _, a := range t.Attr {
+						if a.Name.Local == "val" {
+							if n2, err := strconv.Atoi(a.Value); err == nil && n2 > 0 {
+								reps = n2
+							}
+						}
+					}
+					base := "c"
+					if len(n.MatrixColJc) > 0 {
+						base = n.MatrixColJc[0]
+					}
+					n.MatrixColJc = make([]string, reps)
+					for i := range n.MatrixColJc {
+						n.MatrixColJc[i] = base
+					}
+				}
+			case "strikeH":
+				n.StrikeH = true
+			case "strikeV":
+				n.StrikeV = true
+			case "strikeBLTR":
+				n.StrikeBLTR = true
+			case "strikeTLBR":
+				n.StrikeTLBR = true
+			case "hideTop":
+				if n.Kind == "borderBoxPr" {
+					n.HideTop = true
+				}
+			case "hideBot":
+				if n.Kind == "borderBoxPr" {
+					n.HideBot = true
+				}
+			case "hideLeft":
+				if n.Kind == "borderBoxPr" {
+					n.HideLeft = true
+				}
+			case "hideRight":
+				if n.Kind == "borderBoxPr" {
+					n.HideRight = true
+				}
+			case "borderBoxPr":
+				if child.HideTop {
+					n.HideTop = true
+				}
+				if child.HideBot {
+					n.HideBot = true
+				}
+				if child.HideLeft {
+					n.HideLeft = true
+				}
+				if child.HideRight {
+					n.HideRight = true
+				}
+			case "shp":
+				if n.Kind == "dPr" {
+					for _, a := range t.Attr {
+						if a.Name.Local == "val" {
+							n.DShape = a.Value
+						}
+					}
+				}
+			case "degHide":
+				if n.Kind == "radPr" {
+					n.DegHide = true
+					for _, a := range t.Attr {
+						if a.Name.Local == "val" {
+							switch a.Value {
+							case "0", "false", "off":
+								n.DegHide = false
+							}
+						}
+					}
+				}
+			case "radPr":
+				if child.DegHide {
+					n.DegHide = true
+				}
+			// Phantom-properties wrapper (m:phantPr).
+			case "phantPr":
+				if child.PhShow {
+					n.PhShow = true
+				}
+				if child.PhZeroWid {
+					n.PhZeroWid = true
+				}
+				if child.PhZeroAsc {
+					n.PhZeroAsc = true
+				}
+				if child.PhZeroDesc {
+					n.PhZeroDesc = true
+				}
+				if child.PhTransp {
+					n.PhTransp = true
+				}
+			case "show":
+				if n.Kind == "phantPr" {
+					n.PhShow = true
+				}
+			case "zeroWid":
+				if n.Kind == "phantPr" {
+					n.PhZeroWid = true
+				}
+			case "zeroAsc":
+				if n.Kind == "phantPr" {
+					n.PhZeroAsc = true
+				}
+			case "zeroDesc":
+				if n.Kind == "phantPr" {
+					n.PhZeroDesc = true
+				}
+			case "transp":
+				if n.Kind == "phantPr" {
+					n.PhTransp = true
+				}
+			// Matrix and equation-array spacing rules.
+			case "rSpRule":
+				if n.Kind == "mPr" {
+					for _, a := range t.Attr {
+						if a.Name.Local == "val" {
+							if x, err := strconv.Atoi(a.Value); err == nil {
+								n.MatRowSpRule = x
+							}
+						}
+					}
+				} else if n.Kind == "eqArrPr" {
+					for _, a := range t.Attr {
+						if a.Name.Local == "val" {
+							if x, err := strconv.Atoi(a.Value); err == nil {
+								n.EqRowSpRule = x
+							}
+						}
+					}
+				}
+			case "cSpRule":
+				if n.Kind == "mPr" {
+					for _, a := range t.Attr {
+						if a.Name.Local == "val" {
+							if x, err := strconv.Atoi(a.Value); err == nil {
+								n.MatColSpRule = x
+							}
+						}
+					}
+				}
+			case "plcHide":
+				if n.Kind == "mPr" {
+					n.MatPlcHide = true
+				}
+			case "maxDist":
+				if n.Kind == "eqArrPr" {
+					n.EqMaxDist = true
+				}
+			case "objDist":
+				if n.Kind == "eqArrPr" {
+					n.EqObjDist = true
+				}
+			case "eqArrPr":
+				if child.EqMaxDist {
+					n.EqMaxDist = true
+				}
+				if child.EqObjDist {
+					n.EqObjDist = true
+				}
+				if child.EqRowSpRule != 0 {
+					n.EqRowSpRule = child.EqRowSpRule
+				}
+			// Box-properties — operator emulator + break/alignment hints.
+			case "opEmu":
+				if n.Kind == "boxPr" {
+					n.OpEmu = true
+				}
+			case "noBreak":
+				if n.Kind == "boxPr" {
+					n.BoxNoBreak = true
+				}
+			case "diff":
+				if n.Kind == "boxPr" {
+					n.BoxDiff = true
+				}
+			case "brk":
+				if n.Kind == "boxPr" {
+					for _, a := range t.Attr {
+						if a.Name.Local == "val" {
+							if x, err := strconv.Atoi(a.Value); err == nil {
+								n.BoxBrk = x
+							}
+						}
+					}
+				}
+			case "aln":
+				if n.Kind == "boxPr" {
+					for _, a := range t.Attr {
+						if a.Name.Local == "val" {
+							n.BoxAln = a.Value
+						}
+					}
+				}
+			case "boxPr":
+				if child.OpEmu {
+					n.OpEmu = true
+				}
+				if child.BoxNoBreak {
+					n.BoxNoBreak = true
+				}
+				if child.BoxDiff {
+					n.BoxDiff = true
+				}
+				if child.BoxBrk != 0 {
+					n.BoxBrk = child.BoxBrk
+				}
+				if child.BoxAln != "" {
+					n.BoxAln = child.BoxAln
+				}
+			// Argument size hint.
+			case "argSz":
+				if n.Kind == "argPr" {
+					for _, a := range t.Attr {
+						if a.Name.Local == "val" {
+							if x, err := strconv.Atoi(a.Value); err == nil {
+								n.ArgSz = x
+							}
+						}
+					}
+				}
+			case "argPr":
+				if child.ArgSz != 0 {
+					n.ArgSz = child.ArgSz
 				}
 			default:
 				n.Children = append(n.Children, child)

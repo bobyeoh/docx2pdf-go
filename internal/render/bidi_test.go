@@ -55,3 +55,46 @@ func TestArabicJoinClass_Transparent(t *testing.T) {
 		t.Errorf("FATHA join class = %q, want T", c)
 	}
 }
+
+func TestShapeArabic_LamAlefLigature(t *testing.T) {
+	// "لا" — Lam (U+0644) + Alef (U+0627). In logical order the lam
+	// comes first; after reorderBidi the alef ends up before the lam in
+	// the rune slice. Our substitution combines them into U+FEFB
+	// (isolated Lam-Alef ligature) when nothing else attaches to the
+	// lam on its right.
+	input := "لا"
+	got := shapeArabic(reorderBidi(input, true))
+	runes := []rune(got)
+	if len(runes) != 1 {
+		t.Fatalf("lam+alef should collapse to 1 rune, got %d: %U", len(runes), runes)
+	}
+	if runes[0] != 0xFEFB {
+		t.Errorf("lam-alef ligature = U+%04X, want U+FEFB", runes[0])
+	}
+}
+
+func TestShapeArabic_LamAlefHamzaAbove(t *testing.T) {
+	// "لأ" — Lam + Alef-Hamza-Above → U+FEF7 (isolated) ligature.
+	input := "لأ"
+	got := shapeArabic(reorderBidi(input, true))
+	runes := []rune(got)
+	if len(runes) != 1 || runes[0] != 0xFEF7 {
+		t.Errorf("lam-alef-hamza ligature = %U, want [U+FEF7]", runes)
+	}
+}
+
+func TestShapeArabic_LamAlefAfterConnectingLetter(t *testing.T) {
+	// "بلا" — beh + lam + alef. The lam connects to the beh on its
+	// right, so the lam-alef collapses to the FINAL form U+FEFC.
+	input := "بلا"
+	got := shapeArabic(reorderBidi(input, true))
+	found := false
+	for _, r := range got {
+		if r == 0xFEFC {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("lam-alef-final not present in %U", []rune(got))
+	}
+}

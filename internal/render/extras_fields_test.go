@@ -178,8 +178,8 @@ func TestFormFieldOutput_Dropdown(t *testing.T) {
 		Selected: 1,
 	}
 	got, ok := formFieldOutput(ff, "FORMDROPDOWN")
-	if !ok || got != "Green" {
-		t.Errorf("dropdown → (%q,%v), want (Green,true)", got, ok)
+	if !ok || got != "Green ▾" {
+		t.Errorf("dropdown → (%q,%v), want (\"Green ▾\",true)", got, ok)
 	}
 }
 

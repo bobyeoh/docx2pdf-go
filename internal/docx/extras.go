@@ -537,6 +537,19 @@ func loadAltChunks(rels map[string]relEntry, files map[string]*zip.File, doc *Do
 			// RTF: strip to plain text — we don't model RTF semantics here.
 			txt := stripRTF(s)
 			blocks = flatTextToParagraphs(txt, doc.Defaults)
+		case isMHTMLPayload(low):
+			// MHT (RFC 2557 multipart/related): pull out the first
+			// text/html part and parse THAT as HTML. Other parts (images,
+			// CSS) are dropped — the renderer doesn't reach into the MHT
+			// resources, but the visible text content survives.
+			if html, ok := extractMHTMLHTMLPart(s); ok {
+				blocks = parseHTMLAltChunk(html, doc.Defaults)
+			} else {
+				blocks = flatTextToParagraphs(s, doc.Defaults)
+			}
+		case strings.HasPrefix(low, "<?xml") && (strings.Contains(low, "xhtml") || strings.Contains(low, "<html")):
+			// XHTML: same HTML parser; the XML declaration prefix is fine.
+			blocks = parseHTMLAltChunk(s, doc.Defaults)
 		case strings.HasPrefix(low, "<!doctype html") ||
 			strings.HasPrefix(low, "<html") ||
 			strings.HasPrefix(low, "<body") ||
@@ -559,6 +572,124 @@ func loadAltChunks(rels map[string]relEntry, files map[string]*zip.File, doc *Do
 		}
 		doc.AltChunks[rid] = blocks
 	}
+}
+
+// isMHTMLPayload sniffs the first few hundred bytes for the standard MHT
+// preamble. We allow either MIME-Version or Content-Type header on the
+// first non-blank line, with multipart/related being the typical shape.
+func isMHTMLPayload(low string) bool {
+	if strings.HasPrefix(low, "mime-version:") {
+		return strings.Contains(low, "multipart/")
+	}
+	if strings.HasPrefix(low, "content-type:") && strings.Contains(low, "multipart/related") {
+		return true
+	}
+	// Some exporters emit a blank first line then the headers.
+	if strings.Contains(low[:min(len(low), 512)], "content-type: multipart/related") {
+		return true
+	}
+	return false
+}
+
+// extractMHTMLHTMLPart finds the first part of the MHT envelope whose
+// Content-Type is text/html and returns its decoded body. Content-Transfer-
+// Encoding values "quoted-printable", "base64", and "7bit"/"8bit" are all
+// supported; unknown encodings are returned as-is.
+func extractMHTMLHTMLPart(s string) (string, bool) {
+	// Find the boundary token from the outer Content-Type header.
+	boundary := ""
+	if i := strings.Index(strings.ToLower(s), "boundary="); i >= 0 {
+		rest := s[i+9:]
+		// Strip optional quotes.
+		end := len(rest)
+		for j, c := range rest {
+			if c == '"' || c == ';' || c == '\r' || c == '\n' || c == ' ' {
+				end = j
+				break
+			}
+		}
+		boundary = strings.Trim(rest[:end], "\"")
+	}
+	if boundary == "" {
+		return "", false
+	}
+	sep := "--" + boundary
+	parts := strings.Split(s, sep)
+	for _, p := range parts {
+		// Each part begins with headers, then a blank line, then the body.
+		split := strings.Index(p, "\r\n\r\n")
+		if split < 0 {
+			split = strings.Index(p, "\n\n")
+			if split < 0 {
+				continue
+			}
+		}
+		headers := p[:split]
+		bodyStart := split
+		if strings.HasPrefix(p[split:], "\r\n\r\n") {
+			bodyStart += 4
+		} else {
+			bodyStart += 2
+		}
+		body := p[bodyStart:]
+		lowHeaders := strings.ToLower(headers)
+		if !strings.Contains(lowHeaders, "text/html") {
+			continue
+		}
+		// Decode body per Content-Transfer-Encoding.
+		switch {
+		case strings.Contains(lowHeaders, "content-transfer-encoding: quoted-printable"):
+			body = decodeQuotedPrintable(body)
+		case strings.Contains(lowHeaders, "content-transfer-encoding: base64"):
+			body = string(decodeBase64MHT(body))
+		}
+		return body, true
+	}
+	return "", false
+}
+
+// decodeQuotedPrintable does a minimal Quoted-Printable decode sufficient
+// for the email-bodied HTML chunks Word writes. Soft line breaks (=\r?\n)
+// are dropped; =HH escapes are converted to bytes; the rest passes through.
+func decodeQuotedPrintable(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '=' && i+1 < len(s) {
+			// Soft line break.
+			if s[i+1] == '\n' {
+				i++
+				continue
+			}
+			if s[i+1] == '\r' && i+2 < len(s) && s[i+2] == '\n' {
+				i += 2
+				continue
+			}
+			if i+2 < len(s) {
+				if v, err := strconv.ParseInt(s[i+1:i+3], 16, 32); err == nil {
+					b.WriteByte(byte(v))
+					i += 2
+					continue
+				}
+			}
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
+// decodeBase64MHT decodes the body's base64-encoded contents, ignoring
+// whitespace and any final '=' padding. Reuses the offcrypto base64
+// decoder so MHT/altchunk parsing doesn't pull in encoding/base64.
+func decodeBase64MHT(s string) []byte {
+	return decodeBase64(s)
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // flatTextToParagraphs turns a newline-delimited string into Paragraph
@@ -588,6 +719,12 @@ func resolveXPathWithPrefixes(parts []CustomXMLPart, xpath string, prefixes map[
 	xpath = strings.TrimSpace(xpath)
 	if xpath == "" {
 		return "", false
+	}
+	// Top-level function call? Delegate to the function evaluator so
+	// concat() / substring() / sum() / etc. work with namespace-prefixed
+	// inner expressions.
+	if v, ok, isFn := evalXPathFunction(parts, xpath, prefixes); isFn {
+		return v, ok
 	}
 	attrSel := ""
 	if i := strings.LastIndex(xpath, "/@"); i >= 0 {
@@ -636,6 +773,15 @@ func resolveXPath(parts []CustomXMLPart, xpath string) (string, bool) {
 	xpath = strings.TrimSpace(xpath)
 	if xpath == "" {
 		return "", false
+	}
+	// XPath 1.0 function wrappers we recognise at the top of an expression.
+	// Functions all follow `name(args)` with the closing paren at end of
+	// string. count() / sum() take node sets (single-arg); substring(),
+	// substring-before(), substring-after() take strings and indices;
+	// concat() takes 2+ strings; normalize-space() / translate() / number()
+	// / boolean() / floor() / ceiling() / round() take a single argument.
+	if v, ok, isFn := evalXPathFunction(parts, xpath, nil); isFn {
+		return v, ok
 	}
 	// Attribute selector at the tail of the path: "/foo/bar/@attr".
 	attrSel := ""
@@ -690,6 +836,35 @@ type xpathStep struct {
 	// element's inner text. Prefix-stripped — namespace match is
 	// best-effort by local name only.
 	childName, childVal string
+	// andAttrName/andAttrVal carry a SECOND attribute-equality predicate
+	// joined with `and`. Example: [@a='x' and @b='y']. When both are
+	// non-empty, the walker requires both equalities. Supports the
+	// common OpenDoPE pattern where one custom-XML element disambiguates
+	// across two attributes (e.g. customer id + version).
+	andAttrName, andAttrVal string
+	// conds is the parsed predicate as a list of boolean clauses joined
+	// with `and`. When non-empty it supersedes the attrName/childName
+	// flat fields for compound conditions involving XPath functions
+	// like not() / contains() / starts-with() / position() / last().
+	// Each clause is evaluated against the candidate element; the
+	// element passes only when all clauses are true.
+	conds []xpathCond
+}
+
+// xpathCond is one boolean clause in a predicate.
+type xpathCond struct {
+	// kind identifies the clause shape. Set on parse:
+	//   "attr"        — attribute equality (Name = "@k", Val = "v")
+	//   "child"       — child-element equality (Name = "Tag", Val = "v")
+	//   "contains"    — contains(@k, "needle") (Name = "@k", Val = "needle")
+	//   "starts-with" — starts-with(@k, "prefix") (Name = "@k", Val = "prefix")
+	//   "position-eq" — position()=N (PosN = N)
+	//   "last"        — position()=last() (no args)
+	kind    string
+	Name    string
+	Val     string
+	PosN    int
+	Negated bool
 }
 
 func parseXPathStep(s string) xpathStep {
@@ -702,32 +877,200 @@ func parseXPathStep(s string) xpathStep {
 		pred := s[i+1:]
 		s = s[:i]
 		pred = strings.TrimSuffix(pred, "]")
-		if n, err := strconv.Atoi(pred); err == nil && n > 0 {
+		// Fast path: bare integer predicate [N].
+		if n, err := strconv.Atoi(strings.TrimSpace(pred)); err == nil && n > 0 {
 			step.position = n
-		} else if strings.HasPrefix(pred, "@") {
-			pred = strings.TrimPrefix(pred, "@")
-			if eq := strings.IndexByte(pred, '='); eq >= 0 {
-				step.attrName = strings.TrimSpace(pred[:eq])
-				v := strings.TrimSpace(pred[eq+1:])
-				v = strings.Trim(v, `'"`)
-				step.attrVal = v
+		} else {
+			// Split on " and " into clauses; each clause becomes one
+			// xpathCond. Legacy attrName/attrVal/childName slots are
+			// also filled when applicable so existing walker paths
+			// remain effective for simple cases.
+			parts := splitPredicateAnd(pred)
+			for k, part := range parts {
+				cond, ok := parseXPathCond(strings.TrimSpace(part))
+				if !ok {
+					continue
+				}
+				step.conds = append(step.conds, cond)
+				if k == 0 {
+					switch cond.kind {
+					case "attr":
+						if !cond.Negated {
+							step.attrName = cond.Name
+							step.attrVal = cond.Val
+						}
+					case "child":
+						if !cond.Negated {
+							step.childName = cond.Name
+							step.childVal = cond.Val
+						}
+					}
+				} else if k == 1 && cond.kind == "attr" && !cond.Negated {
+					step.andAttrName = cond.Name
+					step.andAttrVal = cond.Val
+				}
 			}
-		} else if eq := strings.IndexByte(pred, '='); eq >= 0 {
-			// Child-element equality predicate: [Name='Foo'] or
-			// [ns:Name="Foo"]. Strip namespace prefix; match by
-			// local name only.
-			name := strings.TrimSpace(pred[:eq])
-			if ci := strings.IndexByte(name, ':'); ci >= 0 {
-				name = name[ci+1:]
-			}
-			v := strings.TrimSpace(pred[eq+1:])
-			v = strings.Trim(v, `'"`)
-			step.childName = name
-			step.childVal = v
 		}
 	}
 	step.name = s
 	return step
+}
+
+// parseXPathCond parses one boolean clause within a predicate. Supported
+// shapes (case-insensitive function names; quote either ' or "):
+//
+//	@k = 'v'
+//	Tag = 'v'                   (child-element equality)
+//	contains(@k, 'needle')
+//	starts-with(@k, 'prefix')
+//	position() = N
+//	last()
+//	not(<inner-clause>)         (any of the above wrapped)
+//
+// Returns ok=false when the clause shape isn't recognized; the walker
+// then treats the entire predicate as "always passes" (legacy behavior).
+func parseXPathCond(s string) (xpathCond, bool) {
+	c := xpathCond{}
+	if strings.HasPrefix(strings.ToLower(s), "not(") && strings.HasSuffix(s, ")") {
+		inner, ok := parseXPathCond(strings.TrimSpace(s[4 : len(s)-1]))
+		if !ok {
+			return c, false
+		}
+		inner.Negated = !inner.Negated
+		return inner, true
+	}
+	low := strings.ToLower(s)
+	switch {
+	case strings.HasPrefix(low, "contains("):
+		args := strings.TrimSuffix(s[len("contains("):], ")")
+		name, val, ok := splitFnArgs(args)
+		if !ok || !strings.HasPrefix(name, "@") {
+			return c, false
+		}
+		c.kind = "contains"
+		c.Name = strings.TrimPrefix(name, "@")
+		c.Val = val
+		return c, true
+	case strings.HasPrefix(low, "starts-with("):
+		args := strings.TrimSuffix(s[len("starts-with("):], ")")
+		name, val, ok := splitFnArgs(args)
+		if !ok || !strings.HasPrefix(name, "@") {
+			return c, false
+		}
+		c.kind = "starts-with"
+		c.Name = strings.TrimPrefix(name, "@")
+		c.Val = val
+		return c, true
+	case strings.HasPrefix(low, "position()"):
+		rest := strings.TrimSpace(s[len("position()"):])
+		if strings.HasPrefix(rest, "=") {
+			n, err := strconv.Atoi(strings.TrimSpace(rest[1:]))
+			if err == nil {
+				c.kind = "position-eq"
+				c.PosN = n
+				return c, true
+			}
+		}
+		return c, false
+	case low == "last()" || strings.HasPrefix(low, "last()"):
+		c.kind = "last"
+		return c, true
+	case strings.HasPrefix(s, "@"):
+		eq := strings.IndexByte(s, '=')
+		if eq < 0 {
+			return c, false
+		}
+		name := strings.TrimSpace(s[1:eq])
+		val := strings.TrimSpace(s[eq+1:])
+		val = strings.Trim(val, `'"`)
+		c.kind = "attr"
+		c.Name = name
+		c.Val = val
+		return c, true
+	default:
+		// Child-element equality predicate: Tag = 'v' (optionally
+		// namespaced).
+		eq := strings.IndexByte(s, '=')
+		if eq < 0 {
+			return c, false
+		}
+		name := strings.TrimSpace(s[:eq])
+		if ci := strings.IndexByte(name, ':'); ci >= 0 {
+			name = name[ci+1:]
+		}
+		val := strings.TrimSpace(s[eq+1:])
+		val = strings.Trim(val, `'"`)
+		c.kind = "child"
+		c.Name = name
+		c.Val = val
+		return c, true
+	}
+}
+
+// splitFnArgs splits a two-argument xpath function call's body. Returns
+// the two trimmed args (with surrounding quotes stripped from arg 2)
+// and ok=false on shape mismatch.
+func splitFnArgs(s string) (string, string, bool) {
+	depth := 0
+	inQuote := byte(0)
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inQuote != 0 {
+			if c == inQuote {
+				inQuote = 0
+			}
+			continue
+		}
+		switch c {
+		case '\'', '"':
+			inQuote = c
+		case '(':
+			depth++
+		case ')':
+			depth--
+		case ',':
+			if depth == 0 {
+				a := strings.TrimSpace(s[:i])
+				b := strings.TrimSpace(s[i+1:])
+				b = strings.Trim(b, `'"`)
+				return a, b, true
+			}
+		}
+	}
+	return "", "", false
+}
+
+// splitPredicateAnd splits a predicate body on the literal " and "
+// connector (case-insensitive). Quoted segments are respected — `and`
+// inside single or double quotes is not treated as a separator. Returns
+// the original string as a 1-element slice when no separator is found.
+func splitPredicateAnd(s string) []string {
+	if !strings.Contains(strings.ToLower(s), " and ") {
+		return []string{s}
+	}
+	parts := []string{}
+	inQuote := byte(0)
+	start := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inQuote != 0 {
+			if c == inQuote {
+				inQuote = 0
+			}
+			continue
+		}
+		if c == '\'' || c == '"' {
+			inQuote = c
+			continue
+		}
+		if i+5 <= len(s) && strings.EqualFold(s[i:i+5], " and ") {
+			parts = append(parts, s[start:i])
+			start = i + 5
+			i += 4
+		}
+	}
+	parts = append(parts, s[start:])
+	return parts
 }
 
 // parsePrefixMappings unpacks Word's <w:dataBinding w:prefixMappings="…">
@@ -885,6 +1228,337 @@ func storePropsCompanion(itemPath string) string {
 		return itemPath
 	}
 	return dir + "itemProps" + strings.TrimPrefix(base, "item")
+}
+
+// evalXPathFunction recognises an XPath 1.0 function-form expression
+// `name(args)` and computes the result. Returns (value, ok, true) when
+// the expression IS a function call; (_, _, false) when it isn't and the
+// caller should fall through to normal path resolution.
+//
+// prefixes is optional and only consulted by inner path resolutions; pass
+// nil for the default (no namespace remapping).
+func evalXPathFunction(parts []CustomXMLPart, expr string, prefixes map[string]string) (string, bool, bool) {
+	expr = strings.TrimSpace(expr)
+	if !strings.HasSuffix(expr, ")") {
+		return "", false, false
+	}
+	lp := strings.IndexByte(expr, '(')
+	if lp <= 0 {
+		return "", false, false
+	}
+	name := strings.ToLower(strings.TrimSpace(expr[:lp]))
+	body := strings.TrimSpace(expr[lp+1 : len(expr)-1])
+	// Only treat as a function call when the name looks like one we know.
+	// This avoids accidentally swallowing expressions that contain '('
+	// inside a predicate.
+	switch name {
+	case "count", "sum", "substring", "substring-before", "substring-after",
+		"concat", "normalize-space", "translate", "number", "boolean", "not",
+		"floor", "ceiling", "round", "string", "string-length", "local-name", "name":
+	default:
+		return "", false, false
+	}
+	args := splitXPathArgs(body)
+	// Helper to resolve an arg to a string. If the arg is a quoted literal
+	// it's used as-is; numeric literals also pass through; otherwise it's
+	// treated as a sub-expression which may itself be a function or path.
+	resolveArg := func(a string) (string, bool) {
+		a = strings.TrimSpace(a)
+		if a == "" {
+			return "", false
+		}
+		if (strings.HasPrefix(a, "'") && strings.HasSuffix(a, "'")) ||
+			(strings.HasPrefix(a, "\"") && strings.HasSuffix(a, "\"")) {
+			return a[1 : len(a)-1], true
+		}
+		if _, err := strconv.ParseFloat(a, 64); err == nil {
+			return a, true
+		}
+		if v, ok, isFn := evalXPathFunction(parts, a, prefixes); isFn {
+			return v, ok
+		}
+		// Path resolution: prefer the prefixed path resolver when a map is
+		// supplied so OpenDoPE expressions with prefixMappings still work.
+		if prefixes != nil {
+			return resolveXPathWithPrefixes(parts, a, prefixes)
+		}
+		return resolveXPath(parts, a)
+	}
+	switch name {
+	case "count":
+		n := countXPathMatches(parts, body)
+		return strconv.Itoa(n), true, true
+	case "sum":
+		// Sum the numeric values of all element matches for the inner path.
+		// We approximate by counting matches of the (single) path, then
+		// re-fetching each via positional predicate.
+		n := countXPathMatches(parts, body)
+		var total float64
+		for i := 1; i <= n; i++ {
+			indexed := injectPositionalPredicate(body, i)
+			if v, ok := resolveXPath(parts, indexed); ok {
+				if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
+					total += f
+				}
+			}
+		}
+		return formatXPathNumber(total), true, true
+	case "substring":
+		if len(args) < 2 {
+			return "", false, true
+		}
+		s, _ := resolveArg(args[0])
+		startF, _ := strconv.ParseFloat(strings.TrimSpace(args[1]), 64)
+		start := int(math.Round(startF))
+		// XPath 1.0 substring is 1-based; clamp left edge.
+		if start < 1 {
+			start = 1
+		}
+		runes := []rune(s)
+		if start-1 >= len(runes) {
+			return "", true, true
+		}
+		end := len(runes)
+		if len(args) >= 3 {
+			lenF, _ := strconv.ParseFloat(strings.TrimSpace(args[2]), 64)
+			end = start - 1 + int(math.Round(lenF))
+			if end > len(runes) {
+				end = len(runes)
+			}
+			if end < start-1 {
+				end = start - 1
+			}
+		}
+		return string(runes[start-1 : end]), true, true
+	case "substring-before":
+		if len(args) != 2 {
+			return "", false, true
+		}
+		s, _ := resolveArg(args[0])
+		sep, _ := resolveArg(args[1])
+		if sep == "" {
+			return "", true, true
+		}
+		if i := strings.Index(s, sep); i >= 0 {
+			return s[:i], true, true
+		}
+		return "", true, true
+	case "substring-after":
+		if len(args) != 2 {
+			return "", false, true
+		}
+		s, _ := resolveArg(args[0])
+		sep, _ := resolveArg(args[1])
+		if sep == "" {
+			return s, true, true
+		}
+		if i := strings.Index(s, sep); i >= 0 {
+			return s[i+len(sep):], true, true
+		}
+		return "", true, true
+	case "concat":
+		var b strings.Builder
+		for _, a := range args {
+			v, _ := resolveArg(a)
+			b.WriteString(v)
+		}
+		return b.String(), true, true
+	case "normalize-space":
+		var s string
+		if len(args) == 0 {
+			s = ""
+		} else {
+			s, _ = resolveArg(args[0])
+		}
+		return strings.Join(strings.Fields(s), " "), true, true
+	case "translate":
+		if len(args) != 3 {
+			return "", false, true
+		}
+		s, _ := resolveArg(args[0])
+		from, _ := resolveArg(args[1])
+		to, _ := resolveArg(args[2])
+		fromR := []rune(from)
+		toR := []rune(to)
+		var b strings.Builder
+		for _, c := range s {
+			idx := -1
+			for k, fc := range fromR {
+				if fc == c {
+					idx = k
+					break
+				}
+			}
+			if idx < 0 {
+				b.WriteRune(c)
+				continue
+			}
+			if idx < len(toR) {
+				b.WriteRune(toR[idx])
+			}
+			// idx >= len(toR) → character is removed.
+		}
+		return b.String(), true, true
+	case "number":
+		if len(args) == 0 {
+			return "NaN", false, true
+		}
+		v, ok := resolveArg(args[0])
+		if !ok {
+			return "NaN", false, true
+		}
+		f, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil {
+			return "NaN", false, true
+		}
+		return formatXPathNumber(f), true, true
+	case "boolean":
+		if len(args) == 0 {
+			return "false", true, true
+		}
+		v, _ := resolveArg(args[0])
+		if v == "" || v == "0" || strings.EqualFold(v, "false") {
+			return "false", true, true
+		}
+		return "true", true, true
+	case "not":
+		if len(args) == 0 {
+			return "true", true, true
+		}
+		v, _ := resolveArg(args[0])
+		if v == "" || v == "0" || strings.EqualFold(v, "false") {
+			return "true", true, true
+		}
+		return "false", true, true
+	case "floor":
+		if len(args) == 0 {
+			return "NaN", false, true
+		}
+		v, _ := resolveArg(args[0])
+		f, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil {
+			return "NaN", false, true
+		}
+		return formatXPathNumber(math.Floor(f)), true, true
+	case "ceiling":
+		if len(args) == 0 {
+			return "NaN", false, true
+		}
+		v, _ := resolveArg(args[0])
+		f, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil {
+			return "NaN", false, true
+		}
+		return formatXPathNumber(math.Ceil(f)), true, true
+	case "round":
+		if len(args) == 0 {
+			return "NaN", false, true
+		}
+		v, _ := resolveArg(args[0])
+		f, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil {
+			return "NaN", false, true
+		}
+		return formatXPathNumber(math.Round(f)), true, true
+	case "string":
+		if len(args) == 0 {
+			return "", true, true
+		}
+		v, _ := resolveArg(args[0])
+		return v, true, true
+	case "string-length":
+		if len(args) == 0 {
+			return "0", true, true
+		}
+		v, _ := resolveArg(args[0])
+		return strconv.Itoa(len([]rune(v))), true, true
+	case "local-name", "name":
+		// Without a real node model we can only return the trailing step
+		// of the path argument. Word documents rarely use these but the
+		// approximation keeps templates that probe element names alive.
+		if len(args) == 0 {
+			return "", true, true
+		}
+		a := strings.TrimSpace(args[0])
+		a = strings.TrimSuffix(a, "/")
+		if i := strings.LastIndexByte(a, '/'); i >= 0 {
+			a = a[i+1:]
+		}
+		if name == "local-name" {
+			if i := strings.IndexByte(a, ':'); i >= 0 {
+				a = a[i+1:]
+			}
+		}
+		if i := strings.IndexAny(a, "[@"); i >= 0 {
+			a = a[:i]
+		}
+		return a, true, true
+	}
+	return "", false, false
+}
+
+// splitXPathArgs splits a comma-separated arg list, respecting nesting in
+// parentheses and quoted literals. Empty input yields a single empty arg.
+func splitXPathArgs(s string) []string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	var out []string
+	depth := 0
+	quote := byte(0)
+	last := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if quote != 0 {
+			if c == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch c {
+		case '\'', '"':
+			quote = c
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 {
+				out = append(out, strings.TrimSpace(s[last:i]))
+				last = i + 1
+			}
+		}
+	}
+	out = append(out, strings.TrimSpace(s[last:]))
+	return out
+}
+
+// injectPositionalPredicate appends a `[N]` predicate to the final step
+// of an XPath. Used by sum() to enumerate matches one at a time.
+func injectPositionalPredicate(xpath string, n int) string {
+	xpath = strings.TrimSpace(xpath)
+	// If the path already ends in /@attr, the predicate goes on the
+	// element BEFORE the attribute selector.
+	if i := strings.LastIndex(xpath, "/@"); i >= 0 {
+		return xpath[:i] + "[" + strconv.Itoa(n) + "]" + xpath[i:]
+	}
+	return xpath + "[" + strconv.Itoa(n) + "]"
+}
+
+// formatXPathNumber matches XPath 1.0 number-to-string: integers print
+// without a decimal point; non-integers preserve enough precision for
+// document interpolation without trailing zeros.
+func formatXPathNumber(f float64) string {
+	if math.IsNaN(f) {
+		return "NaN"
+	}
+	if f == math.Trunc(f) && !math.IsInf(f, 0) {
+		return strconv.FormatFloat(f, 'f', 0, 64)
+	}
+	return strconv.FormatFloat(f, 'f', -1, 64)
 }
 
 // countXPathMatches returns how many element-matches an XPath has across
@@ -1103,6 +1777,57 @@ func matchSuffixNS(stack []xpathFrame, steps []xpathStep, prefixes map[string]st
 		if st.attrName != "" && f.attrs[st.attrName] != st.attrVal {
 			return false
 		}
+		if st.andAttrName != "" && f.attrs[st.andAttrName] != st.andAttrVal {
+			return false
+		}
+		if !evalXPathConds(st.conds, f, stack, off+i) {
+			return false
+		}
+	}
+	return true
+}
+
+// evalXPathConds checks every clause in conds against the candidate
+// frame f. Returns true when ALL clauses pass; false otherwise.
+// position-eq / last require parentCount + total-children which the
+// streaming walker doesn't have a clean shot at — we approximate.
+func evalXPathConds(conds []xpathCond, f xpathFrame, stack []xpathFrame, idx int) bool {
+	if len(conds) == 0 {
+		return true
+	}
+	for _, c := range conds {
+		pass := true
+		switch c.kind {
+		case "attr":
+			pass = f.attrs[c.Name] == c.Val
+		case "child":
+			// Streaming walker doesn't retain child text in the frame;
+			// child-equality is handled by the legacy branch in
+			// matchSuffix. We pass-through here.
+			pass = true
+		case "contains":
+			pass = strings.Contains(f.attrs[c.Name], c.Val)
+		case "starts-with":
+			pass = strings.HasPrefix(f.attrs[c.Name], c.Val)
+		case "position-eq":
+			var parentCount int
+			if idx-1 >= 0 && idx-1 < len(stack) {
+				parentCount = stack[idx-1].childPos[f.name]
+			}
+			pass = parentCount == c.PosN
+		case "last":
+			// Without an end-of-parent signal we can't know "is last";
+			// approximate as always pass so authors get partial coverage.
+			pass = true
+		default:
+			pass = true
+		}
+		if c.Negated {
+			pass = !pass
+		}
+		if !pass {
+			return false
+		}
 	}
 	return true
 }
@@ -1134,6 +1859,12 @@ func matchSuffixWithPredicates(stack []xpathFrame, steps []xpathStep) bool {
 			}
 		}
 		if st.attrName != "" && f.attrs[st.attrName] != st.attrVal {
+			return false
+		}
+		if st.andAttrName != "" && f.attrs[st.andAttrName] != st.andAttrVal {
+			return false
+		}
+		if !evalXPathConds(st.conds, f, stack, off+i) {
 			return false
 		}
 	}
@@ -1232,6 +1963,7 @@ func extractChartStruct(f *zip.File) (ChartData, error) {
 	}
 	defer rc.Close()
 	dec := xml.NewDecoder(rc)
+	valAxIDs := map[int64]bool{}
 	for {
 		tok, err := dec.Token()
 		if err == io.EOF {
@@ -1256,13 +1988,58 @@ func extractChartStruct(f *zip.File) (ChartData, error) {
 				out.CategoryAxisDeleted = true
 			}
 		case "valAx":
-			title, deleted := parseAxisInfo(dec, se)
-			if title != "" {
-				out.YAxisTitle = title
+			info := parseValAxScaling(dec, se)
+			if info.Title != "" && out.YAxisTitle == "" {
+				out.YAxisTitle = info.Title
 			}
-			if deleted {
+			if info.Deleted {
 				out.ValueAxisDeleted = true
 			}
+			if info.HasMin && !out.HasValMin {
+				out.HasValMin = true
+				out.ValMin = info.Min
+			}
+			if info.HasMax && !out.HasValMax {
+				out.HasValMax = true
+				out.ValMax = info.Max
+			}
+			if info.LogBase > 0 && out.LogBase == 0 {
+				out.LogBase = info.LogBase
+			}
+			if info.MajorUnit > 0 && out.MajorUnit == 0 {
+				out.MajorUnit = info.MajorUnit
+			}
+			if info.MinorUnit > 0 && out.MinorUnit == 0 {
+				out.MinorUnit = info.MinorUnit
+			}
+			if info.HasCrossesAt && !out.HasCrossesAt {
+				out.HasCrossesAt = true
+				out.CrossesAt = info.CrossesAt
+			}
+			if info.AxId != 0 {
+				valAxIDs[info.AxId] = true
+				if len(valAxIDs) > 1 {
+					out.HasSecondaryAxis = true
+				}
+			}
+		case "legend":
+			pos, del := parseLegendInfo(dec, se)
+			if pos != "" {
+				out.LegendPos = pos
+			}
+			if del {
+				out.LegendDeleted = true
+			}
+		case "plotVisOnly":
+			if attr(se, "val") != "0" {
+				out.PlotVisOnly = true
+			}
+			_ = dec.Skip()
+		case "dispBlanksAs":
+			if v := attr(se, "val"); v != "" {
+				out.DispBlanksAs = v
+			}
+			_ = dec.Skip()
 		case "dLbls":
 			parseDLbls(dec, se, &out.DataLabels)
 		case "barChart":
@@ -1392,6 +2169,155 @@ func parseAxisInfo(dec *xml.Decoder, start xml.StartElement) (title string, dele
 	return
 }
 
+// valAxInfo collects the metadata we care about from a single c:valAx
+// subtree in one pass.
+type valAxInfo struct {
+	Title        string
+	Deleted      bool
+	Min, Max     float64
+	HasMin       bool
+	HasMax       bool
+	LogBase      float64
+	MajorUnit    float64
+	MinorUnit    float64
+	CrossesAt    float64
+	HasCrossesAt bool
+	AxId         int64
+}
+
+// parseValAxScaling drains a c:valAx subtree, scraping the title,
+// delete flag, axId, and any c:scaling children (logBase/min/max), plus
+// majorUnit / minorUnit / crossesAt.
+func parseValAxScaling(dec *xml.Decoder, start xml.StartElement) valAxInfo {
+	info := valAxInfo{}
+	depth := 1
+	for depth > 0 {
+		tok, err := dec.Token()
+		if err != nil {
+			return info
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			switch t.Name.Local {
+			case "axId":
+				if v := attr(t, "val"); v != "" {
+					if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+						info.AxId = n
+					}
+				}
+				_ = dec.Skip()
+			case "title":
+				info.Title = extractChartTitle(dec, t)
+			case "delete":
+				v := attr(t, "val")
+				info.Deleted = v == "" || v == "1" || v == "true"
+				_ = dec.Skip()
+			case "scaling":
+				parseAxScaling(dec, t, &info)
+			case "majorUnit":
+				if v := attr(t, "val"); v != "" {
+					if n, err := strconv.ParseFloat(v, 64); err == nil {
+						info.MajorUnit = n
+					}
+				}
+				_ = dec.Skip()
+			case "minorUnit":
+				if v := attr(t, "val"); v != "" {
+					if n, err := strconv.ParseFloat(v, 64); err == nil {
+						info.MinorUnit = n
+					}
+				}
+				_ = dec.Skip()
+			case "crossesAt":
+				if v := attr(t, "val"); v != "" {
+					if n, err := strconv.ParseFloat(v, 64); err == nil {
+						info.CrossesAt = n
+						info.HasCrossesAt = true
+					}
+				}
+				_ = dec.Skip()
+			default:
+				depth++
+			}
+		case xml.EndElement:
+			depth--
+		}
+	}
+	return info
+}
+
+// parseAxScaling reads c:scaling/c:logBase / min / max.
+func parseAxScaling(dec *xml.Decoder, start xml.StartElement, info *valAxInfo) {
+	depth := 1
+	for depth > 0 {
+		tok, err := dec.Token()
+		if err != nil {
+			return
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			switch t.Name.Local {
+			case "logBase":
+				if v := attr(t, "val"); v != "" {
+					if n, err := strconv.ParseFloat(v, 64); err == nil && n > 1 {
+						info.LogBase = n
+					}
+				}
+				_ = dec.Skip()
+			case "min":
+				if v := attr(t, "val"); v != "" {
+					if n, err := strconv.ParseFloat(v, 64); err == nil {
+						info.Min = n
+						info.HasMin = true
+					}
+				}
+				_ = dec.Skip()
+			case "max":
+				if v := attr(t, "val"); v != "" {
+					if n, err := strconv.ParseFloat(v, 64); err == nil {
+						info.Max = n
+						info.HasMax = true
+					}
+				}
+				_ = dec.Skip()
+			default:
+				depth++
+			}
+		case xml.EndElement:
+			depth--
+		}
+	}
+}
+
+// parseLegendInfo extracts c:legendPos@val ("b","t","l","r","tr") and
+// any c:delete inside c:legend.
+func parseLegendInfo(dec *xml.Decoder, start xml.StartElement) (pos string, deleted bool) {
+	depth := 1
+	for depth > 0 {
+		tok, err := dec.Token()
+		if err != nil {
+			return
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			switch t.Name.Local {
+			case "legendPos":
+				pos = attr(t, "val")
+				_ = dec.Skip()
+			case "delete":
+				v := attr(t, "val")
+				deleted = v == "" || v == "1" || v == "true"
+				_ = dec.Skip()
+			default:
+				depth++
+			}
+		case xml.EndElement:
+			depth--
+		}
+	}
+	return
+}
+
 // parseDLbls reads c:dLbls option toggles into out.
 func parseDLbls(dec *xml.Decoder, start xml.StartElement, out *DataLabelOptions) {
 	depth := 1
@@ -1470,6 +2396,38 @@ func parseChartTypeBody(dec *xml.Decoder, start xml.StartElement, out *ChartData
 					out.Grouping = v
 				}
 				_ = dec.Skip()
+			case "varyColors":
+				v := attr(t, "val")
+				if v == "" || v == "1" || v == "true" {
+					out.VaryColors = true
+				}
+				_ = dec.Skip()
+			case "gapWidth":
+				if v := attr(t, "val"); v != "" {
+					if n, err := strconv.Atoi(v); err == nil {
+						out.GapWidthPct = n
+					}
+				}
+				_ = dec.Skip()
+			case "overlap":
+				if v := attr(t, "val"); v != "" {
+					if n, err := strconv.Atoi(v); err == nil {
+						out.OverlapPct = n
+					}
+				}
+				_ = dec.Skip()
+			case "smooth":
+				// Chart-level c:smooth defaults all series to smooth.
+				v := attr(t, "val")
+				if v == "" || v == "1" || v == "true" {
+					for i := range out.Series {
+						out.Series[i].Smooth = true
+					}
+				}
+				_ = dec.Skip()
+			case "dLbls":
+				// Chart-level dLbls — merge into out.DataLabels.
+				parseDLbls(dec, t, &out.DataLabels)
 			case "ser":
 				ser, cats, err := parseChartSeries(dec, t)
 				if err != nil {
@@ -1481,6 +2439,15 @@ func parseChartTypeBody(dec *xml.Decoder, start xml.StartElement, out *ChartData
 				if len(cats) > len(out.Categories) {
 					out.Categories = cats
 				}
+			case "upDownBars":
+				out.HasUpDownBars = true
+				_ = dec.Skip()
+			case "hiLowLines":
+				out.HasHiLowLines = true
+				_ = dec.Skip()
+			case "dropLines":
+				out.HasDropLines = true
+				_ = dec.Skip()
 			default:
 				_ = dec.Skip()
 			}
@@ -1515,6 +2482,22 @@ func parseChartSeries(dec *xml.Decoder, start xml.StartElement) (ChartSeries, []
 				ser.Values = parseChartRefNumbers(dec, t)
 			case "spPr":
 				ser.Color = parseFirstSolidFill(dec, t)
+			case "smooth":
+				v := attr(t, "val")
+				if v == "" || v == "1" || v == "true" {
+					ser.Smooth = true
+				}
+				_ = dec.Skip()
+			case "marker":
+				ser.MarkerSymbol = parseSeriesMarker(dec, t)
+			case "trendline":
+				ser.Trendline = parseTrendline(dec, t)
+			case "errBars":
+				ser.ErrBars = parseErrBars(dec, t)
+			case "dLbls":
+				dl := DataLabelOptions{}
+				parseDLbls(dec, t, &dl)
+				ser.DataLabels = &dl
 			default:
 				_ = dec.Skip()
 			}
@@ -1524,6 +2507,115 @@ func parseChartSeries(dec *xml.Decoder, start xml.StartElement) (ChartSeries, []
 			}
 		}
 	}
+}
+
+// parseSeriesMarker reads c:marker/c:symbol. Returns "" when no
+// child symbol is present.
+func parseSeriesMarker(dec *xml.Decoder, start xml.StartElement) string {
+	sym := ""
+	depth := 1
+	for depth > 0 {
+		tok, err := dec.Token()
+		if err != nil {
+			return sym
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			if t.Name.Local == "symbol" {
+				if v := attr(t, "val"); v != "" {
+					sym = v
+				}
+				_ = dec.Skip()
+			} else {
+				depth++
+			}
+		case xml.EndElement:
+			depth--
+		}
+	}
+	return sym
+}
+
+// parseTrendline reads a c:trendline subtree.
+func parseTrendline(dec *xml.Decoder, start xml.StartElement) *ChartTrendline {
+	out := &ChartTrendline{Kind: "linear"}
+	depth := 1
+	for depth > 0 {
+		tok, err := dec.Token()
+		if err != nil {
+			return out
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			switch t.Name.Local {
+			case "trendlineType":
+				if v := attr(t, "val"); v != "" {
+					out.Kind = v
+				}
+				_ = dec.Skip()
+			case "order":
+				if v := attr(t, "val"); v != "" {
+					if n, err := strconv.Atoi(v); err == nil {
+						out.Order = n
+					}
+				}
+				_ = dec.Skip()
+			case "period":
+				if v := attr(t, "val"); v != "" {
+					if n, err := strconv.Atoi(v); err == nil {
+						out.Order = n
+					}
+				}
+				_ = dec.Skip()
+			case "spPr":
+				out.Color = parseFirstSolidFill(dec, t)
+			default:
+				depth++
+			}
+		case xml.EndElement:
+			depth--
+		}
+	}
+	return out
+}
+
+// parseErrBars reads a c:errBars subtree.
+func parseErrBars(dec *xml.Decoder, start xml.StartElement) *ChartErrBars {
+	out := &ChartErrBars{Direction: "y", ErrValType: "fixedVal"}
+	depth := 1
+	for depth > 0 {
+		tok, err := dec.Token()
+		if err != nil {
+			return out
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			switch t.Name.Local {
+			case "errDir":
+				if v := attr(t, "val"); v != "" {
+					out.Direction = v
+				}
+				_ = dec.Skip()
+			case "errValType":
+				if v := attr(t, "val"); v != "" {
+					out.ErrValType = v
+				}
+				_ = dec.Skip()
+			case "val":
+				if v := attr(t, "val"); v != "" {
+					if n, err := strconv.ParseFloat(v, 64); err == nil {
+						out.Value = n
+					}
+				}
+				_ = dec.Skip()
+			default:
+				depth++
+			}
+		case xml.EndElement:
+			depth--
+		}
+	}
+	return out
 }
 
 // extractFirstText returns the first non-empty CharData inside the

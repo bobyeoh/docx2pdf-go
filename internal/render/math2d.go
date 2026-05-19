@@ -36,6 +36,22 @@ func (r *renderer) buildMathBox(n *docx.MathNode, fontSize float64) mathBox {
 	if n == nil {
 		return mathBox{}
 	}
+	// m:argPr/m:argSz: per-argument relative size hint in [-2, +2]. Each
+	// step is ~0.85× scaling (mirrors Word's UI "smaller/larger" choices).
+	// Applied here so every code path that recurses through buildMathBox
+	// picks up the size shift uniformly.
+	if n.ArgSz != 0 {
+		switch n.ArgSz {
+		case -2:
+			fontSize *= 0.72
+		case -1:
+			fontSize *= 0.85
+		case 1:
+			fontSize *= 1.18
+		case 2:
+			fontSize *= 1.4
+		}
+	}
 	switch n.Kind {
 	case "t":
 		return r.mathStyledTextBox(applyMathScript(n.Text, n.Script), fontSize, runPropsForMath(n))
@@ -76,9 +92,11 @@ func (r *renderer) buildMathBox(n *docx.MathNode, fontSize float64) mathBox {
 		return r.mathBarBox(n, fontSize)
 	case "box":
 		// m:box is a non-visible grouping — pass the base box through.
-		return r.buildMathBox(n.Base, fontSize)
+		// However, some writers attach m:strikeH/V/BLTR/TLBR to the box
+		// itself rather than to m:borderBox. Apply any strikes on top.
+		return applyMathStrikes(r.buildMathBox(n.Base, fontSize), n)
 	case "borderBox":
-		return r.mathBorderBoxBox(n, fontSize)
+		return applyMathStrikes(r.mathBorderBoxBox(n, fontSize), n)
 	case "groupChr":
 		return r.mathGroupChrBox(n, fontSize)
 	case "eqArr":
@@ -100,6 +118,45 @@ func (r *renderer) buildMathBox(n *docx.MathNode, fontSize float64) mathBox {
 		return r.mathTextBox(n.Text, fontSize)
 	}
 	return r.mathSequence(n.Children, fontSize)
+}
+
+// applyMathStrikes overlays cancellation lines on top of a mathBox per
+// m:strikeH/V/BLTR/TLBR. Lines are drawn after the inner box so they
+// sit visually atop the glyphs.
+func applyMathStrikes(inner mathBox, n *docx.MathNode) mathBox {
+	if !n.StrikeH && !n.StrikeV && !n.StrikeBLTR && !n.StrikeTLBR {
+		return inner
+	}
+	origDraw := inner.draw
+	w := inner.w
+	asc := inner.ascent
+	desc := inner.descent
+	inner.draw = func(r *renderer, x, baseline float64) {
+		if origDraw != nil {
+			origDraw(r, x, baseline)
+		}
+		r.pdf.SetStrokeColor(60, 60, 60)
+		r.pdf.SetLineWidth(0.6)
+		top := baseline - asc
+		bot := baseline + desc
+		mid := (top + bot) / 2
+		left := x
+		right := x + w
+		if n.StrikeH {
+			r.pdf.Line(left, mid, right, mid)
+		}
+		if n.StrikeV {
+			mx := (left + right) / 2
+			r.pdf.Line(mx, top, mx, bot)
+		}
+		if n.StrikeBLTR {
+			r.pdf.Line(left, bot, right, top)
+		}
+		if n.StrikeTLBR {
+			r.pdf.Line(left, top, right, bot)
+		}
+	}
+	return inner
 }
 
 // mathTextBox renders a single string at the active font size.
@@ -362,7 +419,11 @@ func (r *renderer) mathRadicalBox(n *docx.MathNode, fontSize float64) mathBox {
 	w := rsW + base.w + 2
 	asc := base.ascent + 2
 	desc := base.descent
-	deg := r.buildMathBox(n.Deg, fontSize*0.6)
+	// m:radPr/m:degHide: suppress the degree even when present.
+	var deg mathBox
+	if !n.DegHide {
+		deg = r.buildMathBox(n.Deg, fontSize*0.6)
+	}
 	if deg.w > 0 {
 		w += deg.w * 0.7
 	}
@@ -542,7 +603,23 @@ func (r *renderer) mathNaryBox(n *docx.MathNode, fontSize float64) mathBox {
 	// operator (rather than stacked above/below). The default is
 	// limLoc=undOvr for sum-like operators and subSup for integrals;
 	// when the spec says subSup explicitly we shift positions.
-	subSupStyle := n.NaryLimLoc == "subSup"
+	limLoc := n.NaryLimLoc
+	if limLoc == "" && r.doc != nil {
+		// Fall back to document-level m:mathPr defaults: m:intLim for
+		// integral-like operators (∫ ∬ ∭ ∮ ∯ ∰), m:naryLim for ∑/∏/⋃/⋂ etc.
+		if isIntegralNaryChar(glyph) {
+			limLoc = r.doc.Settings.MathProps.IntLim
+		} else {
+			limLoc = r.doc.Settings.MathProps.NaryLim
+		}
+	}
+	subSupStyle := limLoc == "subSup"
+	// When no document or element preference is recorded, integrals default
+	// to subSup (Word's display behavior) and other n-ary operators default
+	// to undOvr.
+	if limLoc == "" && isIntegralNaryChar(glyph) {
+		subSupStyle = true
+	}
 	if subSupStyle {
 		w := op.w + lo.w + base.w + 4
 		if hi.w > lo.w {
@@ -619,6 +696,17 @@ func (r *renderer) mathNaryBox(n *docx.MathNode, fontSize float64) mathBox {
 	}
 }
 
+// isIntegralNaryChar reports whether the n-ary operator glyph belongs to
+// the integral family — used to pick the right document-level limLoc
+// fallback (m:intLim vs m:naryLim).
+func isIntegralNaryChar(g string) bool {
+	switch g {
+	case "∫", "∬", "∭", "∮", "∯", "∰", "∱", "∲", "∳":
+		return true
+	}
+	return false
+}
+
 // mathDelimBox surrounds a body with paired delimiters (paren / bracket /
 // brace / pipe). Delimiters stretch by simply scaling their font size to
 // match the body height.
@@ -674,6 +762,17 @@ func (r *renderer) mathDelimBox(n *docx.MathNode, fontSize float64) mathBox {
 	// fraction look stunted.
 	if n.DGrow && bodyH > fontSize {
 		want := bodyH / (fontSize * 1.0)
+		if want > delimScale {
+			delimScale = want
+		}
+	}
+	// m:dPr/m:shp val="match" — delimiters must stretch to the full body
+	// height instead of using Word's "centered" fixed-glyph aesthetic.
+	// "centered" (the default) keeps the brace centered on the body
+	// midline; with "match" we force the delimiter to fully envelop the
+	// body, bumping the scale beyond the bodyH/1.1 heuristic when needed.
+	if n.DShape == "match" && bodyH > 0 {
+		want := bodyH / fontSize
 		if want > delimScale {
 			delimScale = want
 		}
@@ -833,6 +932,10 @@ func (r *renderer) mathLimBox(n *docx.MathNode, lim *docx.MathNode, low bool, fo
 func (r *renderer) mathBorderBoxBox(n *docx.MathNode, fontSize float64) mathBox {
 	base := r.buildMathBox(n.Base, fontSize)
 	pad := fontSize * 0.2
+	hideTop := n.HideTop
+	hideBot := n.HideBot
+	hideLeft := n.HideLeft
+	hideRight := n.HideRight
 	return mathBox{
 		w:       base.w + pad*2,
 		ascent:  base.ascent + pad,
@@ -843,9 +946,25 @@ func (r *renderer) mathBorderBoxBox(n *docx.MathNode, fontSize float64) mathBox 
 			}
 			top := baseline - base.ascent - pad
 			h := base.height() + pad*2
+			right := x + base.w + pad*2
+			bot := top + h
 			r.pdf.SetLineWidth(0.5)
 			r.pdf.SetStrokeColor(0, 0, 0)
-			r.pdf.Rectangle(x, top, x+base.w+pad*2, top+h, "D", 0, 0)
+			// m:borderBoxPr lets the author hide individual sides — used
+			// for "show only the top stroke" notation. We paint each side
+			// separately so the hide flags select which lines to draw.
+			if !hideTop {
+				r.pdf.Line(x, top, right, top)
+			}
+			if !hideBot {
+				r.pdf.Line(x, bot, right, bot)
+			}
+			if !hideLeft {
+				r.pdf.Line(x, top, x, bot)
+			}
+			if !hideRight {
+				r.pdf.Line(right, top, right, bot)
+			}
 		},
 	}
 }
@@ -906,8 +1025,10 @@ func (r *renderer) mathGroupChrBox(n *docx.MathNode, fontSize float64) mathBox {
 	}
 }
 
-// mathEqArrBox renders m:eqArr — a vertical stack of equations centered
-// on each other. Used for systems of equations.
+// mathEqArrBox renders m:eqArr — a vertical stack of equations. Honors
+// EqMaxDist (extra row padding, "Maximize Distance" toggle), EqRowSpRule
+// (custom row spacing rule, 1..4), and falls back to centered alignment
+// when none of those drive a more specific layout.
 func (r *renderer) mathEqArrBox(n *docx.MathNode, fontSize float64) mathBox {
 	rows := []mathBox{}
 	maxW := 0.0
@@ -923,7 +1044,22 @@ func (r *renderer) mathEqArrBox(n *docx.MathNode, fontSize float64) mathBox {
 	if len(rows) == 0 {
 		return mathBox{}
 	}
-	const rowGap = 2.0
+	rowGap := 2.0
+	// EqMaxDist asks for the maximum vertical separation between rows so
+	// stacked subscripts/superscripts don't visually touch. Bumping the
+	// gap by ~30% of the font matches Word's spacing in practice.
+	if n.EqMaxDist {
+		rowGap = fontSize * 0.35
+	}
+	// EqRowSpRule: 1=single, 2=1.5x, 3=double, 4=at-least. We approximate
+	// 1.5/double by multiplying the gap; "at-least" keeps the default
+	// since callers can't supply the minimum from here.
+	switch n.EqRowSpRule {
+	case 2:
+		rowGap *= 1.5
+	case 3:
+		rowGap *= 2
+	}
 	totalH := 0.0
 	for _, b := range rows {
 		totalH += b.height() + rowGap
@@ -993,6 +1129,20 @@ func (r *renderer) mathMatrixBox(n *docx.MathNode, fontSize float64) mathBox {
 	if totalH > 0 {
 		totalH -= rowGap
 	}
+	// Resolve per-column alignment ("l"/"c"/"r"); default center.
+	colJc := make([]string, cols)
+	for j := range colJc {
+		colJc[j] = "c"
+	}
+	for j, jc := range n.MatrixColJc {
+		if j >= cols {
+			break
+		}
+		switch jc {
+		case "l", "c", "r":
+			colJc[j] = jc
+		}
+	}
 	return mathBox{
 		w:       totalW + 4,
 		ascent:  totalH / 2,
@@ -1003,9 +1153,17 @@ func (r *renderer) mathMatrixBox(n *docx.MathNode, fontSize float64) mathBox {
 				cx := x + 2
 				for j := 0; j < cols; j++ {
 					if row[j].draw != nil {
-						// Center each cell in its column; baseline at row mid-line.
 						cellAsc := row[j].ascent
-						row[j].draw(r, cx+(colW[j]-row[j].w)/2, y+cellAsc)
+						var ox float64
+						switch colJc[j] {
+						case "l":
+							ox = 0
+						case "r":
+							ox = colW[j] - row[j].w
+						default:
+							ox = (colW[j] - row[j].w) / 2
+						}
+						row[j].draw(r, cx+ox, y+cellAsc)
 					}
 					cx += colW[j] + colGap
 				}

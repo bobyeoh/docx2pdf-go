@@ -116,6 +116,28 @@ type Options struct {
 	// MergeData (which becomes the implicit first record only when
 	// MergeRecords is nil).
 	MergeRecords []map[string]string
+	// PDFUserPassword, when non-empty, encrypts the produced PDF with
+	// this user password. Readers prompt for it before showing content.
+	// Word's w:documentProtection has no PDF analog beyond this; setting
+	// it from doc.Settings.DocumentProtection.Hash is left to the caller
+	// because the hash isn't reversible.
+	PDFUserPassword string
+	// PDFOwnerPassword is the owner password — controls permission
+	// changes inside reader software. Defaults to a random per-run value
+	// when only PDFUserPassword is set so the permissions can't be lifted
+	// by re-saving without it.
+	PDFOwnerPassword string
+	// PDFPermissions bitmask: any combination of
+	// gopdf.PermissionsPrint|PermissionsCopy|PermissionsModify|
+	// PermissionsAnnotForms. Zero means "all permissions granted"; the
+	// renderer maps this to gopdf's default permissive bitmask so the PDF
+	// is encrypted but readers still allow print/copy without the owner
+	// password.
+	PDFPermissions int
+	// AutoHyphenation, when true, enables Liang-style English
+	// hyphenation at line-wrap. Overrides w:autoHyphenation = false in
+	// the document; when both are false, hyphenation is off.
+	AutoHyphenation bool
 }
 
 // RenderWithContext is Render with cancellation.
@@ -232,7 +254,71 @@ func RenderWriter(doc *docx.Document, w io.Writer, opts Options) error {
 	pdf := gopdf.GoPdf{}
 	firstW := twipsToPt(sections[0].PageSize.WidthTwips)
 	firstH := twipsToPt(sections[0].PageSize.HeightTwips)
-	pdf.Start(gopdf.Config{PageSize: gopdf.Rect{W: firstW, H: firstH}})
+	cfg := gopdf.Config{PageSize: gopdf.Rect{W: firstW, H: firstH}}
+	// PDF encryption: when caller supplied any password, populate
+	// Config.Protection before Start so every subsequent object is
+	// emitted with the encryption dict pre-installed.
+	//
+	// We also derive a *permissions-only* protection envelope from
+	// w:documentProtection when the source is restricted (read-only,
+	// comments-only, forms-only) and the caller did not supply their
+	// own password. The PDF gets an empty user password (so it opens
+	// without prompting) but the permission flags are tightened to
+	// match Word's edit-lock intent.
+	userPass := opts.PDFUserPassword
+	ownerPass := opts.PDFOwnerPassword
+	perms := opts.PDFPermissions
+	derived := false
+	if userPass == "" && ownerPass == "" && doc.Settings.DocumentProtection.Enforcement {
+		switch doc.Settings.DocumentProtection.Edit {
+		case "readOnly":
+			perms = gopdf.PermissionsPrint | gopdf.PermissionsCopy
+			derived = true
+		case "comments":
+			perms = gopdf.PermissionsPrint | gopdf.PermissionsCopy | gopdf.PermissionsAnnotForms
+			derived = true
+		case "forms":
+			perms = gopdf.PermissionsPrint | gopdf.PermissionsAnnotForms
+			derived = true
+		case "trackedChanges":
+			perms = gopdf.PermissionsPrint | gopdf.PermissionsCopy | gopdf.PermissionsModify
+			derived = true
+		}
+	}
+	// w:writeProtection — "open read-only" hint. Maps to print-only PDF
+	// permissions when the source asked for hard enforcement; "recommended"
+	// is a soft toggle so we don't reduce permissions there.
+	if userPass == "" && ownerPass == "" && doc.Settings.WriteProtection.Enforcement {
+		perms = gopdf.PermissionsPrint | gopdf.PermissionsCopy
+		derived = true
+	}
+	if derived {
+		// Deterministic owner password derived from the protection
+		// algorithm name + provider so the same source maps to the
+		// same PDF owner key without storing user-visible data.
+		// Users opening the PDF aren't prompted; only permission
+		// lifts (e.g. removing the read-only edit lock) require
+		// the owner key.
+		ownerPass = "docx2pdf-protected-" + doc.Settings.DocumentProtection.AlgorithmName + "-" + doc.Settings.DocumentProtection.CryptProviderTyp
+	}
+	if userPass != "" || ownerPass != "" {
+		if ownerPass == "" {
+			// Without a separate owner password the user password gates
+			// permission changes too. Cheap fallback; callers can override.
+			ownerPass = userPass + "-owner"
+		}
+		if perms == 0 {
+			perms = gopdf.PermissionsPrint | gopdf.PermissionsCopy |
+				gopdf.PermissionsModify | gopdf.PermissionsAnnotForms
+		}
+		cfg.Protection = gopdf.PDFProtectionConfig{
+			UseProtection: true,
+			Permissions:   perms,
+			UserPass:      []byte(userPass),
+			OwnerPass:     []byte(ownerPass),
+		}
+	}
+	pdf.Start(cfg)
 
 	parseRFCDate := func(s string) time.Time {
 		if s == "" {
@@ -285,6 +371,7 @@ func RenderWriter(doc *docx.Document, w io.Writer, opts Options) error {
 			decimalSymbol: doc.Settings.DecimalSymbol,
 			listSeparator: doc.Settings.ListSeparator,
 			filename:      filepath.Base(opts.SourceFilename),
+			filenameFull:  opts.SourceFilename,
 			author:        firstNonEmpty(opts.Author, doc.Properties.Author),
 			title:         doc.Properties.Title,
 			subject:       doc.Properties.Subject,
@@ -318,6 +405,16 @@ func RenderWriter(doc *docx.Document, w io.Writer, opts Options) error {
 			glossary:        doc.Glossary,
 			tcEntries:       collectTCEntries(doc),
 			xeEntries:       collectXEEntries(doc),
+			taEntries:       collectTAEntries(doc),
+			altChunks:       doc.AltChunks,
+			allImages:       doc.Images,
+			imageTargets:    doc.RelTargets,
+			xePages: func() *map[string][]int {
+				m := map[string][]int{}
+				return &m
+			}(),
+			doc:            doc,
+			autoNumCounter: new(int),
 		},
 	}
 	if err := r.registerFonts(); err != nil {
@@ -501,6 +598,19 @@ func RenderWriter(doc *docx.Document, w io.Writer, opts Options) error {
 		for bi, b := range sec.Blocks {
 			switch v := b.(type) {
 			case docx.Paragraph:
+				// Cross-paragraph keepNext bonding: when v.KeepNext and
+				// the next block is also a paragraph, seed an estimate
+				// of its height so drawParagraph can reserve room for
+				// both. Tables also get measured for completeness.
+				r.nextBlockMinHeight = 0
+				if v.KeepNext && bi+1 < len(sec.Blocks) {
+					switch nb := sec.Blocks[bi+1].(type) {
+					case docx.Paragraph:
+						r.nextBlockMinHeight = r.measureParagraph(nb)
+					case docx.Table:
+						r.nextBlockMinHeight = r.measureTable(nb)
+					}
+				}
 				if err := r.drawParagraph(v); err != nil {
 					if opts.Lenient {
 						logFn(fmt.Sprintf("lenient: skip paragraph: %v", err))
@@ -508,6 +618,7 @@ func RenderWriter(doc *docx.Document, w io.Writer, opts Options) error {
 					}
 					return err
 				}
+				r.nextBlockMinHeight = 0
 			case docx.Table:
 				if err := r.drawTable(v); err != nil {
 					if opts.Lenient {
@@ -544,11 +655,25 @@ func RenderWriter(doc *docx.Document, w io.Writer, opts Options) error {
 			return err
 		}
 	}
+	// w:footnotePr w:pos="docEnd" / "sectEnd": when any section declares
+	// non-default footnote placement, emit a doc-end footnote trailer too.
+	// Page-bottom render still ran above, but with an empty queue (the
+	// enqueue path skipped when this flag is set). When mixed (some
+	// docEnd, some pageBottom), we currently bias toward docEnd for the
+	// whole document — a coarser approximation than per-section gating.
+	if anySectionDocEndFootnotes(doc.Sections) {
+		if err := r.appendNotesSection(doc.Footnotes, "Footnotes"); err != nil {
+			return err
+		}
+	}
 	// Comments are reviewer markup; they're not part of the visible body
 	// in Word's default print view, but dropping them silently loses
 	// content. Surface them as a trailing section after endnotes so a
 	// human can still see them in the produced PDF.
 	if err := r.appendCommentsSection(doc); err != nil {
+		return err
+	}
+	if err := r.appendPermissionRangesSection(doc); err != nil {
 		return err
 	}
 
@@ -559,6 +684,15 @@ func RenderWriter(doc *docx.Document, w io.Writer, opts Options) error {
 		if err := r.stampPageNumbers(); err != nil {
 			return err
 		}
+	}
+
+	// Commit the hierarchical PDF outline tree we built while drawing.
+	// Parse() walks the nodes and wires up Prev/Next/Parent/First/Last
+	// pointers gopdf needs to serialize a nested bookmark structure.
+	// Done in both dry-run and live passes so the dry-run sanity-checks
+	// the same tree shape.
+	if len(r.outlineRoots) > 0 {
+		r.outlineRoots.Parse()
 	}
 
 	if opts.skipWrite {
@@ -592,6 +726,12 @@ type renderer struct {
 	fonts       map[string]bool     // registered font names
 	counters    map[int]map[int]int // numId → level → next counter value
 	noPageBreak bool                // when true, ensureRoom never adds pages
+	// nextBlockMinHeight is the estimated minimum height (in points) of
+	// the block that will be drawn immediately after the current one.
+	// Set by the caller before drawParagraph when a keepNext paragraph
+	// should be bonded to a specific successor so the pair lands on
+	// the same page. Zero means "no bonding hint".
+	nextBlockMinHeight float64
 	// Multi-column layout (w:cols).
 	numColumns float64
 	colW       float64
@@ -613,6 +753,11 @@ type renderer struct {
 	// Line numbering state: counter advances per visible body line; reset
 	// to LineNumbering.Start at each section.
 	lineNumCounter int
+	// curChart points to the chart currently being drawn so palette /
+	// font-size helpers can consult its cs:colorStyle / cs:chartStyle
+	// metadata without an extra argument on every call. Nil outside the
+	// drawChart scope.
+	curChart *docx.ChartData
 	// croppedCache stores cropped image instances keyed by "<origID>:crop".
 	croppedCache map[string]image.Image
 	// pendingFootnotes holds IDs queued for page-bottom render. ensureRoom
@@ -690,6 +835,12 @@ type renderer struct {
 	// The band auto-clears the first time the renderer notices cursorY
 	// crossed bottomY, falling back to the natural full-width geometry.
 	floatBand *floatWrapBand
+	// outlineRoots holds the top-level entries of the PDF outline (PDF
+	// bookmarks). outlineStack indexes into the active ancestor chain by
+	// depth (1-based) so each new heading lands in the right parent.
+	// Parsed and committed in the final WriteTo flush.
+	outlineRoots gopdf.OutlineNodes
+	outlineStack []*gopdf.OutlineNode
 }
 
 // floatWrapBand is the active text-wrap exclusion zone for a single

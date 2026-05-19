@@ -81,6 +81,20 @@ type Document struct {
 	// Properties from core.xml / app.xml when present — used for AUTHOR /
 	// TITLE fields and for /Info dictionary in the PDF.
 	Properties Properties
+	// RawByteSize is the on-disk .docx package size (ZIP envelope) in
+	// bytes, captured at Open time. Surfaced by the FILESIZE field.
+	RawByteSize int64
+	// Revision mirrors docProps/app.xml <Revision> — the edit-cycle
+	// counter Word increments on each save. REVNUM field uses it.
+	Revision string
+	// HasDigitalSignature is true when the source package contained an
+	// _xmlsignatures part. We don't verify the signature, but the flag
+	// is surfaced so callers can mark, log, or refuse to convert
+	// signed-but-soon-altered documents.
+	HasDigitalSignature bool
+	// DigitalSignatureRels lists every relationship target found under
+	// the _xmlsignatures folder. Empty when the document is unsigned.
+	DigitalSignatureRels []string
 	// Settings from word/settings.xml — doc-wide rendering knobs.
 	Settings Settings
 	// FootnoteSeparators captures any custom w:type="separator" /
@@ -134,9 +148,23 @@ type Document struct {
 	// extracted; other ProgIDs leave the entry absent and the renderer
 	// falls back to the preview image.
 	OLEEmbeds map[string]ExcelEmbed
+	// EmbeddedDocs maps an OLE relationship id to a flattened list of
+	// blocks extracted from an embedded OOXML document (Word.Document /
+	// Package referencing a .docx). The renderer splices these blocks
+	// inline at the OLE site so the contents survive in PDF output.
+	// Limited to one-level nesting; embedded-in-embedded docs are
+	// rendered as their first paragraph + a "[truncated]" marker.
+	EmbeddedDocs map[string][]Block
 	// CommentsExtended holds the threaded / "marked done" state of each
 	// w:id, parsed from word/commentsExtended.xml.
 	CommentsExtended map[string]CommentExtended
+	// EMFShapes carries vector-replay VMLShape groups extracted from
+	// EMF metafiles. When an inline drawing references an rId present
+	// here, the renderer paints the shape instead of the placeholder
+	// label kept in UnsupportedMedia. Best-effort replay: text-only
+	// records are skipped (those are surfaced via the label).
+	EMFShapes map[string]*VMLShape
+
 	// UnsupportedMedia maps a relationship id whose target file is a
 	// media format the renderer cannot draw (EMF, WMF) to its format
 	// label ("EMF", "WMF").
@@ -144,6 +172,10 @@ type Document struct {
 	// CommentMeta indexes w:author / w:date / w:initials per comment id
 	// from word/comments.xml.
 	CommentMeta map[string]CommentMeta
+	// Inks maps a w14:contentPart relationship id to the parsed inkML
+	// stroke list. The renderer paints each stroke as a polyline so
+	// hand-drawn annotations survive the conversion.
+	Inks map[string][]InkStroke
 }
 
 // BibSource is one parsed entry from a bibliography custom XML store.
@@ -419,6 +451,11 @@ type CompatOptions struct {
 	// AdjustLineHeightInTable: revert to Word 97's table line-height
 	// algorithm, which adds extra leading.
 	AdjustLineHeightInTable *bool
+	// UseWord2002TableStyleRules: revert to the Word 2002 table-style
+	// conditional formatting precedence rules. Mostly affects how banded
+	// rows + first-row / last-row overlap. Honored by the renderer as a
+	// layout hint when true.
+	UseWord2002TableStyleRules *bool
 }
 
 // DocProtection captures the bits of w:documentProtection we surface.
@@ -467,6 +504,32 @@ type Properties struct {
 	CreateDate string
 	ModifyDate string
 	PrintDate  string
+	// LastModifiedBy is dc:lastModifiedBy / cp:lastModifiedBy — the user
+	// who saved the document last. Surfaced by LASTSAVEDBY (handled via
+	// runtime fallback) and DOCPROPERTY "LastModifiedBy".
+	LastModifiedBy string
+	// Revision is cp:revision — Word's incrementing save counter.
+	Revision string
+	// ContentStatus / Language / Version come from cp:contentStatus,
+	// dc:language, cp:version respectively. All are advisory metadata
+	// surfaced via DOCPROPERTY.
+	ContentStatus string
+	Language      string
+	Version       string
+	// Paragraphs / CharactersWithSpaces / HiddenSlides come from app.xml.
+	// HeadingPairs / TitlesOfParts capture the "Headings/Outline pairs"
+	// table that Office writes for navigation panes.
+	Paragraphs           int
+	CharactersWithSpaces int
+	HeadingPairs         []HeadingPair
+	TitlesOfParts        []string
+}
+
+// HeadingPair is one app.xml HeadingPairs entry: a name plus the count of
+// items that follow under that grouping in TitlesOfParts.
+type HeadingPair struct {
+	Name  string
+	Count int
 }
 
 // ParaDefaults seeds every paragraph before its own pPr is applied. Modern
@@ -525,13 +588,13 @@ type FrameInfo struct {
 	HRule       string // "auto", "exact", "atLeast" — applies to HeightTwips
 }
 
-// LineNumbering encodes w:lnNumType. The renderer paints at a fixed
-// horizontal inset, so w:distance is intentionally not modeled — a per-doc
-// value would drift from the actual draw position.
+// LineNumbering encodes w:lnNumType. DistanceTwips is the horizontal
+// inset from the text edge in twips; zero means "renderer default".
 type LineNumbering struct {
-	Start   int    // first line number (default 1)
-	CountBy int    // every Nth line shown (default 1)
-	Restart string // "newPage", "newSection", "continuous"
+	Start         int    // first line number (default 1)
+	CountBy       int    // every Nth line shown (default 1)
+	Restart       string // "newPage", "newSection", "continuous"
+	DistanceTwips int    // w:distance — twips between line numbers and body
 }
 
 // Section represents one continuous range of body blocks that share the same
@@ -602,6 +665,22 @@ type Section struct {
 	// PrChange records w:sectPrChange — tracked-change of section
 	// properties (page size/margins/columns adjusted under revision).
 	PrChange *PrChange
+	// TextDirection is w:textDirection at the section level: "lrTb"
+	// (default), "tbRl" (vertical right-to-left for CJK), "btLr" (rotated
+	// 90° CCW), "lrTbV" / "tbRlV" mirror variants. Renderer rotates the
+	// flow-box accordingly; empty falls back to lrTb.
+	TextDirection string
+	// Bidi marks an entire section as right-to-left: paragraphs default
+	// to bidi unless overridden, columns lay out right→left.
+	Bidi bool
+	// NoEndnote suppresses endnotes that would otherwise be emitted at
+	// this section's end. Mirrors w:noEndnote.
+	NoEndnote bool
+	// PaperSrcFirst / PaperSrcOther mirror w:paperSrc — printer tray
+	// hints. PDF has no equivalent so the renderer ignores them; field
+	// preserved for metadata-round-trip.
+	PaperSrcFirst int
+	PaperSrcOther int
 }
 
 // ColumnSpec is one column of an unequal-width multi-column section
@@ -870,6 +949,11 @@ type Run struct {
 	// Image source-rect crop in PERCENT (a:srcRect attrs are 1/1000 of percent
 	// from each edge). E.g. CropTop=10000 = 10%. Zero = no crop on that side.
 	CropTopPct, CropBottomPct, CropLeftPct, CropRightPct float64
+	// ChromaKey, when non-empty, names a hex color the source declared as
+	// transparent (VML v:imagedata/@chromakey). Renderer can substitute
+	// alpha for matching pixels; absent / unimplemented means the color
+	// is treated as solid.
+	ChromaKey string
 	// ImageEffects, when non-nil, lists DrawingML pixel-effect filters that
 	// should be applied to the image before placement. See ImageEffect.
 	ImageEffects []ImageEffect
@@ -894,6 +978,14 @@ type Run struct {
 	// AnchorSimplePosUsed flips the renderer onto that placement path.
 	AnchorSimplePosUsed                    bool
 	AnchorSimplePosXPt, AnchorSimplePosYPt float64
+	// ImagePctWidth / ImagePctHeight carry wp14:sizeRelH/wp14:pctWidth and
+	// wp14:sizeRelV/wp14:pctHeight. Values are thousandths of a percent
+	// (50000 = 50%). Non-zero values override ImageWidthPt / ImageHeightPt
+	// at render time, where the page geometry is known. ImagePctRelFromH/
+	// V record what the percentage is taken relative to (defaults to
+	// "page"): "page", "margin", "leftMargin", "rightMargin", etc.
+	ImagePctWidth, ImagePctHeight      uint32
+	ImagePctRelFromH, ImagePctRelFromV string
 	// FootnoteID, when non-empty, tags this run as a footnote / endnote
 	// reference site. The visible Text is still drawn (typically as a
 	// superscript marker); the renderer also queues the corresponding note
@@ -1047,6 +1139,75 @@ type ChartData struct {
 	// whether each datapoint should print its value, category name,
 	// series name, or percentage (pie/doughnut).
 	DataLabels DataLabelOptions
+	// LegendPos is one of "t","b","l","r","tr" or empty (default
+	// renderer places at bottom). Mirror of c:legend / c:legendPos@val.
+	// LegendDeleted suppresses the legend entirely (c:legend/c:delete).
+	LegendPos     string
+	LegendDeleted bool
+	// VaryColors is c:varyColors. When true, the renderer assigns a
+	// distinct palette color to each data point in a single-series
+	// chart (typically pie / doughnut / single-series column).
+	VaryColors bool
+	// GapWidthPct is c:gapWidth — the space between category groups in
+	// a bar/column chart, expressed as a percentage of the bar width.
+	// Word's default is 150; 0 means bars touch.
+	GapWidthPct int
+	// OverlapPct is c:overlap — how much each adjacent bar in a cluster
+	// overlaps the previous one, in percent. Negative = gap between
+	// bars in the same category (typical clustered default), positive
+	// = visual overlap. Range −100..100.
+	OverlapPct int
+	// DispBlanksAs mirrors c:dispBlanksAs@val: "gap", "zero", "span".
+	// Controls how missing/NaN values are drawn in line/area charts.
+	DispBlanksAs string
+	// PlotVisOnly is c:plotVisOnly@val ("0"/"1"). False would mean Word
+	// plots values from hidden cells too. Renderer ignores it but the
+	// field preserves the metadata for round-trip / debugging.
+	PlotVisOnly bool
+	// ValMin / ValMax / LogBase / MajorUnit / MinorUnit mirror the
+	// primary value axis c:scaling. Zero means "use auto".
+	ValMin    float64
+	ValMax    float64
+	HasValMin bool
+	HasValMax bool
+	LogBase   float64
+	MajorUnit float64
+	MinorUnit float64
+	// CrossesAt is c:crossesAt — the explicit value at which the
+	// category axis crosses the value axis. Zero unless HasCrossesAt.
+	CrossesAt    float64
+	HasCrossesAt bool
+	// HasSecondaryAxis is true when at least one series carries a
+	// second c:valAx via c:axId chain. We do not draw a separate axis;
+	// secondary series render against the same y-range but get marked.
+	HasSecondaryAxis bool
+	// HasUpDownBars / HasHiLowLines / HasDropLines toggle the matching
+	// chart decorations (children of c:lineChart / c:stockChart /
+	// c:areaChart). UpDownBars connect the first and last series at each
+	// category with a thin colored bar (green up, red down). HiLowLines
+	// connect the maximum and minimum series values per category. Drop
+	// lines drop a vertical rule from each data point to the category axis.
+	HasUpDownBars bool
+	HasHiLowLines bool
+	HasDropLines  bool
+	// WaterfallSubtotals lists the 0-based indexes flagged as subtotal
+	// bars in a chartEx waterfall (cx:dataPt/cx:subtotals). Subtotals
+	// reset the running cumulative line and render as a solid full-
+	// height column rather than a delta. Empty for non-waterfall charts.
+	WaterfallSubtotals []int
+	// Palette is the ordered series color list from the chart's sibling
+	// colorsN.xml (cs:colorStyle). Renderers cycle through this before
+	// falling back to the built-in accent palette. Entries may be "scheme:
+	// accent1" placeholders when the theme part is missing.
+	Palette []string
+	// PaletteMethod mirrors cs:colorStyle@meth: "cycle" (default), "withinLinear",
+	// or "withinVar". Affects how the renderer wraps the palette for charts
+	// with more series than palette entries.
+	PaletteMethod string
+	// StyleSummary holds coarse text metrics from the chart's sibling
+	// styleN.xml (cs:chartStyle). Zero-valued fields fall back to renderer
+	// defaults.
+	StyleSummary ChartStyleSummary
 }
 
 // DataLabelOptions mirrors c:dLbls children that toggle per-point label
@@ -1067,6 +1228,47 @@ type ChartSeries struct {
 	// Color, when non-empty, is the explicit 6-hex series color from the
 	// chart part. Empty entries fall back to a palette picked by index.
 	Color string
+	// Smooth toggles spline-style interpolation on line charts
+	// (c:smooth at the series level).
+	Smooth bool
+	// MarkerSymbol is the c:marker/c:symbol val; "none" suppresses the
+	// marker entirely on line / scatter charts. Other values supported
+	// at render time: "circle","square","diamond","triangle","x","plus",
+	// "star","dash","auto". Empty falls back to renderer default.
+	MarkerSymbol string
+	// Trendline, when non-nil, asks the renderer to overlay a fitted
+	// curve on top of this series.
+	Trendline *ChartTrendline
+	// ErrBars, when non-nil, draws Y-direction error whiskers at every
+	// value point.
+	ErrBars *ChartErrBars
+	// Secondary marks this series as plotted against the secondary axis
+	// (set when its c:axId chain matches Document.ChartData's secondary
+	// axId pair). Used for legend annotation only — both axes share the
+	// same y-range in the simplified renderer.
+	Secondary bool
+	// DataLabels is the series-level c:dLbls override. When non-nil it
+	// supersedes the chart-level DataLabels for this series only.
+	DataLabels *DataLabelOptions
+}
+
+// ChartTrendline mirrors c:trendline children we know how to render.
+// Kind is one of "linear","poly","exp","log","power","movingAvg". When
+// unknown, renderer falls back to linear.
+type ChartTrendline struct {
+	Kind  string
+	Order int    // for "poly" (degree) or "movingAvg" (period)
+	Color string // optional 6-hex
+}
+
+// ChartErrBars mirrors c:errBars. Direction is "y" (default) or "x";
+// ErrValType is "fixedVal"|"percentage"|"stdDev"|"stdErr"|"cust";
+// Value is the magnitude for fixedVal / percentage. Custom and stat
+// types are approximated as a fraction of the data range.
+type ChartErrBars struct {
+	Direction  string
+	ErrValType string
+	Value      float64
 }
 
 // VMLShape captures the rendering knobs of a legacy VML primitive.
@@ -1109,6 +1311,14 @@ type VMLShape struct {
 	// a flat token list ("M 0 0 L 1 0 L 1 1 Z" style — m/l/c/q/z plus
 	// numeric tokens). Coordinates are in the shape's local 0..1 space.
 	CustomPath string
+	// WordArt marks a shape that hosted a <v:textpath> — legacy WordArt.
+	// The TextBox carries the visible string; renderer treats it as a
+	// decorative title (bold, larger size, shape-fill color) so it reads
+	// as WordArt rather than plain inline text.
+	WordArt         bool
+	WordArtFitShape bool   // v:textpath fitshape="t"
+	WordArtFitPath  bool   // v:textpath fitpath="t"
+	WordArtStyle    string // CSS-shape style string Word wrote on textpath
 	// GradientKind is "linear" / "radial" / "" (no gradient — fall back to
 	// FillColor). When set, GradientStops drives the gradient color ramp.
 	GradientKind string
@@ -1122,6 +1332,29 @@ type VMLShape struct {
 	// "diamond". The renderer only honors these on "line"-kind shapes.
 	HeadEnd string
 	TailEnd string
+	// StrokeDash captures v:stroke@dashstyle ("solid"/"dash"/"shortdash"
+	// /"dot"/...) — the legacy VML alternative to a:ln/custDash. Renderer
+	// maps to its dash pattern when set.
+	StrokeDash string
+	// StrokeLineStyle is v:stroke@linestyle ("single", "thinThin",
+	// "thinThick", "thickThin", "thickBetweenThin"). The renderer maps
+	// the compound styles to double-stroked outlines.
+	StrokeLineStyle string
+	// DashStyle is the DrawingML a:prstDash@val (solid / dash / dashDot /
+	// lgDash / lgDashDot / lgDashDotDot / sysDash / sysDashDot /
+	// sysDashDotDot / sysDot / dot) — populated when a vector shape was
+	// synthesized from a w:drawing a:ln. Empty means "solid stroke" (no
+	// dash pattern). Renderer maps each enum to a gopdf dash array.
+	DashStyle string
+	// CapStyle is the DrawingML a:ln@cap value ("flat" / "rnd" / "sq").
+	// "" → "flat". Renderer maps "rnd"→round, "sq"→square via gopdf's
+	// SetLineCapStyle.
+	CapStyle string
+	// CompoundLn mirrors a:ln@cmpd: "" (sng / single) is the default,
+	// "dbl" / "thickThin" / "thinThick" / "tri" call for compound
+	// strokes. Renderer paints these as 2 or 3 parallel strokes at the
+	// appropriate inset for the shape's outline.
+	CompoundLn string
 	// Shadow, when non-nil, adds an outer drop shadow drawn before the
 	// shape itself.
 	Shadow *ShadowEffect
@@ -1269,6 +1502,24 @@ type FormFieldInfo struct {
 	Choices  []string // dropdown options
 	Selected int      // dropdown selected index (0-based)
 	Name     string   // w:name — form field name
+	// HelpText is w:helpText w:val — the message Word shows in the
+	// status bar / dialog when focus enters the field. We surface it
+	// as a PDF tooltip on the form-control box. Empty when unset.
+	HelpText string
+	// StatusText is w:statusText w:val — the secondary "press F1" hint.
+	// We do not render this directly but preserve it for auditing.
+	StatusText string
+	// MaxLength is w:maxLength on textInput — width limit for the text
+	// field. Zero means "no limit".
+	MaxLength int
+	// TextType is w:textInput w:type val: "regular" (default), "number",
+	// "date", "currentDate", "currentTime", "calculation". Renderer uses
+	// it to choose a sensible default placeholder when Default is empty.
+	TextType string
+	// Format is w:textInput w:format — a Word numeric/date format mask
+	// (e.g. "0.00", "M/d/yyyy"). We don't apply it to the visible value
+	// (no live evaluation) but expose it so callers can render hints.
+	Format string
 }
 
 // RunProps captures character-level formatting we honor.
@@ -1350,6 +1601,12 @@ type RunProps struct {
 	// NoProof suppresses spellcheck flags; render-noop, but parsed for
 	// completeness so consumers can introspect it.
 	NoProof bool
+	// AnimationEffect mirrors w:effect (Word 97-style text animation:
+	// "blinkBackground", "lights", "antsBlack", "antsRed", "shimmer",
+	// "sparkle"). PDF has no animation primitive; the renderer applies a
+	// best-effort static decoration (a faint highlight strip for the
+	// "ants" / "blink" families). Empty = no effect.
+	AnimationEffect string
 	// WebHidden mirrors Word's "hide in web view" toggle. We treat it like
 	// w:vanish for print output (web-hidden text shouldn't appear in PDF).
 	WebHidden bool
@@ -1369,6 +1626,23 @@ type RunProps struct {
 	W14Ligatures    string
 	W14ShadowColor  string
 	W14OutlineColor string
+	// W14OutlineWidthPt is the textOutline stroke width in points
+	// (converted from w14:w EMU at parse time). Zero means "use a default
+	// hairline approximation".
+	W14OutlineWidthPt float64
+	// W14TextFillColor is the run-level <w14:textFill> color. Solid fill
+	// produces a single color; gradient fall back to the first stop. When
+	// non-empty, this overrides the regular w:color/srgbClr resolution
+	// for the actual glyph fill (Word renders outline + fill independently).
+	W14TextFillColor string
+	// W14GlowColor + W14GlowRadiusPt drive a soft outline halo at draw
+	// time. Radius is converted from w14:rad EMUs to points.
+	W14GlowColor    string
+	W14GlowRadiusPt float64
+	// W14Reflection asks the renderer to mirror the run text below the
+	// baseline. We render with a fixed dist/fade — Word's exact angular
+	// gradient is approximated as a 50% alpha drop with vertical flip.
+	W14Reflection bool
 	// W14NumForm is "lining" (default) or "oldStyle" — selects between
 	// figure styles in OpenType fonts that ship both.
 	W14NumForm string
@@ -1747,10 +2021,17 @@ type BorderEdge struct {
 	Style string
 	Sz    float64 // line thickness in points (Word stores 1/8 pt; we convert)
 	Color string  // 6-hex; empty = auto/black
+	// Art names a w:pgBorders/@art preset ID (ECMA-376 ST_PageBorderArt:
+	// "hearts", "stars", "apples", "christmasTree", "snowflakes", etc. —
+	// 165 in total). Only valid on page borders; cell/paragraph borders
+	// never carry an art attribute. Renderer maps the ID to a tile glyph.
+	Art string
 }
 
 // Has reports whether the edge carries any styling info.
-func (e BorderEdge) Has() bool { return e.Style != "" || e.Sz != 0 || e.Color != "" }
+func (e BorderEdge) Has() bool {
+	return e.Style != "" || e.Sz != 0 || e.Color != "" || e.Art != ""
+}
 
 // PageSize in twips. 1 pt = 20 twips.
 type PageSize struct {
@@ -1785,6 +2066,11 @@ var DefaultMarginsTwips = Margins{Top: 1440, Bottom: 1440, Left: 1440, Right: 14
 type Numbering struct {
 	Abstract map[int]AbstractNum // abstractNumId → definition
 	NumToAbs map[int]int         // numId → abstractNumId
+	// StyleLink maps a paragraph styleID (case-sensitive) to the
+	// (numId, level) it should number from when the level's
+	// w:pStyle val points back to that style. Populated by
+	// resolveNumStyleLinks after numbering.xml + styles.xml load.
+	StyleLink map[string]StyleNumRef
 	// PicBullets maps w:numPicBulletId → image rId. A level whose
 	// w:lvlPicBulletId names one of these renders the image as its marker.
 	PicBullets map[int]string
@@ -1792,6 +2078,13 @@ type Numbering struct {
 	// w:lvlOverride inside a w:num: per-numId level swaps and start
 	// overrides. Empty map is fine.
 	Overrides map[int]map[int]NumOverride
+}
+
+// StyleNumRef is the (numId, level) pair a style links to via
+// abstractNum/lvl/pStyle.
+type StyleNumRef struct {
+	NumID int
+	Level int
 }
 
 type AbstractNum struct {
@@ -1843,6 +2136,13 @@ type NumLevel struct {
 	// The renderer uses it to select an appropriate font when painting
 	// the marker.
 	MarkerFontFamily string
+	// MarkerProps captures the rest of the level's w:rPr (bold / italic /
+	// color / size / underline / strike) so the bullet glyph picks up the
+	// formatting Word painted on it — many legal-style lists ship bold
+	// markers on non-bold body text. MarkerFontFamily takes precedence
+	// over MarkerProps.FontFamily when both are set; consumers may treat
+	// MarkerProps as a starting overlay on the run's own rPr.
+	MarkerProps RunProps
 	// MarkerJc is w:lvlJc: the marker's alignment inside its column —
 	// "left" (default), "center", "right", "start", "end". Used by the
 	// renderer to push the marker glyph to the right edge of the hanging

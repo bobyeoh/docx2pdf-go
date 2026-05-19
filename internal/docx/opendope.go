@@ -146,27 +146,87 @@ func applyRepeatContext(xpath string, stack []openDopeRepeatFrame) string {
 	if xpath == "" || len(stack) == 0 {
 		return xpath
 	}
-	for _, f := range stack {
+	// We honor NESTED repeats: an inner frame's xpathPrefix is stored
+	// as the *original* (pre-rewrite) path. When an outer frame has
+	// already injected [i] predicates, the inner prefix no longer
+	// matches the result verbatim; we have to rewrite the inner
+	// prefix the same way the outer rewrite would, then apply the
+	// inner's own [j] predicate.
+	result := xpath
+	for i, f := range stack {
 		if f.xpathPrefix == "" || f.index <= 0 {
 			continue
 		}
-		if !strings.HasPrefix(xpath, f.xpathPrefix) {
+		// Compute the live prefix for THIS frame, given any outer
+		// frames that have already been rewritten.
+		livePrefix := f.xpathPrefix
+		for j := 0; j < i; j++ {
+			outer := stack[j]
+			if outer.xpathPrefix == "" || outer.index <= 0 {
+				continue
+			}
+			if !strings.HasPrefix(livePrefix, outer.xpathPrefix) {
+				continue
+			}
+			rest := livePrefix[len(outer.xpathPrefix):]
+			if rest != "" && rest[0] != '/' && rest[0] != '[' && rest[0] != '@' {
+				continue
+			}
+			if strings.HasPrefix(rest, "[") {
+				continue
+			}
+			livePrefix = outer.xpathPrefix + "[" + intStr(outer.index) + "]" + rest
+		}
+		if !strings.HasPrefix(result, livePrefix) {
 			continue
 		}
-		rest := xpath[len(f.xpathPrefix):]
-		// Only rewrite when the prefix ends at a path boundary — we
-		// must not splice inside an element name.
+		rest := result[len(livePrefix):]
 		if rest != "" && rest[0] != '/' && rest[0] != '[' && rest[0] != '@' {
 			continue
 		}
-		// If the prefix already has a positional predicate in the
-		// source (e.g. the writer hardcoded "[1]"), leave it alone.
 		if strings.HasPrefix(rest, "[") {
 			continue
 		}
-		return f.xpathPrefix + "[" + intStr(f.index) + "]" + rest
+		result = livePrefix + "[" + intStr(f.index) + "]" + rest
 	}
-	return xpath
+	return result
+}
+
+// resolveOpenDoPEXPathInContext is resolveOpenDoPEXPath but threading the
+// active repeat stack so the bound XPath is rewritten with [i] before
+// hitting the custom XML store. Allows nested SDT bindings to follow
+// their parent's repeat iteration.
+func resolveOpenDoPEXPathInContext(doc *Document, id string, stack []openDopeRepeatFrame) (string, bool) {
+	if doc == nil || id == "" || doc.OpenDoPEXPaths == nil {
+		return "", false
+	}
+	xpath, ok := doc.OpenDoPEXPaths[id]
+	if !ok {
+		return "", false
+	}
+	return resolveXPath(doc.CustomXMLRoots, applyRepeatContext(xpath, stack))
+}
+
+// resolveOpenDoPERepeatCountInContext returns the iteration count for an
+// inner repeat, honoring the outer-repeat stack. Without this, a nested
+// repeat would always see the full element set (e.g. all customers ×
+// all orders) instead of just the orders for THIS customer.
+func resolveOpenDoPERepeatCountInContext(doc *Document, id string, stack []openDopeRepeatFrame) int {
+	if doc == nil || id == "" || doc.OpenDoPEXPaths == nil {
+		return 0
+	}
+	xpath, ok := doc.OpenDoPEXPaths[id]
+	if !ok {
+		return 0
+	}
+	resolved := applyRepeatContext(xpath, stack)
+	if n := countXPathMatches(doc.CustomXMLRoots, resolved); n > 0 {
+		return n
+	}
+	if _, ok := resolveXPath(doc.CustomXMLRoots, resolved); ok {
+		return 1
+	}
+	return 0
 }
 
 // resolveOpenDoPECondition evaluates a condition ID. The returned bool is

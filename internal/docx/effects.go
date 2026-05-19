@@ -59,6 +59,11 @@ func parseGradFillTheme(dec *xml.Decoder, start xml.StartElement, theme Theme) (
 				}
 				_ = dec.Skip()
 			case "path":
+				// <a:path path="circle|rect|shape">: radial-style gradient
+				// emanating from a center point. The renderer treats all
+				// three the same (concentric ellipses from outside in)
+				// because a faithful rectangular distance-field approximation
+				// would need a real PDF shading pattern.
 				kind = "radial"
 				_ = dec.Skip()
 			default:

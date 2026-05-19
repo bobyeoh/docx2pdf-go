@@ -23,6 +23,64 @@ func diagramSiblingLayout(files map[string]*zip.File, dataTarget string) *zip.Fi
 	return diagramSibling(files, dataTarget, "layout")
 }
 
+// diagramSiblingColors returns the colors*.xml zip entry paired with a
+// given data*.xml target. The colors part holds the per-node accent
+// scheme (a:fillClrLst / a:linClrLst / a:effectClrLst / a:txFillClrLst /
+// a:txLinClrLst / a:txEffectClrLst) the SmartArt instance uses.
+func diagramSiblingColors(files map[string]*zip.File, dataTarget string) *zip.File {
+	return diagramSibling(files, dataTarget, "colors")
+}
+
+// diagramSiblingQuickStyle returns the quickStyle*.xml zip entry paired
+// with a given data*.xml target. The quickStyle part chooses 3D / outline
+// / shadow treatments for SmartArt nodes.
+func diagramSiblingQuickStyle(files map[string]*zip.File, dataTarget string) *zip.File {
+	return diagramSibling(files, dataTarget, "quickStyle")
+}
+
+// extractDiagramColors pulls the first sequence of accent colors declared
+// in a SmartArt colors part. The output is suitable for cycling through
+// SmartArt nodes so each one gets a distinct accent color when the
+// renderer synthesizes the layout.
+//
+// Returns nil for the common case where the part is missing or holds
+// only scheme references (which need theme resolution); the renderer
+// falls back to its hard-coded accent palette in that case.
+func extractDiagramColors(f *zip.File) []string {
+	if f == nil {
+		return nil
+	}
+	rc, err := openZipFile(f)
+	if err != nil {
+		return nil
+	}
+	defer rc.Close()
+	dec := xml.NewDecoder(rc)
+	var out []string
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return out
+		}
+		se, ok := tok.(xml.StartElement)
+		if !ok {
+			continue
+		}
+		switch se.Name.Local {
+		case "srgbClr":
+			if v := attr(se, "val"); v != "" {
+				out = append(out, v)
+			}
+			_ = dec.Skip()
+		case "sysClr":
+			if v := attr(se, "lastClr"); v != "" {
+				out = append(out, v)
+			}
+			_ = dec.Skip()
+		}
+	}
+}
+
 func diagramSibling(files map[string]*zip.File, dataTarget, prefix string) *zip.File {
 	const dataPrefix = "data"
 	full := "word/" + dataTarget

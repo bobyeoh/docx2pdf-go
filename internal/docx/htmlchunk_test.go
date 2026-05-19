@@ -99,3 +99,50 @@ func TestParseHTMLAltChunk_Entities(t *testing.T) {
 		t.Errorf("entities not decoded: %q", all)
 	}
 }
+
+func TestParseHTMLAltChunk_Table(t *testing.T) {
+	html := `<table>
+  <tr><th>Name</th><th>Age</th></tr>
+  <tr><td>Alice</td><td>30</td></tr>
+  <tr><td>Bob</td><td>40</td></tr>
+</table>`
+	blocks := parseHTMLAltChunk(html, RunProps{})
+	if len(blocks) != 1 {
+		t.Fatalf("expected 1 block, got %d", len(blocks))
+	}
+	tbl, ok := blocks[0].(Table)
+	if !ok {
+		t.Fatalf("blocks[0] is %T not Table", blocks[0])
+	}
+	if got, want := len(tbl.Rows), 3; got != want {
+		t.Fatalf("rows = %d, want %d", got, want)
+	}
+	if got, want := len(tbl.Rows[0].Cells), 2; got != want {
+		t.Fatalf("header cells = %d, want %d", got, want)
+	}
+	// Header cells should carry Bold via <th>.
+	headerCell := tbl.Rows[0].Cells[0]
+	if len(headerCell.Blocks) == 0 {
+		t.Fatal("header cell has no blocks")
+	}
+	p, ok := headerCell.Blocks[0].(Paragraph)
+	if !ok {
+		t.Fatalf("header cell block is %T not Paragraph", headerCell.Blocks[0])
+	}
+	if len(p.Runs) == 0 || !p.Runs[0].Props.Bold || p.Runs[0].Text != "Name" {
+		t.Errorf("header cell runs = %+v, want bold 'Name'", p.Runs)
+	}
+}
+
+func TestParseHTMLAltChunk_Image(t *testing.T) {
+	html := `<p>Before <img src="foo.png" alt="logo"/> after.</p>`
+	blocks := parseHTMLAltChunk(html, RunProps{})
+	p := blocks[0].(Paragraph)
+	all := ""
+	for _, r := range p.Runs {
+		all += r.Text
+	}
+	if !strings.Contains(all, "[logo]") {
+		t.Errorf("expected image alt placeholder, got %q", all)
+	}
+}

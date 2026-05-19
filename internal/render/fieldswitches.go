@@ -350,3 +350,65 @@ func hexSymbolSwitch(instrFull string) bool {
 	}
 	return false
 }
+
+// styleRefSwitch reports whether `\<letter>` appears as a standalone
+// switch in instrFull. Used by STYLEREF's l/f/r/t/n/w/s flags.
+func styleRefSwitch(instrFull string, letter byte) bool {
+	parts := strings.Fields(instrFull)
+	want := `\` + string(letter)
+	for _, p := range parts {
+		if p == want {
+			return true
+		}
+	}
+	return false
+}
+
+// trimStyleRefPrefix removes a leading "<digits>.<digits>.* " prefix
+// from a STYLEREF target so e.g. "1.2 Title" → "Title". When no such
+// prefix exists, returns the input unchanged.
+func trimStyleRefPrefix(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return s
+	}
+	i := 0
+	sawDigit := false
+	for i < len(s) {
+		c := s[i]
+		if c >= '0' && c <= '9' {
+			sawDigit = true
+			i++
+			continue
+		}
+		if c == '.' && sawDigit {
+			i++
+			continue
+		}
+		break
+	}
+	if !sawDigit {
+		return s
+	}
+	rest := strings.TrimLeft(s[i:], " \t")
+	if rest == "" {
+		return s
+	}
+	return rest
+}
+
+// onlyDigitsAndPunct retains digits + punctuation; drops letters. Used
+// by STYLEREF \n to show "1.2.3" without the heading title.
+func onlyDigitsAndPunct(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(r)
+			continue
+		}
+		if unicode.IsPunct(r) {
+			b.WriteRune(r)
+		}
+	}
+	return strings.TrimSpace(b.String())
+}

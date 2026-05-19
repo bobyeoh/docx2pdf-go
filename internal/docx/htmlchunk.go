@@ -224,6 +224,25 @@ type htmlBuilder struct {
 	listKind  []string
 	listIndex []int
 	linkURL   string
+	// tableStack tracks nested HTML tables. Each entry holds the rows
+	// gathered so far and the active row's cells. <tr> opens a new row,
+	// <td>/<th> opens a cell whose content is captured by redirecting
+	// finishParagraph into the cell's block slice. <table> close commits
+	// the collected rows as a docx.Table block.
+	tableStack []*htmlTableState
+}
+
+// htmlTableState mirrors the in-progress structure of a single HTML table.
+type htmlTableState struct {
+	rows        []TableRow
+	curRow      []TableCell
+	curCellBlks []Block
+	inRow       bool
+	inCell      bool
+	// savedOut is the htmlBuilder.out captured at table open time. Cell
+	// content is collected into curCellBlks instead of going to out;
+	// when the cell closes we move it into the row.
+	savedOut []Block
 }
 
 func (b *htmlBuilder) pushProps() {
@@ -299,7 +318,14 @@ func (b *htmlBuilder) finishParagraph() {
 		p.IndentLeftPt = float64(b.listLvl) * 18
 		p.IndentFirstLinePt = -12
 	}
-	b.out = append(b.out, p)
+	// Inside a table cell, paragraphs collect into the cell's block list
+	// rather than the document body. The active cell is wherever
+	// curCellBlks was last reset by a <td>/<th> open.
+	if t := b.curTable(); t != nil && t.inCell {
+		t.curCellBlks = append(t.curCellBlks, p)
+	} else {
+		b.out = append(b.out, p)
+	}
 	b.runs = b.runs[:0]
 	b.inPara = false
 }
@@ -384,7 +410,59 @@ func (b *htmlBuilder) handleStart(tok htmlToken) {
 	case "li":
 		b.finishParagraph()
 		// li reopens a paragraph; finish caller will emit the marker.
+	case "table":
+		b.finishParagraph()
+		// Capture out so the table's cells don't leak into the
+		// surrounding document. Cell content is redirected into
+		// curCellBlks via finishParagraph's table-aware dispatch.
+		b.tableStack = append(b.tableStack, &htmlTableState{savedOut: b.out})
+		b.out = nil
+	case "tr":
+		if t := b.curTable(); t != nil {
+			b.finishParagraph()
+			if t.inRow {
+				t.rows = append(t.rows, TableRow{Cells: t.curRow})
+				t.curRow = nil
+			}
+			t.inRow = true
+		}
+	case "td", "th":
+		if t := b.curTable(); t != nil {
+			if !t.inRow {
+				t.inRow = true
+			}
+			b.finishParagraph()
+			t.inCell = true
+			t.curCellBlks = nil
+		}
+		if tok.name == "th" {
+			b.pushProps()
+			b.props.Bold = true
+		}
+	case "img":
+		// HTML <img src="..."> from an altChunk doesn't carry a docx
+		// relationship, so the image content isn't accessible to the
+		// renderer. Surface the alt text (or the basename of the src)
+		// as a labeled placeholder run so the position is preserved.
+		alt := tok.attr["alt"]
+		if alt == "" {
+			alt = tok.attr["src"]
+		}
+		if alt == "" {
+			alt = "image"
+		}
+		b.openParagraph()
+		b.runs = append(b.runs, Run{Text: "[" + alt + "]", Props: b.props})
 	}
+}
+
+// curTable returns the active htmlTableState or nil if no <table> is
+// currently open.
+func (b *htmlBuilder) curTable() *htmlTableState {
+	if n := len(b.tableStack); n > 0 {
+		return b.tableStack[n-1]
+	}
+	return nil
 }
 
 func (b *htmlBuilder) handleEnd(tok htmlToken) {
@@ -416,6 +494,54 @@ func (b *htmlBuilder) handleEnd(tok htmlToken) {
 		}
 	case "li":
 		b.finishParagraph()
+	case "th":
+		b.popProps()
+		if t := b.curTable(); t != nil {
+			b.finishParagraph()
+			t.curRow = append(t.curRow, TableCell{Blocks: t.curCellBlks})
+			t.curCellBlks = nil
+			t.inCell = false
+		}
+	case "td":
+		if t := b.curTable(); t != nil {
+			b.finishParagraph()
+			t.curRow = append(t.curRow, TableCell{Blocks: t.curCellBlks})
+			t.curCellBlks = nil
+			t.inCell = false
+		}
+	case "tr":
+		if t := b.curTable(); t != nil {
+			b.finishParagraph()
+			if t.inCell {
+				t.curRow = append(t.curRow, TableCell{Blocks: t.curCellBlks})
+				t.curCellBlks = nil
+				t.inCell = false
+			}
+			t.rows = append(t.rows, TableRow{Cells: t.curRow})
+			t.curRow = nil
+			t.inRow = false
+		}
+	case "table":
+		if n := len(b.tableStack); n > 0 {
+			b.finishParagraph()
+			t := b.tableStack[n-1]
+			// Flush a row that closed without a </tr>.
+			if t.inCell {
+				t.curRow = append(t.curRow, TableCell{Blocks: t.curCellBlks})
+			}
+			if t.inRow && len(t.curRow) > 0 {
+				t.rows = append(t.rows, TableRow{Cells: t.curRow})
+			}
+			b.tableStack = b.tableStack[:n-1]
+			// Restore the surrounding flow and commit the table as one
+			// block. Computed grid widths default to equal share of the
+			// page; renderer falls back to default column sizing when
+			// none are set.
+			b.out = t.savedOut
+			if len(t.rows) > 0 {
+				b.out = append(b.out, Table{Rows: t.rows})
+			}
+		}
 	}
 }
 

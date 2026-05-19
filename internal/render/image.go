@@ -58,6 +58,67 @@ func (r *renderer) fitImage(img image.Image) (w, h float64) {
 	return w, h
 }
 
+// resolvePctSize maps a wp14:pctWidth / wp14:pctHeight value (in
+// thousandths of a percent) and its relativeFrom anchor to a point
+// measurement, given the active section's page geometry. Returns 0
+// when pct is zero so callers can fall back to wp:extent-derived
+// dimensions.
+//
+// The relativeFrom keywords follow ECMA-376:
+//
+//	"page"          → physical page edge-to-edge
+//	"margin"        → text body inside both margins (contentW for horiz,
+//	                   pageH-marT-marB for vert)
+//	"leftMargin"    → the left margin strip
+//	"rightMargin"   → the right margin strip
+//	"topMargin"     → the top margin strip
+//	"bottomMargin"  → the bottom margin strip
+//	"insideMargin"  → mirror margins: left on odd page, right on even
+//	"outsideMargin" → mirror margins: right on odd page, left on even
+//
+// We use marL/marR/marT/marB rather than per-page mirror logic; without
+// the section's MirrorMargins context inside/outside reduce to the
+// left/right cases, which is good enough for the common templates
+// where pctWidth ≤ 100% applies relative to margin.
+func (r *renderer) resolvePctSize(pct uint32, relFrom string, horiz bool) float64 {
+	if pct == 0 {
+		return 0
+	}
+	frac := float64(pct) / 100000.0
+	var base float64
+	switch relFrom {
+	case "page", "":
+		if horiz {
+			base = r.pageW
+		} else {
+			base = r.pageH
+		}
+	case "margin", "insideMargin", "outsideMargin":
+		if horiz {
+			base = r.contentW
+		} else {
+			base = r.pageH - r.marT - r.marB
+		}
+	case "leftMargin":
+		base = r.marL
+	case "rightMargin":
+		base = r.marR
+	case "topMargin":
+		base = r.marT
+	case "bottomMargin":
+		base = r.marB
+	default:
+		// Unknown anchor — fall back to page so the image still appears
+		// instead of vanishing.
+		if horiz {
+			base = r.pageW
+		} else {
+			base = r.pageH
+		}
+	}
+	return base * frac
+}
+
 // applyImageEffects walks effs and applies each filter to img, returning a
 // new image. The pixel ops happen in a fresh NRGBA so the input is not
 // mutated. The order in effs matters — Word processes them top to bottom

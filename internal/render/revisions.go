@@ -158,6 +158,70 @@ func (r *renderer) drawRevisionChangeBar(topY, bottomY float64) {
 	r.pdf.Line(x, topY, x, bottomY)
 }
 
+// drawPrChangeBadge paints a small letter badge in the margin next to a
+// tracked-property change. The letter encodes which level of property
+// was edited (P=paragraph pPrChange, R=run rPrChange, T=table tblPr,
+// r=row trPr, c=cell tcPr, S=section sectPrChange) so reviewers can
+// disambiguate text edits from formatting edits at a glance. Author
+// color picks up the same palette as inserts/deletes so the badge ties
+// to the same reviewer thread.
+func (r *renderer) drawPrChangeBadge(letter string, pc *docx.PrChange, topY float64) {
+	if pc == nil || !r.opts.ShowRevisions {
+		return
+	}
+	color := revisionColorForAuthor(pc.Author, "808080")
+	rr, gg, bb := parseHexColor(color)
+	x := r.marL - 14
+	if x < 1 {
+		x = 1
+	}
+	r.pdf.SetFillColor(rr, gg, bb)
+	r.pdf.Oval(x, topY, x+9, topY+9)
+	savedFs := r.opts.DefaultFontSize
+	r.pdf.SetFontSize(6)
+	r.pdf.SetX(x + 2.5)
+	r.pdf.SetY(topY + 1.5)
+	r.pdf.SetTextColor(255, 255, 255)
+	_ = r.pdf.Cell(nil, letter)
+	r.pdf.SetTextColor(0, 0, 0)
+	r.pdf.SetFontSize(savedFs)
+}
+
+// firstParagraphPrChange returns the first PrChange found on a paragraph
+// or its runs (paragraph-level first). Used to decide which badge to
+// stamp alongside the change bar.
+func firstParagraphPrChange(p docx.Paragraph) (string, *docx.PrChange) {
+	if p.PrChange != nil {
+		return "P", p.PrChange
+	}
+	for _, r := range p.Runs {
+		if r.PrChange != nil {
+			return "R", r.PrChange
+		}
+	}
+	return "", nil
+}
+
+// firstTablePrChange returns the first PrChange found on a table, its
+// rows, or its cells. Letter picks identify the level so reviewers can
+// see whether the table, a row, or a cell changed.
+func firstTablePrChange(t docx.Table) (string, *docx.PrChange) {
+	if t.PrChange != nil {
+		return "T", t.PrChange
+	}
+	for _, row := range t.Rows {
+		if row.PrChange != nil {
+			return "r", row.PrChange
+		}
+		for _, c := range row.Cells {
+			if c.PrChange != nil {
+				return "c", c.PrChange
+			}
+		}
+	}
+	return "", nil
+}
+
 // revisionColorForAuthor hashes an author string into one of a handful of
 // readable hex colors so different reviewers' edits visually disambiguate.
 // Empty author returns the supplied fallback.

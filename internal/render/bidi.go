@@ -93,6 +93,83 @@ func shapeArabic(s string) string {
 	if !hasArabic {
 		return s
 	}
+	// Lam-alef ligature substitution: collapse a lam (U+0644) followed
+	// in *logical* order by an alef variant into a single visual ligature.
+	// reorderBidi has already mapped to visual order, so in this slice an
+	// Arabic word's last logical char is at the lowest index. That makes
+	// the lam appear AFTER its alef neighbor here — so the pattern to
+	// match is "alef at i, lam at i+1".
+	//
+	// The combined codepoint comes from the Arabic Presentation Forms-A
+	// (FEF5..FEFC) block:
+	//
+	//	lam + alef-madda   → FEF5 (isolated) / FEF6 (final)
+	//	lam + alef-hamza-a → FEF7 (isolated) / FEF8 (final)
+	//	lam + alef-hamza-b → FEF9 (isolated) / FEFA (final)
+	//	lam + alef plain   → FEFB (isolated) / FEFC (final)
+	//
+	// Selection between isolated and final depends on whether the lam
+	// connects to a previous letter (visual right neighbour). The substitution
+	// reuses arabicJoinClass to detect that, then writes the ligature in the
+	// alef slot and removes the lam.
+	if len(runes) >= 2 {
+		out := make([]rune, 0, len(runes))
+		for i := 0; i < len(runes); i++ {
+			if i+1 < len(runes) && runes[i+1] == 0x0644 {
+				switch runes[i] {
+				case 0x0622, 0x0623, 0x0625, 0x0627:
+					// Lam's predecessor in logical reading order is the
+					// rune to its right in logical order — which sits at
+					// i+2 in our already-bidi-reordered visual slice. If
+					// that letter joins on its left, the lam takes the
+					// FINAL form; otherwise the ligature is ISOLATED.
+					joinsNext := false
+					for k := i + 2; k < len(runes); k++ {
+						if isTransparentJoin(runes[k]) {
+							continue
+						}
+						jc := arabicJoinClass(runes[k])
+						if jc == "D" || jc == "R" {
+							joinsNext = true
+						}
+						break
+					}
+					var lig rune
+					switch runes[i] {
+					case 0x0622:
+						if joinsNext {
+							lig = 0xFEF6
+						} else {
+							lig = 0xFEF5
+						}
+					case 0x0623:
+						if joinsNext {
+							lig = 0xFEF8
+						} else {
+							lig = 0xFEF7
+						}
+					case 0x0625:
+						if joinsNext {
+							lig = 0xFEFA
+						} else {
+							lig = 0xFEF9
+						}
+					case 0x0627:
+						if joinsNext {
+							lig = 0xFEFC
+						} else {
+							lig = 0xFEFB
+						}
+					}
+					out = append(out, lig)
+					i++ // consume the lam
+					continue
+				}
+			}
+			out = append(out, runes[i])
+		}
+		runes = out
+	}
 	out := make([]rune, len(runes))
 	for i, r := range runes {
 		shape, ok := arabicShapingTable[r]

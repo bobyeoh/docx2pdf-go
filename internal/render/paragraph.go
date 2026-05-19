@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/bobyeoh/docx2pdf-go/internal/docx"
+	"github.com/signintech/gopdf"
 )
 
 func (r *renderer) drawParagraph(p docx.Paragraph) error {
@@ -38,26 +39,6 @@ func (r *renderer) drawParagraph(p docx.Paragraph) error {
 	if p.PageBreak {
 		r.pdf.AddPage()
 		r.cursorY = r.marT
-	}
-	// PDF outline: paragraphs styled as Heading1..9 or Title contribute
-	// a bookmark in the reader's sidebar so the resulting PDF has a
-	// clickable navigable structure. The text of the first paragraph at
-	// each heading level becomes the bookmark title. We add the outline
-	// here (before content draws) so it points at the correct page —
-	// note that any preceding spacing-before or KeepNext ensureRoom may
-	// still shift the page; close enough for "click to jump near
-	// chapter".
-	if title := headingTitle(p); title != "" {
-		// Heading level → indent in the PDF outline. gopdf doesn't model
-		// a real nested-outline tree (only a flat list), so we approximate
-		// hierarchy by prefixing N-1 figure-spaces per level. The
-		// resulting sidebar reads as Heading 1 > Heading 2 > ... without
-		// requiring upstream support for sub-outlines.
-		level := outlineLevelFromStyle(p.StyleID, p.OutlineLvl)
-		if level > 1 {
-			title = strings.Repeat("  ", level-1) + title
-		}
-		r.pdf.AddOutline(title)
 	}
 	// RTL paragraph state: drives rune-reversal inside RTL word atoms and
 	// line-internal atom reversal at flush time. Set before runsToAtoms so
@@ -98,10 +79,36 @@ func (r *renderer) drawParagraph(p docx.Paragraph) error {
 	if sb > 0 {
 		r.cursorY += sb
 	}
-	// keepNext/keepLines: reserve a line of next-paragraph height so an
-	// orphan line doesn't end the page right after a keepNext heading.
+	// PDF outline: paragraphs styled as Heading1..9 or Title contribute a
+	// bookmark in the reader's sidebar so the resulting PDF has a clickable
+	// navigable structure. We emit a true nested outline tree — Heading2
+	// becomes a child of the most recent Heading1, etc. We add the outline
+	// AFTER applying spacing-before so the bookmark's destination Y lands
+	// at the heading's actual top edge, not the gap above it. KeepNext
+	// ensureRoom may still shift the heading to a new page; that case is
+	// handled by ensureRoom moving cursorY and triggering AddPage, so the
+	// AddOutlineWithPosition we call here will use the correct page index.
+	if title := headingTitle(p); title != "" {
+		level := outlineLevelFromStyle(p.StyleID, p.OutlineLvl)
+		if level < 1 {
+			level = 1
+		}
+		r.appendOutline(title, level)
+	}
+	// keepNext baseline: ensure room for at least 2.4× a default font
+	// line so a heading isn't orphaned at the bottom of the page. Full
+	// keepLines / widow-orphan measurement happens once we know the
+	// paragraph's left indent (after listIndent resolution below).
 	if p.KeepNext || p.KeepLines {
-		r.ensureRoom(r.opts.DefaultFontSize * 2.4)
+		bond := r.opts.DefaultFontSize * 2.4
+		// Cross-paragraph bonding: when the caller supplied a hint about
+		// the next block's height (set just before drawParagraph), use
+		// max(hint, 2.4 lines) so a keepNext heading and its full
+		// follow-on paragraph land on the same page.
+		if p.KeepNext && r.nextBlockMinHeight > bond {
+			bond = r.nextBlockMinHeight
+		}
+		r.ensureRoom(bond)
 	}
 	savedTabs := r.activeTabs
 	r.activeTabs = p.Tabs
@@ -121,15 +128,17 @@ func (r *renderer) drawParagraph(p docx.Paragraph) error {
 	var listMarkerImg image.Image
 	var listMarkerFont string
 	var listMarkerJc string
+	var listMarkerProps docx.RunProps
 	var lvlHangPt float64
 	listIndent := 0.0
 	if p.List != nil {
-		markerText, markerImg, indentPt, hangPt, font, jc := r.resolveListMarker(*p.List)
+		markerText, markerImg, indentPt, hangPt, font, jc, mProps := r.resolveListMarker(*p.List)
 		listIndent = indentPt
 		listMarkerText = markerText
 		listMarkerImg = markerImg
 		listMarkerFont = font
 		listMarkerJc = jc
+		listMarkerProps = mProps
 		lvlHangPt = hangPt
 	}
 
@@ -168,6 +177,7 @@ func (r *renderer) drawParagraph(p docx.Paragraph) error {
 			fontFamily: listMarkerFont,
 			jc:         listMarkerJc,
 			colWidth:   lvlHangPt,
+			props:      listMarkerProps,
 		}
 	}
 
@@ -201,6 +211,36 @@ func (r *renderer) drawParagraph(p docx.Paragraph) error {
 	}
 	atoms = append(atoms, r.runsToAtoms(runs)...)
 
+	// w:keepLines / w:widowControl: measure the paragraph's height before
+	// drawing and adjust page-break placement so a paragraph either fits
+	// entirely on this page or moves to the next page (KeepLines), and
+	// so the page split never leaves a single orphan/widow line behind
+	// (WidowControl, default on).
+	if !r.noPageBreak {
+		paraH := r.measureAtomsHeight(atoms, r.contentW)
+		lineH := r.applyLineHeight(r.opts.DefaultFontSize * 1.2)
+		remaining := r.pageH - r.marB - r.cursorY
+		pageInner := r.pageH - r.marT - r.marB
+		if p.KeepLines && paraH > remaining && paraH <= pageInner {
+			r.ensureRoom(pageInner + 1) // force a page break
+		} else if (p.WidowControl == nil || *p.WidowControl) && lineH > 0 && paraH > remaining {
+			linesHere := int(remaining / lineH)
+			totalLines := int((paraH + lineH*0.5) / lineH)
+			if totalLines >= 2 {
+				if linesHere == 1 {
+					// Only 1 line would land before the break — push
+					// the whole paragraph to next page so the first
+					// page doesn't carry a 1-line widow.
+					r.ensureRoom(pageInner + 1)
+				} else if totalLines-linesHere == 1 {
+					// Last line alone on the next page (orphan): pull
+					// it back by reducing this page's remaining space.
+					r.ensureRoom(remaining + lineH + 1)
+				}
+			}
+		}
+	}
+
 	if err := r.layoutLine(atoms, align); err != nil {
 		r.restoreParagraphState(savedColIdx, savedMarL, savedContentW, savedLine)
 		r.pendingMarker = nil
@@ -224,6 +264,9 @@ func (r *renderer) drawParagraph(p docx.Paragraph) error {
 	// per-line revision mask at this layer).
 	if r.opts.ShowRevisions && paragraphHasRevision(p) {
 		r.drawRevisionChangeBar(pbdrTopY, pbdrBottomY)
+		if letter, pc := firstParagraphPrChange(p); pc != nil {
+			r.drawPrChangeBadge(letter, pc, pbdrTopY)
+		}
 	}
 	// w:suppressLineNumbers — record the y-range so the section's
 	// line-number gutter skips this paragraph. Effective only when the
@@ -286,18 +329,18 @@ func (r *renderer) restoreParagraphState(savedColIdx int, savedMarL, savedConten
 // Returns empty values when the list isn't defined — some Word docs
 // reference numIds that aren't in numbering.xml, and we fall back gracefully
 // rather than failing the render.
-func (r *renderer) resolveListMarker(li docx.ListInfo) (marker string, img image.Image, indentPt, hangPt float64, fontFamily, markerJc string) {
+func (r *renderer) resolveListMarker(li docx.ListInfo) (marker string, img image.Image, indentPt, hangPt float64, fontFamily, markerJc string, props docx.RunProps) {
 	absID, ok := r.doc.Numbering.NumToAbs[li.NumID]
 	if !ok {
-		return "", nil, 0, 0, "", ""
+		return
 	}
 	an, ok := r.doc.Numbering.Abstract[absID]
 	if !ok {
-		return "", nil, 0, 0, "", ""
+		return
 	}
 	lv, ok := an.Levels[li.Level]
 	if !ok {
-		return "", nil, 0, 0, "", ""
+		return
 	}
 
 	// w:lvlOverride lives on the w:num, not the abstractNum. A num that
@@ -375,12 +418,24 @@ func (r *renderer) resolveListMarker(li docx.ListInfo) (marker string, img image
 	if hangPt < 2 {
 		hangPt = 18 // 360 twips = 0.25 inch — enough gap between marker and text
 	}
+	// w:legacy mode (Word 6/95 compatibility): legacyIndent twips is a
+	// flat marker offset measured from the paragraph's left edge; there
+	// is no separate hanging-indent column. When the level is in legacy
+	// mode we treat LegacyIndent as the marker's column width and zero
+	// the hang so the body text starts immediately after.
+	if lv.LegacyIndent > 0 {
+		indentPt = twipsToPt(lv.LegacyIndent)
+		hangPt = twipsToPt(lv.LegacyIndent)
+	}
 
 	markerJc = lv.MarkerJc
+	// Level-rPr bold/italic/color/size flow onto the marker glyph so a
+	// "1." that Word painted bold in a non-bold body actually renders bold.
+	props = lv.MarkerProps
 	if lv.PicBulletID > 0 {
 		if rid, ok := r.doc.Numbering.PicBullets[lv.PicBulletID]; ok {
 			if image, ok := r.doc.Images[rid]; ok {
-				return "", image, indentPt, hangPt, "", markerJc
+				return "", image, indentPt, hangPt, "", markerJc, props
 			}
 		}
 	}
@@ -406,7 +461,7 @@ func (r *renderer) resolveListMarker(li docx.ListInfo) (marker string, img image
 			indentPt = 0
 		}
 	}
-	return marker, nil, indentPt, hangPt, fontFamily, markerJc
+	return marker, nil, indentPt, hangPt, fontFamily, markerJc, props
 }
 
 // formatLevelText expands lvlText placeholders like "%1.%2" using the
@@ -1154,6 +1209,48 @@ func outlineLevelFromStyle(styleID string, outlineLvl int) int {
 		}
 	}
 	return 1
+}
+
+// appendOutline records a heading entry in the renderer's outline tree at
+// the requested depth (1-based). It uses gopdf's nested-outline API so the
+// produced PDF has a real hierarchy in the bookmarks pane — Heading2 nests
+// under the most recent Heading1, Heading3 under the most recent Heading2,
+// etc. Skipped levels (e.g. Heading1 then Heading3 with no Heading2) are
+// flattened by clamping the new node's depth to one more than the deepest
+// existing ancestor, matching docx4j's "compact-skip" behavior.
+func (r *renderer) appendOutline(title string, level int) {
+	if title == "" {
+		return
+	}
+	if level < 1 {
+		level = 1
+	}
+	if level > 9 {
+		level = 9
+	}
+	// gopdf's bookmark dest is the current page; SetXY hasn't been called
+	// yet for the heading itself, so use AddOutlineWithPosition so the
+	// destination Y matches where the heading will be drawn.
+	obj := r.pdf.AddOutlineWithPosition(title)
+	node := &gopdf.OutlineNode{Obj: obj}
+	// Compact-skip: a heading deeper than the existing stack + 1 attaches
+	// as a child of whatever the current deepest ancestor is, not at its
+	// nominal depth. Prevents orphan "phantom" parents in the outline.
+	if level > len(r.outlineStack)+1 {
+		level = len(r.outlineStack) + 1
+	}
+	// Pop any deeper-than-(level-1) ancestors — they're siblings, not
+	// ancestors, of the new node.
+	if len(r.outlineStack) >= level {
+		r.outlineStack = r.outlineStack[:level-1]
+	}
+	if level == 1 {
+		r.outlineRoots = append(r.outlineRoots, node)
+	} else {
+		parent := r.outlineStack[level-2]
+		parent.Children = append(parent.Children, node)
+	}
+	r.outlineStack = append(r.outlineStack, node)
 }
 
 func isHeadingStyle(id string) bool {

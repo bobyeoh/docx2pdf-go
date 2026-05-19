@@ -79,6 +79,22 @@ type atom struct {
 	// this atom to honor run-level w:fitText squeeze. Width has
 	// already been multiplied by the same scale at emit time.
 	fitScale float64
+	// eaTopText / eaBottomText carry the two halves of an atomEACombine
+	// (w:eastAsianLayout w:combine="lines"). Rendered as two half-height
+	// rows stacked vertically; the surrounding atom width matches the
+	// wider of the two halves so adjacent flow doesn't overlap.
+	eaTopText, eaBottomText       string
+	eaOpenBracket, eaCloseBracket string
+}
+
+// glowOffsets is the unit-vector ring used to stamp glow/outline halos
+// around glyphs. Eight directions at 45° produce a recognizable halo
+// without driving up PDF size too much. Each offset is multiplied by the
+// effect radius/width at call time.
+var glowOffsets = [8][2]float64{
+	{1, 0}, {-1, 0}, {0, 1}, {0, -1},
+	{0.707, 0.707}, {-0.707, 0.707},
+	{0.707, -0.707}, {-0.707, -0.707},
 }
 
 type atomKind int
@@ -90,9 +106,10 @@ const (
 	atomPageBreak // hard page break (w:br w:type="page")
 	atomImage
 	atomTab
-	atomBookmark // zero-width marker; registers a named PDF anchor at this position
-	atomVMLShape // inline geometric primitive (v:rect/v:line/v:oval/...)
-	atomMath     // 2D-laid-out OMML expression
+	atomBookmark  // zero-width marker; registers a named PDF anchor at this position
+	atomVMLShape  // inline geometric primitive (v:rect/v:line/v:oval/...)
+	atomMath      // 2D-laid-out OMML expression
+	atomEACombine // w:eastAsianLayout w:combine="lines": two half-height rows stacked
 )
 
 // nextTabAfterWithAlign returns the next tab stop strictly past relX
@@ -246,10 +263,64 @@ func (r *renderer) runsToAtoms(runs []docx.Run) []atom {
 		// construction, and font selection all see the corrected props
 		// without each having to know about the cs/bidi split.
 		run.Props = applyComplexScriptProps(run.Props, r.paragraphRTL)
-		if run.FootnoteID != "" && !r.drawingFootnotes {
-			r.pendingFootnotes = append(r.pendingFootnotes, pendingNote{
-				id: run.FootnoteID, endnote: run.IsEndnote,
+		// w:eastAsianLayout w:combine — render the combined text as a
+		// two-row stack inside a single line slot. This is the visual
+		// Word uses for "Asian Layout: Combine in characters" so the
+		// reading order packs vertically into one line. We split the
+		// text in half by rune count and emit one atomEACombine
+		// carrying both halves. The surrounding bracket pair (if any)
+		// is rendered alongside the stack.
+		if run.Props.EALayout != nil && run.Props.EALayout.Combine && run.Text != "" {
+			openB, closeB := combineBracketChars(run.Props.EALayout.CombineBrackets)
+			runes := []rune(run.Text)
+			mid := (len(runes) + 1) / 2
+			top := string(runes[:mid])
+			bot := string(runes[mid:])
+			_ = r.applyRunFont(run.Props)
+			halfSize := r.opts.DefaultFontSize
+			// Each half is rendered at half height, so measurement
+			// uses the half-height font size.
+			topW, _ := r.pdf.MeasureTextWidth(top)
+			botW, _ := r.pdf.MeasureTextWidth(bot)
+			w := topW
+			if botW > w {
+				w = botW
+			}
+			w *= 0.5 // half-size font width
+			bw := 0.0
+			if openB != "" {
+				obw, _ := r.pdf.MeasureTextWidth(openB)
+				cbw, _ := r.pdf.MeasureTextWidth(closeB)
+				bw = obw + cbw
+			}
+			out = append(out, atom{
+				kind:           atomEACombine,
+				eaTopText:      top,
+				eaBottomText:   bot,
+				eaOpenBracket:  openB,
+				eaCloseBracket: closeB,
+				props:          run.Props,
+				width:          w + bw + 1.0,
+				height:         halfSize * 1.2,
 			})
+			continue
+		}
+		if run.FootnoteID != "" && !r.drawingFootnotes {
+			// Skip page-bottom queueing for footnotes when the doc
+			// declared w:footnotePr w:pos="docEnd"/"sectEnd" — those get
+			// emitted as a single trailer at doc end via
+			// appendNotesSection. Endnotes already defer either to
+			// section end or doc end, so the gate only fires on the
+			// footnote half.
+			deferToTrailer := false
+			if !run.IsEndnote && r.doc != nil && anySectionDocEndFootnotes(r.doc.Sections) {
+				deferToTrailer = true
+			}
+			if !deferToTrailer {
+				r.pendingFootnotes = append(r.pendingFootnotes, pendingNote{
+					id: run.FootnoteID, endnote: run.IsEndnote,
+				})
+			}
 			// Rewrite the reference text from "[id]" to the configured
 			// label (decimal/roman/letter/symbol).
 			labels := r.footnoteLabels
@@ -295,12 +366,39 @@ func (r *renderer) runsToAtoms(runs []docx.Run) []atom {
 				anchorSimplePosUsed: run.AnchorSimplePosUsed,
 				anchorSimplePosXPt:  run.AnchorSimplePosXPt,
 				anchorSimplePosYPt:  run.AnchorSimplePosYPt,
+				linkRID:             run.LinkURL,
+				linkAnchor:          run.LinkAnchor,
 			})
 			continue
 		}
 		if run.ImageID != "" {
 			img, ok := r.doc.Images[run.ImageID]
 			if !ok {
+				// EMF vector replay: when emfToVMLShape produced a
+				// shape, render that instead of the placeholder label.
+				if r.doc.EMFShapes != nil {
+					if shape := r.doc.EMFShapes[run.ImageID]; shape != nil {
+						w := run.ImageWidthPt
+						h := run.ImageHeightPt
+						if w <= 0 {
+							w = shape.WidthPt
+						}
+						if h <= 0 {
+							h = shape.HeightPt
+						}
+						scaled := *shape
+						scaled.WidthPt = w
+						scaled.HeightPt = h
+						out = append(out, atom{
+							kind:   atomVMLShape,
+							width:  w,
+							height: h,
+							shape:  &scaled,
+							props:  run.Props,
+						})
+						continue
+					}
+				}
 				// Unsupported media (EMF/WMF/etc.) or unresolved rId. If
 				// the docx declared a w:extent (ImageWidthPt/HeightPt),
 				// emit a sized outline box so the layout reflects the
@@ -370,14 +468,39 @@ func (r *renderer) runsToAtoms(runs []docx.Run) []atom {
 				r.croppedCache[imgID] = img
 			}
 			var w, h float64
-			if run.ImageWidthPt > 0 && run.ImageHeightPt > 0 {
+			// wp14:pctWidth / pctHeight (thousandths of a percent) trump
+			// an explicit wp:extent. When only one of the two percentages
+			// is specified, the other dimension is scaled to keep the
+			// image's natural aspect ratio.
+			pctW := r.resolvePctSize(run.ImagePctWidth, run.ImagePctRelFromH, true)
+			pctH := r.resolvePctSize(run.ImagePctHeight, run.ImagePctRelFromV, false)
+			switch {
+			case pctW > 0 && pctH > 0:
+				w, h = pctW, pctH
+			case pctW > 0:
+				w = pctW
+				natW, natH := r.fitImage(img)
+				if natW > 0 {
+					h = pctW * natH / natW
+				} else {
+					h = pctW
+				}
+			case pctH > 0:
+				h = pctH
+				natW, natH := r.fitImage(img)
+				if natH > 0 {
+					w = pctH * natW / natH
+				} else {
+					w = pctH
+				}
+			case run.ImageWidthPt > 0 && run.ImageHeightPt > 0:
 				w, h = run.ImageWidthPt, run.ImageHeightPt
 				if w > r.contentW {
 					scale := r.contentW / w
 					w *= scale
 					h *= scale
 				}
-			} else {
+			default:
 				w, h = r.fitImage(img)
 			}
 			out = append(out, atom{
@@ -504,13 +627,16 @@ func (r *renderer) runsToAtoms(runs []docx.Run) []atom {
 				_ = r.applyFontFamily(run.Props, r.selectFont(run.Props))
 				w, _ := r.pdf.MeasureTextWidth(" ")
 				out = append(out, atom{kind: atomSpace, text: " ", props: run.Props, width: w})
-			case isCJK(rn) || isSymbolGlyph(rn):
-				// CJK and symbol-block runes share a code path: each
-				// becomes its own atom. CJK because we need
-				// per-character line breaks (no inter-word spaces);
-				// symbols because their natural font may differ from
-				// the surrounding Latin (e.g. ✓ routes to fallback
-				// while ASCII stays on the regular face).
+			case isCJK(rn) || isSymbolGlyph(rn) || isPUA(rn):
+				// CJK, symbol-block runes, and Private-Use-Area glyphs
+				// share a code path: each becomes its own atom. CJK
+				// because we need per-character line breaks (no inter-
+				// word spaces); symbols because their natural font may
+				// differ from the surrounding Latin (e.g. ✓ routes to
+				// fallback while ASCII stays on the regular face); PUA
+				// because vendor/EUDC fonts are different from the run's
+				// nominal face and bundling them with surrounding Latin
+				// would render them as missing-glyph boxes.
 				flushBuf()
 				fam := r.chooseFamily(rn, run.Props)
 				_ = r.applyFontFamily(run.Props, fam)
@@ -810,8 +936,82 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 				case "outline":
 					r.pdf.SetTextColor(160, 160, 160)
 				}
+				// w14:glow — stamp the glyph 8 times around the target in
+				// the glow color before drawing the real text so it looks
+				// haloed. Radius is the offset distance in points.
+				if a.props.W14GlowColor != "" && a.text != "" {
+					rad := a.props.W14GlowRadiusPt
+					if rad <= 0 {
+						rad = 2
+					}
+					if rad > 6 {
+						rad = 6
+					}
+					gr, gg, gb := parseHexColor(a.props.W14GlowColor)
+					savedR, savedG, savedB := uint8(0), uint8(0), uint8(0)
+					if a.props.Color != "" {
+						savedR, savedG, savedB = parseHexColor(a.props.Color)
+					}
+					r.pdf.SetTextColor(gr, gg, gb)
+					for _, off := range glowOffsets {
+						r.pdf.SetX(cx + off[0]*rad)
+						r.pdf.SetY(topY + off[1]*rad)
+						_ = r.pdf.Cell(nil, a.text)
+					}
+					r.pdf.SetTextColor(savedR, savedG, savedB)
+					r.pdf.SetX(cx)
+					r.pdf.SetY(topY)
+				}
+				// w14:textOutline — stamp the glyph at 8 small offsets in
+				// the outline color, then draw the real text on top. This
+				// fakes a stroke without needing PDF text-rendering-mode
+				// access. Width drives the offset distance.
+				if a.props.W14OutlineColor != "" && a.props.W14OutlineWidthPt > 0 && a.text != "" {
+					w := a.props.W14OutlineWidthPt
+					if w > 1.5 {
+						w = 1.5
+					}
+					or, og, ob := parseHexColor(a.props.W14OutlineColor)
+					savedR, savedG, savedB := uint8(0), uint8(0), uint8(0)
+					if a.props.Color != "" {
+						savedR, savedG, savedB = parseHexColor(a.props.Color)
+					}
+					r.pdf.SetTextColor(or, og, ob)
+					for _, off := range glowOffsets {
+						r.pdf.SetX(cx + off[0]*w)
+						r.pdf.SetY(topY + off[1]*w)
+						_ = r.pdf.Cell(nil, a.text)
+					}
+					r.pdf.SetTextColor(savedR, savedG, savedB)
+					r.pdf.SetX(cx)
+					r.pdf.SetY(topY)
+				}
+				// w14:textFill — override the run fill color before the
+				// real glyph stamp. Doesn't disturb the prior outline pass
+				// because that already set its own color.
+				if a.props.W14TextFillColor != "" {
+					fr, fg, fb := parseHexColor(a.props.W14TextFillColor)
+					r.pdf.SetTextColor(fr, fg, fb)
+				}
 				if err := r.pdf.Cell(nil, a.text); err != nil {
 					return err
+				}
+				// w14:reflection — draw a flipped copy beneath the text
+				// in a lighter shade, simulating the mirror Word renders.
+				// We can't scale vertically in gopdf without state, so we
+				// just stamp at baseline+ascent in a gray tone.
+				if a.props.W14Reflection && a.text != "" {
+					savedR, savedG, savedB := uint8(0), uint8(0), uint8(0)
+					if a.props.Color != "" {
+						savedR, savedG, savedB = parseHexColor(a.props.Color)
+					}
+					r.pdf.SetTextColor(200, 200, 200)
+					r.pdf.SetX(cx)
+					r.pdf.SetY(baseline + ascent*0.05)
+					_ = r.pdf.Cell(nil, a.text)
+					r.pdf.SetTextColor(savedR, savedG, savedB)
+					r.pdf.SetX(cx)
+					r.pdf.SetY(topY)
 				}
 				// w:ruby — paint the interlinear annotation in a smaller
 				// font centered above the base char. We approximate the
@@ -874,6 +1074,12 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 				}
 				if a.props.Em != "" && a.text != "" {
 					drawEmphasisMark(r, a, cx, baseline)
+				}
+				// w:bdr (run-level box border around the atom) and form-
+				// field control affordances. Draw last so they sit over the
+				// fill/strike layers but under the next atom.
+				if a.props.TextBorder.Has() && a.text != "" {
+					drawRunTextBorder(r, a.props.TextBorder, cx, topY, a.width, ascent*1.15)
 				}
 				cx += a.width
 				// Restore the renderer-wide fitTextScale we possibly
@@ -982,6 +1188,16 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 				if err := r.drawTransformedImage(img, imgX, r.cursorY, a.width, a.height, a.imageRotationDeg, a.imageFlipH, a.imageFlipV); err != nil {
 					return err
 				}
+				// Image hyperlink: a:hlinkClick on wp:docPr / pic:cNvPr.
+				// LinkURL holds the relationship rId (resolved here); LinkAnchor
+				// is an in-document bookmark name. Emit a PDF link annotation
+				// covering the drawn image bounds. Also applies to anchored
+				// images — they get their click target where they land.
+				if url := r.resolveURL(a.linkRID); url != "" {
+					r.pdf.AddExternalLink(url, imgX, r.cursorY, a.width, a.height)
+				} else if a.linkAnchor != "" {
+					r.pdf.AddInternalLink(a.linkAnchor, imgX, r.cursorY, a.width, a.height)
+				}
 				if a.anchored {
 					// Anchored image — don't advance the inline cursor.
 				} else {
@@ -991,10 +1207,58 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 				if a.shape != nil {
 					drawVMLShape(r, a.shape, cx, r.cursorY, a.width, a.height)
 				}
+				// Shape hyperlink: a:hlinkClick / v:shape@href / o:OLEObject
+				// @href all converge onto the run's LinkURL or LinkAnchor.
+				if url := r.resolveURL(a.linkRID); url != "" {
+					r.pdf.AddExternalLink(url, cx, r.cursorY, a.width, a.height)
+				} else if a.linkAnchor != "" {
+					r.pdf.AddInternalLink(a.linkAnchor, cx, r.cursorY, a.width, a.height)
+				}
 				cx += a.width
 			case atomMath:
 				if a.math.draw != nil {
 					a.math.draw(r, cx, baseline)
+				}
+				cx += a.width
+			case atomEACombine:
+				// Two-row stack: top half above midline, bottom below.
+				// Both rendered at half the surrounding font size so
+				// the combined glyph occupies one logical character
+				// width inside one line of flow text.
+				_ = r.applyRunFont(a.props)
+				halfSize := r.opts.DefaultFontSize * 0.5
+				orig := r.opts.DefaultFontSize
+				savedProps := a.props
+				smallProps := savedProps
+				smallProps.FontSize = halfSize
+				_ = r.applyRunFont(smallProps)
+				bracketX := cx
+				if a.eaOpenBracket != "" {
+					r.pdf.SetX(bracketX)
+					r.pdf.SetY(baseline - fontAscent(savedProps, orig))
+					_ = r.pdf.Cell(nil, a.eaOpenBracket)
+					obw, _ := r.pdf.MeasureTextWidth(a.eaOpenBracket)
+					bracketX += obw
+				}
+				topW, _ := r.pdf.MeasureTextWidth(a.eaTopText)
+				botW, _ := r.pdf.MeasureTextWidth(a.eaBottomText)
+				stackW := topW
+				if botW > stackW {
+					stackW = botW
+				}
+				// Center each half horizontally inside the stack column.
+				r.pdf.SetX(bracketX + (stackW-topW)/2)
+				r.pdf.SetY(baseline - lineMaxH*0.9)
+				_ = r.pdf.Cell(nil, a.eaTopText)
+				r.pdf.SetX(bracketX + (stackW-botW)/2)
+				r.pdf.SetY(baseline - lineMaxH*0.45)
+				_ = r.pdf.Cell(nil, a.eaBottomText)
+				bracketX += stackW
+				if a.eaCloseBracket != "" {
+					r.pdf.SetX(bracketX)
+					r.pdf.SetY(baseline - fontAscent(savedProps, orig))
+					_ = r.applyRunFont(savedProps)
+					_ = r.pdf.Cell(nil, a.eaCloseBracket)
 				}
 				cx += a.width
 			}
@@ -1095,6 +1359,31 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 				}
 			}
 			if a.width > effW {
+				// Try Liang hyphenation before per-rune fallback. If a
+				// legal soft-break fits effW we get a clean two-piece
+				// split with a trailing hyphen at the line break.
+				if r.doc != nil && (r.doc.Settings.AutoHyphenation || r.opts.AutoHyphenation) {
+					if pair := r.splitWordAtomByHyphenation(a, effW); pair != nil {
+						for _, sub := range pair {
+							if lineW+sub.width > effW && len(line) > 0 {
+								if line[len(line)-1].kind == atomSpace {
+									lineW -= line[len(line)-1].width
+									line = line[:len(line)-1]
+								}
+								if err := flush(false); err != nil {
+									return err
+								}
+							}
+							line = append(line, sub)
+							lineW += sub.width
+							sh := atomHeight(sub, r.opts.DefaultFontSize)
+							if sh > lineMaxH {
+								lineMaxH = sh
+							}
+						}
+						continue
+					}
+				}
 				subs := r.splitWordAtomByRune(a)
 				for _, sub := range subs {
 					if lineW+sub.width > effW && len(line) > 0 {
@@ -1213,6 +1502,70 @@ func isKinsokuNoEnd(a atom) bool {
 		return true
 	}
 	return false
+}
+
+// isAllCapsWord reports whether s contains at least one letter and all
+// letters are uppercase. Non-letter runes are ignored (so "U.S.A." or
+// "WORD123" still classifies as all-caps).
+func isAllCapsWord(s string) bool {
+	any := false
+	for _, r := range s {
+		switch {
+		case r >= 'A' && r <= 'Z':
+			any = true
+		case r >= 'a' && r <= 'z':
+			return false
+		}
+	}
+	return any
+}
+
+// splitWordAtomByHyphenation tries Liang-style hyphenation on a word
+// atom and returns a 2-element slice of atoms (head with trailing
+// hyphen, tail) when a legal break fits within maxW. Returns nil when
+// no valid hyphenation exists or none fits. Used by layoutLine before
+// falling back to per-rune splitting.
+func (r *renderer) splitWordAtomByHyphenation(a atom, maxW float64) []atom {
+	if a.kind != atomWord || a.text == "" || maxW <= 0 {
+		return nil
+	}
+	// Paragraph opt-out: w:wordWrap = false disables soft breaks entirely.
+	if !r.paragraphWordWrap {
+		return nil
+	}
+	// w:doNotHyphenateCaps — skip hyphenation when the source word is
+	// entirely uppercase letters.
+	if r.doc != nil && r.doc.Settings.DoNotHyphenateCaps && isAllCapsWord(a.text) {
+		return nil
+	}
+	breaks := hyphenateForLang(a.text, a.props.Lang.Latin)
+	if len(breaks) == 0 {
+		return nil
+	}
+	_ = r.applyFontFamily(a.props, a.fontFamily)
+	// Pick the LARGEST head that fits, so we keep maximal text on the
+	// current line. Word's preference is identical.
+	bestHead, bestTail := "", ""
+	bestHeadW := 0.0
+	for i := len(breaks) - 1; i >= 0; i-- {
+		k := breaks[i]
+		head := a.text[:k] + "-"
+		hw, _ := r.pdf.MeasureTextWidth(head)
+		if hw <= maxW {
+			bestHead = head
+			bestTail = a.text[k:]
+			bestHeadW = hw
+			break
+		}
+	}
+	if bestHead == "" {
+		return nil
+	}
+	tailW, _ := r.pdf.MeasureTextWidth(bestTail)
+	return []atom{
+		{kind: atomWord, text: bestHead, props: a.props, fontFamily: a.fontFamily, width: bestHeadW, linkRID: a.linkRID, linkAnchor: a.linkAnchor},
+		{kind: atomWord, text: bestTail, props: a.props, fontFamily: a.fontFamily, width: tailW, linkRID: a.linkRID, linkAnchor: a.linkAnchor},
+	}
 }
 
 // splitWordAtomByRune breaks a word atom into one atom per rune, each
@@ -1410,26 +1763,35 @@ func (r *renderer) lineBandAdjust(y, baseX, baseW float64) (float64, float64, bo
 	gap := r.floatBand.gapPt
 	leftX, rightX := r.floatBand.leftX, r.floatBand.rightX
 	if len(r.floatBand.polygon) >= 3 {
-		// Scanline 2x: one at the line's top, one at the bottom of the
-		// (approximate) line height. We take the union so a line that
-		// straddles a polygon peak still yields to the widest crossing
-		// instead of slipping past the indent.
+		// Sample the polygon at multiple scanlines spanning the line
+		// height, then take the union of the resulting exclusion boxes.
+		// More samples handle a polygon that bulges in or out across a
+		// line height; the unioned bounds keep text from clipping into
+		// the shape.
 		lineH := r.opts.DefaultFontSize * 1.2
-		l1, r1, hit1 := polygonScanline(r.floatBand.polygon, r.floatBand.polyMinY, r.floatBand.polyMaxY, y)
-		l2, r2, hit2 := polygonScanline(r.floatBand.polygon, r.floatBand.polyMinY, r.floatBand.polyMaxY, y+lineH)
-		switch {
-		case hit1 && hit2:
-			leftX = math.Min(l1, l2)
-			rightX = math.Max(r1, r2)
-		case hit1:
-			leftX, rightX = l1, r1
-		case hit2:
-			leftX, rightX = l2, r2
-		default:
+		const samples = 5
+		minX, maxX := math.Inf(1), math.Inf(-1)
+		hit := false
+		for i := 0; i < samples; i++ {
+			ty := y + lineH*float64(i)/float64(samples-1)
+			l, rg, ok := polygonScanline(r.floatBand.polygon, r.floatBand.polyMinY, r.floatBand.polyMaxY, ty)
+			if !ok {
+				continue
+			}
+			if l < minX {
+				minX = l
+			}
+			if rg > maxX {
+				maxX = rg
+			}
+			hit = true
+		}
+		if !hit {
 			// Line is above or below the polygon's vertical extent:
 			// nothing to exclude. Fall through to baseX/baseW.
 			return baseX, baseW, true
 		}
+		leftX, rightX = minX, maxX
 	}
 	if r.floatBand.side == "left" {
 		newX := rightX + gap
@@ -1709,6 +2071,14 @@ func atomHeight(a atom, defaultSize float64) float64 {
 	switch a.kind {
 	case atomImage, atomVMLShape, atomMath:
 		return a.height
+	case atomEACombine:
+		// Two stacked halves: total height matches a single line at
+		// the run's font size; each half occupies half that height.
+		sz := a.props.FontSize
+		if sz == 0 {
+			sz = defaultSize
+		}
+		return sz * 1.2
 	case atomWord, atomSpace, atomTab:
 		sz := a.props.FontSize
 		if sz == 0 {
@@ -1770,6 +2140,24 @@ func allRTL(s string) bool {
 	return true
 }
 
+// combineBracketChars maps w:combineBrackets values to the (opening,
+// closing) glyph pair. None / empty pair returns "" / "" so the
+// caller renders the bare text. Word's set: round, square, angle,
+// curly. We accept those plus "none".
+func combineBracketChars(kind string) (string, string) {
+	switch kind {
+	case "round":
+		return "(", ")"
+	case "square":
+		return "[", "]"
+	case "angle":
+		return "〈", "〉"
+	case "curly":
+		return "{", "}"
+	}
+	return "", ""
+}
+
 // reverseRunes returns s with its runes in reverse order. Operates on
 // runes (not bytes) so multi-byte characters survive intact.
 func reverseRunes(s string) string {
@@ -1778,4 +2166,29 @@ func reverseRunes(s string) string {
 		rs[i], rs[j] = rs[j], rs[i]
 	}
 	return string(rs)
+}
+
+// drawRunTextBorder paints a w:bdr box around the atom rectangle. Style
+// "none"/"nil"/"" suppress the box. Width falls back to 0.5pt when sz
+// is zero; color defaults to a soft gray so the box reads as a "control"
+// without competing with the glyph.
+func drawRunTextBorder(r *renderer, e docx.BorderEdge, x, y, w, h float64) {
+	if !e.Has() || e.Style == "none" || e.Style == "nil" {
+		return
+	}
+	width := e.Sz
+	if width <= 0 {
+		width = 0.5
+	}
+	if e.Color != "" && e.Color != "auto" {
+		rr, gg, bb := parseHexColor(e.Color)
+		r.pdf.SetStrokeColor(rr, gg, bb)
+	} else {
+		r.pdf.SetStrokeColor(160, 160, 160)
+	}
+	r.pdf.SetLineWidth(width)
+	// Add a 1pt breathing pad so glyphs don't kiss the frame.
+	pad := 1.0
+	r.pdf.Rectangle(x-pad, y-pad, x+w+pad, y+h+pad, "D", 0, 0)
+	r.pdf.SetStrokeColor(0, 0, 0)
 }

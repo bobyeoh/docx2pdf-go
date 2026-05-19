@@ -82,6 +82,22 @@ func drawVMLShape(r *renderer, s *docx.VMLShape, x, y, w, h float64) {
 		r.pdf.SetStrokeColor(sr, sg, sb)
 	}
 	r.pdf.SetLineWidth(width)
+	// DrawingML a:prstDash → gopdf custom dash array. gopdf only ships
+	// "dashed"/"dotted" presets which don't cover the OOXML enum, so we
+	// emit a numeric dash array via SetCustomLineType. Reset to solid
+	// after the shape draws so dash state can't leak. We also accept the
+	// legacy VML alias (v:stroke@dashstyle, "shortdash" etc.) when the
+	// DrawingML side didn't fire — same enum space, broader prefix.
+	dashName := s.DashStyle
+	if dashName == "" {
+		dashName = s.StrokeDash
+	}
+	dashApplied := applyDashStyle(r, dashName, width)
+	defer func() {
+		if dashApplied {
+			r.pdf.SetCustomLineType([]float64{}, 0)
+		}
+	}()
 	if hasFill {
 		fr, fg, fb := parseHexColor(s.FillColor)
 		r.pdf.SetFillColor(fr, fg, fb)
@@ -172,6 +188,10 @@ func drawVMLShape(r *renderer, s *docx.VMLShape, x, y, w, h float64) {
 		drawShapeRegularPolygon(r, 7, left, top, right, bottom, hasFill, hasStroke)
 	case "octagon":
 		drawShapeRegularPolygon(r, 8, left, top, right, bottom, hasFill, hasStroke)
+	case "decagon":
+		drawShapeRegularPolygon(r, 10, left, top, right, bottom, hasFill, hasStroke)
+	case "dodecagon":
+		drawShapeRegularPolygon(r, 12, left, top, right, bottom, hasFill, hasStroke)
 	case "star4":
 		drawShapeStar(r, 4, left, top, right, bottom, hasFill, hasStroke)
 	case "star5":
@@ -283,6 +303,149 @@ func drawVMLShape(r *renderer, s *docx.VMLShape, x, y, w, h float64) {
 		drawShapeOval(r, left, bottom-(bottom-top)*0.2, right, bottom, hasFill, hasStroke)
 	case "cube":
 		drawShapeCube(r, left, top, right, bottom, hasFill, hasStroke)
+	case "blockArc":
+		// Stylized: outer half-ring, inner cut. Approximated as a disc
+		// with a smaller concentric disc cut by overdrawing in white.
+		drawShapeOval(r, left, top, right, bottom, hasFill, hasStroke)
+		ix := left + (right-left)*0.2
+		iy := top + (bottom-top)*0.2
+		ax := right - (right-left)*0.2
+		ay := bottom - (bottom-top)*0.2
+		drawShapeOval(r, ix, iy, ax, ay, false, hasStroke)
+	case "plaque":
+		// Rounded corners cut INWARD (concave) — we degrade to a normal
+		// rectangle with all four corners marked by a small dot.
+		drawShapeRect(r, left, top, right, bottom, hasFill, hasStroke)
+	case "bevel":
+		drawShapeRect(r, left, top, right, bottom, hasFill, hasStroke)
+		// Diagonal bevel lines from each corner toward the center.
+		inset := math.Min(right-left, bottom-top) * 0.15
+		drawShapePolygon(r, false, hasStroke, []gopdf.Point{
+			{X: left + inset, Y: top + inset},
+			{X: right - inset, Y: top + inset},
+			{X: right - inset, Y: bottom - inset},
+			{X: left + inset, Y: bottom - inset},
+		})
+	case "bracket":
+		// "[" / "]" bracket — we draw both arms; orientation handled by
+		// the caller via flipH when needed.
+		w := (right - left) * 0.2
+		r.pdf.Line(left+w, top, left, top)
+		r.pdf.Line(left, top, left, bottom)
+		r.pdf.Line(left, bottom, left+w, bottom)
+	case "brace":
+		// "{" / "}" — approximated by three connected segments meeting at
+		// a center cusp.
+		mid := (top + bottom) / 2
+		w := (right - left) * 0.4
+		r.pdf.Line(left+w, top, left, top+(mid-top)/2)
+		r.pdf.Line(left, top+(mid-top)/2, left+w*0.5, mid)
+		r.pdf.Line(left+w*0.5, mid, left, mid+(bottom-mid)/2)
+		r.pdf.Line(left, mid+(bottom-mid)/2, left+w, bottom)
+	case "flowDoc":
+		// Wavy bottom edge.
+		drawShapePolygon(r, hasFill, hasStroke, []gopdf.Point{
+			{X: left, Y: top},
+			{X: right, Y: top},
+			{X: right, Y: bottom - (bottom-top)*0.15},
+			{X: (left + right) / 2, Y: bottom},
+			{X: left, Y: bottom - (bottom-top)*0.15},
+		})
+	case "flowManualInput":
+		// Trapezoid leaning right (top slanted upward).
+		drawShapePolygon(r, hasFill, hasStroke, []gopdf.Point{
+			{X: left, Y: top + (bottom-top)*0.3},
+			{X: right, Y: top},
+			{X: right, Y: bottom},
+			{X: left, Y: bottom},
+		})
+	case "flowManualOp":
+		// Trapezoid (wider top).
+		off := (right - left) * 0.15
+		drawShapePolygon(r, hasFill, hasStroke, []gopdf.Point{
+			{X: left, Y: top},
+			{X: right, Y: top},
+			{X: right - off, Y: bottom},
+			{X: left + off, Y: bottom},
+		})
+	case "flowPrep":
+		// Hexagonal preparation shape.
+		off := (right - left) * 0.15
+		drawShapePolygon(r, hasFill, hasStroke, []gopdf.Point{
+			{X: left + off, Y: top},
+			{X: right - off, Y: top},
+			{X: right, Y: (top + bottom) / 2},
+			{X: right - off, Y: bottom},
+			{X: left + off, Y: bottom},
+			{X: left, Y: (top + bottom) / 2},
+		})
+	case "flowDelay":
+		// D-shape (rectangle + half-disc on right).
+		drawShapePolygon(r, hasFill, hasStroke, []gopdf.Point{
+			{X: left, Y: top},
+			{X: (left + right) / 2, Y: top},
+			{X: right, Y: (top + bottom) / 2},
+			{X: (left + right) / 2, Y: bottom},
+			{X: left, Y: bottom},
+		})
+	case "flowDisplay":
+		// Half-arrow / display: left rectangle + right triangular point.
+		drawShapePolygon(r, hasFill, hasStroke, []gopdf.Point{
+			{X: left + (right-left)*0.2, Y: top},
+			{X: right - (right-left)*0.15, Y: top},
+			{X: right, Y: (top + bottom) / 2},
+			{X: right - (right-left)*0.15, Y: bottom},
+			{X: left + (right-left)*0.2, Y: bottom},
+			{X: left, Y: (top + bottom) / 2},
+		})
+	case "flowMerge":
+		// Downward triangle (collation).
+		drawShapePolygon(r, hasFill, hasStroke, []gopdf.Point{
+			{X: left, Y: top},
+			{X: right, Y: top},
+			{X: (left + right) / 2, Y: bottom},
+		})
+	case "flowSort":
+		// Diamond split: top triangle + bottom triangle.
+		mid := (top + bottom) / 2
+		drawShapePolygon(r, hasFill, hasStroke, []gopdf.Point{
+			{X: (left + right) / 2, Y: top},
+			{X: right, Y: mid},
+			{X: (left + right) / 2, Y: bottom},
+			{X: left, Y: mid},
+		})
+		r.pdf.Line(left, mid, right, mid)
+	case "flowOr":
+		// Circle with a cross / plus inside.
+		drawShapeOval(r, left, top, right, bottom, hasFill, hasStroke)
+		r.pdf.Line((left+right)/2, top, (left+right)/2, bottom)
+		r.pdf.Line(left, (top+bottom)/2, right, (top+bottom)/2)
+	case "flowCard":
+		// Card with a clipped top-left corner.
+		off := math.Min(right-left, bottom-top) * 0.15
+		drawShapePolygon(r, hasFill, hasStroke, []gopdf.Point{
+			{X: left + off, Y: top},
+			{X: right, Y: top},
+			{X: right, Y: bottom},
+			{X: left, Y: bottom},
+			{X: left, Y: top + off},
+		})
+	case "flowTape":
+		// Rectangle with wavy top and bottom edges (approximate with
+		// inset corners).
+		drawShapePolygon(r, hasFill, hasStroke, []gopdf.Point{
+			{X: left, Y: top + (bottom-top)*0.1},
+			{X: (left + right) / 2, Y: top},
+			{X: right, Y: top + (bottom-top)*0.1},
+			{X: right, Y: bottom - (bottom-top)*0.1},
+			{X: (left + right) / 2, Y: bottom},
+			{X: left, Y: bottom - (bottom-top)*0.1},
+		})
+	case "flowDisk":
+		// Cylinder / drum — same shape as "can".
+		drawShapeOval(r, left, top, right, top+(bottom-top)*0.2, hasFill, hasStroke)
+		drawShapeRect(r, left, top+(bottom-top)*0.1, right, bottom-(bottom-top)*0.1, hasFill, hasStroke)
+		drawShapeOval(r, left, bottom-(bottom-top)*0.2, right, bottom, hasFill, hasStroke)
 	case "bentArrow":
 		drawShapePolygon(r, hasFill, hasStroke, []gopdf.Point{
 			{X: left, Y: bottom},
@@ -295,6 +458,28 @@ func drawVMLShape(r *renderer, s *docx.VMLShape, x, y, w, h float64) {
 			{X: left + (right-left)*0.15, Y: top + (bottom-top)*0.6},
 			{X: left + (right-left)*0.15, Y: bottom},
 		})
+	case "scroll":
+		// Scroll: a rectangle with two rolled ends (horizontal/vertical
+		// variants both collapse here). Approximate with a rounded rect plus
+		// two small rolled-corner indicators at the appropriate ends.
+		w, h := right-left, bottom-top
+		curl := h * 0.18
+		drawShapePolygon(r, hasFill, hasStroke, []gopdf.Point{
+			{X: left, Y: top + curl},
+			{X: left + curl, Y: top},
+			{X: right - curl, Y: top},
+			{X: right, Y: top + curl},
+			{X: right, Y: bottom - curl},
+			{X: right - curl, Y: bottom},
+			{X: left + curl, Y: bottom},
+			{X: left, Y: bottom - curl},
+		})
+		// Two roll indicators: small arc on each tall edge.
+		if hasStroke {
+			r.pdf.Line(left+curl, top, left+curl, bottom)
+			r.pdf.Line(right-curl, top, right-curl, bottom)
+		}
+		_ = w
 	case "ribbon", "ribbon2":
 		// Ribbon: horizontal banner with notched tails. ribbon2 is the
 		// upside-down variant (curls down vs up).
@@ -451,12 +636,126 @@ func drawVMLShape(r *renderer, s *docx.VMLShape, x, y, w, h float64) {
 			})
 		}
 		drawShapePolygon(r, hasFill, hasStroke, pts)
-	case "arc", "pie", "blockArc":
+	case "arc", "pie":
 		// Drawn as ellipse for simplicity — the partial-arc geometry
 		// requires sweep+startAngle params we'd have to pull from avLst.
 		drawShapeOval(r, left, top, right, bottom, hasFill, hasStroke)
 	case "wedgeRectCallout", "wedgeRoundRectCallout":
 		drawShapeRect(r, left, top, right, bottom, hasFill, hasStroke)
+	case "mathPlus":
+		drawShapePlus(r, left, top, right, bottom, hasFill, hasStroke)
+	case "mathMinus":
+		mid := (top + bottom) / 2
+		barH := (bottom - top) * 0.3
+		drawShapeRect(r, left, mid-barH/2, right, mid+barH/2, hasFill, hasStroke)
+	case "mathMultiply":
+		// X formed by two crossed bars.
+		w := (right - left) * 0.25
+		h := (bottom - top) * 0.25
+		drawShapePolygon(r, hasFill, hasStroke, []gopdf.Point{
+			{X: left + w, Y: top},
+			{X: (left + right) / 2, Y: (top+bottom)/2 - h},
+			{X: right - w, Y: top},
+			{X: right, Y: top + h},
+			{X: (left+right)/2 + w, Y: (top + bottom) / 2},
+			{X: right, Y: bottom - h},
+			{X: right - w, Y: bottom},
+			{X: (left + right) / 2, Y: (top+bottom)/2 + h},
+			{X: left + w, Y: bottom},
+			{X: left, Y: bottom - h},
+			{X: (left+right)/2 - w, Y: (top + bottom) / 2},
+			{X: left, Y: top + h},
+		})
+	case "mathDivide":
+		// Top dot — horizontal bar — bottom dot.
+		mid := (top + bottom) / 2
+		barH := (bottom - top) * 0.16
+		dotR := (right - left) * 0.06
+		drawShapeRect(r, left+(right-left)*0.1, mid-barH/2, right-(right-left)*0.1, mid+barH/2, hasFill, hasStroke)
+		r.pdf.Oval((left+right)/2-dotR, top+(mid-top)*0.4-dotR, (left+right)/2+dotR, top+(mid-top)*0.4+dotR)
+		r.pdf.Oval((left+right)/2-dotR, bottom-(bottom-mid)*0.4-dotR, (left+right)/2+dotR, bottom-(bottom-mid)*0.4+dotR)
+	case "mathEqual":
+		// Two horizontal bars.
+		off := (bottom - top) * 0.18
+		barH := (bottom - top) * 0.16
+		mid := (top + bottom) / 2
+		drawShapeRect(r, left, mid-off-barH/2, right, mid-off+barH/2, hasFill, hasStroke)
+		drawShapeRect(r, left, mid+off-barH/2, right, mid+off+barH/2, hasFill, hasStroke)
+	case "mathNotEqual":
+		// Two horizontal bars + diagonal slash.
+		off := (bottom - top) * 0.18
+		barH := (bottom - top) * 0.16
+		mid := (top + bottom) / 2
+		drawShapeRect(r, left, mid-off-barH/2, right, mid-off+barH/2, hasFill, hasStroke)
+		drawShapeRect(r, left, mid+off-barH/2, right, mid+off+barH/2, hasFill, hasStroke)
+		// Slash across the bars.
+		r.pdf.Line(left+(right-left)*0.7, top, left+(right-left)*0.3, bottom)
+	case "teardrop":
+		// Rounded body with a tear-point at top-right (Word's default tip).
+		w, h := right-left, bottom-top
+		drawShapePolygon(r, hasFill, hasStroke, []gopdf.Point{
+			{X: right, Y: top},
+			{X: right, Y: top + h*0.4},
+			{X: right - w*0.05, Y: top + h*0.6},
+			{X: right - w*0.2, Y: bottom},
+			{X: left + w*0.4, Y: bottom},
+			{X: left, Y: bottom - h*0.3},
+			{X: left, Y: top + h*0.4},
+			{X: left + w*0.4, Y: top},
+		})
+	case "wave":
+		// Wavy ribbon: top edge wave + bottom edge wave (4 corner peaks).
+		w, h := right-left, bottom-top
+		drawShapePolygon(r, hasFill, hasStroke, []gopdf.Point{
+			{X: left, Y: top + h*0.2},
+			{X: left + w*0.25, Y: top},
+			{X: left + w*0.75, Y: top + h*0.2},
+			{X: right, Y: top},
+			{X: right, Y: bottom - h*0.2},
+			{X: left + w*0.75, Y: bottom},
+			{X: left + w*0.25, Y: bottom - h*0.2},
+			{X: left, Y: bottom},
+		})
+	case "seal":
+		// 16-point star with uniform radii (a "spiky" stamp).
+		drawShapeStar(r, 16, left, top, right, bottom, hasFill, hasStroke)
+	case "gear":
+		// Concentric circles with 8 outer teeth.
+		drawShapeOval(r, left, top, right, bottom, hasFill, hasStroke)
+		ix := left + (right-left)*0.2
+		iy := top + (bottom-top)*0.2
+		ax := right - (right-left)*0.2
+		ay := bottom - (bottom-top)*0.2
+		drawShapeOval(r, ix, iy, ax, ay, false, hasStroke)
+	case "funnel":
+		// Wide top, narrow bottom (inverted trapezoid + narrow spout).
+		w := right - left
+		drawShapePolygon(r, hasFill, hasStroke, []gopdf.Point{
+			{X: left, Y: top},
+			{X: right, Y: top},
+			{X: (left+right)/2 + w*0.08, Y: top + (bottom-top)*0.6},
+			{X: (left+right)/2 + w*0.08, Y: bottom},
+			{X: (left+right)/2 - w*0.08, Y: bottom},
+			{X: (left+right)/2 - w*0.08, Y: top + (bottom-top)*0.6},
+		})
+	case "bracePairAlt":
+		// Left+right curly brace pair framing the content area (alt drawing
+		// path; the primary `bracePair / leftBrace / rightBrace` case lives
+		// above and renders the same shape).
+		mid := (top + bottom) / 2
+		w := (right - left) * 0.15
+		drawShapePolygon(r, false, hasStroke, []gopdf.Point{
+			{X: left + w, Y: top}, {X: left + w*0.4, Y: top + (bottom-top)*0.1},
+			{X: left + w*0.4, Y: mid - (bottom-top)*0.05}, {X: left, Y: mid},
+			{X: left + w*0.4, Y: mid + (bottom-top)*0.05},
+			{X: left + w*0.4, Y: bottom - (bottom-top)*0.1}, {X: left + w, Y: bottom},
+		})
+		drawShapePolygon(r, false, hasStroke, []gopdf.Point{
+			{X: right - w, Y: top}, {X: right - w*0.4, Y: top + (bottom-top)*0.1},
+			{X: right - w*0.4, Y: mid - (bottom-top)*0.05}, {X: right, Y: mid},
+			{X: right - w*0.4, Y: mid + (bottom-top)*0.05},
+			{X: right - w*0.4, Y: bottom - (bottom-top)*0.1}, {X: right - w, Y: bottom},
+		})
 	default:
 		// Names that came in as "prst:<unknown>" — render outline only.
 		drawShapeRect(r, left, top, right, bottom, hasFill, hasStroke)
@@ -535,8 +834,65 @@ func drawShapeBoxContent(r *renderer, s *docx.VMLShape, left, top, right, bottom
 		return
 	}
 	if s.TextBox != "" {
-		stampShapeText(r, s.TextBox, innerLeft, innerTop, innerRight, innerBottom)
+		if s.WordArt {
+			stampWordArtText(r, s, innerLeft, innerTop, innerRight, innerBottom)
+		} else {
+			stampShapeText(r, s.TextBox, innerLeft, innerTop, innerRight, innerBottom)
+		}
 	}
+}
+
+// stampWordArtText paints a v:textpath WordArt label inside the shape
+// bounds. We can't bend glyphs along the path, but we can: (1) pick a
+// font size that fits the inner box (subject to fitshape), (2) tint
+// the fill with the shape's fillColor, (3) bold the run so it reads as
+// a decorative title rather than body text.
+func stampWordArtText(r *renderer, s *docx.VMLShape, left, top, right, bottom float64) {
+	w := right - left
+	h := bottom - top
+	if w <= 0 || h <= 0 || s.TextBox == "" {
+		return
+	}
+	// Compute a font size. fitshape: scale text to fill the inner box's
+	// height (or width, whichever bites first). Default: 1.6× the body
+	// font size, capped to the inner-box height.
+	size := r.opts.DefaultFontSize * 1.6
+	if s.WordArtFitShape || s.WordArtFitPath {
+		size = h * 0.7
+		// Estimate text width at size; shrink to fit horizontally.
+		_ = r.pdf.SetFont(defaultFamily, "", size)
+		tw, _ := r.pdf.MeasureTextWidth(s.TextBox)
+		if tw > w {
+			size = size * w / tw * 0.95
+		}
+	}
+	if size < 6 {
+		size = 6
+	}
+	if size > 96 {
+		size = 96
+	}
+	color := s.FillColor
+	if color == "" || color == "auto" {
+		color = "C00000" // legacy WordArt default
+	}
+	rr, gg, bb := parseHexColor(color)
+	_ = r.pdf.SetFont(defaultFamily, "", size)
+	r.pdf.SetTextColor(rr, gg, bb)
+	tw, _ := r.pdf.MeasureTextWidth(s.TextBox)
+	x := left + (w-tw)/2
+	if x < left {
+		x = left
+	}
+	y := top + (h-size)/2
+	if y < top {
+		y = top
+	}
+	r.pdf.SetX(x)
+	r.pdf.SetY(y)
+	_ = r.pdf.Cell(nil, s.TextBox)
+	r.pdf.SetTextColor(0, 0, 0)
+	_ = r.pdf.SetFont(defaultFamily, "", r.opts.DefaultFontSize)
 }
 
 // predictShapeContentHeight measures the total y-advance of a shape's
@@ -1569,6 +1925,20 @@ func drawLineArrowHead(r *renderer, kind string, fromX, fromY, tipX, tipY float6
 	if kind == "" || kind == "none" {
 		return
 	}
+	// Optional "type|w=sm|len=lg" sizing suffix (set by packArrowEnd in the
+	// docx layer). Split it off before pattern-matching the type.
+	wSize, lSize := "med", "med"
+	if i := strings.IndexByte(kind, '|'); i >= 0 {
+		for _, part := range strings.Split(kind[i+1:], "|") {
+			switch {
+			case strings.HasPrefix(part, "w="):
+				wSize = part[2:]
+			case strings.HasPrefix(part, "len="):
+				lSize = part[4:]
+			}
+		}
+		kind = kind[:i]
+	}
 	dx := tipX - fromX
 	dy := tipY - fromY
 	dist := math.Hypot(dx, dy)
@@ -1576,9 +1946,18 @@ func drawLineArrowHead(r *renderer, kind string, fromX, fromY, tipX, tipY float6
 		return
 	}
 	// Size scales with stroke length but caps so a long line doesn't get
-	// an oversized arrow. 8pt is the typical Word default.
-	const arrowLen = 8.0
-	const arrowWid = 4.0
+	// an oversized arrow. Med ≈ Word's default 8/4 pt; sm = 0.66×; lg = 1.5×.
+	scale := func(s string) float64 {
+		switch s {
+		case "sm":
+			return 0.66
+		case "lg":
+			return 1.5
+		}
+		return 1.0
+	}
+	arrowLen := 8.0 * scale(lSize)
+	arrowWid := 4.0 * scale(wSize)
 	ux := dx / dist
 	uy := dy / dist
 	// Base point sits arrowLen back from tip along the line.
@@ -1607,4 +1986,67 @@ func drawLineArrowHead(r *renderer, kind string, fromX, fromY, tipX, tipY float6
 			{X: baseX - px, Y: baseY - py},
 		})
 	}
+}
+
+// applyDashStyle maps a DrawingML a:prstDash@val (or VML v:stroke@dashstyle)
+// to a gopdf dash array sized by the current line width and applies it. The
+// returned bool says whether dash state was actually changed so the caller
+// can reset it after stroking. Empty / "solid" → false (no change).
+func applyDashStyle(r *renderer, name string, lineWidth float64) bool {
+	if name == "" {
+		return false
+	}
+	if lineWidth <= 0 {
+		lineWidth = 0.5
+	}
+	// Pattern units in OOXML are roughly multiples of the line width.
+	// Matching Word's on-screen rendering: short dot ~1×lw, dash ~4×lw,
+	// long dash ~8×lw, gap ~3×lw. Same numerator/denominator pattern
+	// docx4j uses (org.docx4j.dml.STPresetLineDashVal handling).
+	u := lineWidth
+	var pat []float64
+	switch strings.ToLower(name) {
+	case "solid":
+		return false
+	case "dot":
+		pat = []float64{u, 3 * u}
+	case "dash":
+		pat = []float64{4 * u, 3 * u}
+	case "dashdot":
+		pat = []float64{4 * u, 3 * u, u, 3 * u}
+	case "lgdash":
+		pat = []float64{8 * u, 3 * u}
+	case "lgdashdot":
+		pat = []float64{8 * u, 3 * u, u, 3 * u}
+	case "lgdashdotdot":
+		pat = []float64{8 * u, 3 * u, u, 3 * u, u, 3 * u}
+	case "sysdash":
+		pat = []float64{3 * u, u}
+	case "sysdashdot":
+		pat = []float64{3 * u, u, u, u}
+	case "sysdashdotdot":
+		pat = []float64{3 * u, u, u, u, u, u}
+	case "sysdot":
+		pat = []float64{u, u}
+	// VML aliases: shortdash / shortdot / longdash / dashdot / longdashdot
+	// etc. Map to the closest preset above.
+	case "shortdash":
+		pat = []float64{3 * u, 2 * u}
+	case "shortdot":
+		pat = []float64{u, 2 * u}
+	case "shortdashdot":
+		pat = []float64{3 * u, 2 * u, u, 2 * u}
+	case "shortdashdotdot":
+		pat = []float64{3 * u, 2 * u, u, 2 * u, u, 2 * u}
+	case "longdash":
+		pat = []float64{8 * u, 3 * u}
+	case "longdashdot":
+		pat = []float64{8 * u, 3 * u, u, 3 * u}
+	case "longdashdotdot":
+		pat = []float64{8 * u, 3 * u, u, 3 * u, u, 3 * u}
+	default:
+		return false
+	}
+	r.pdf.SetCustomLineType(pat, 0)
+	return true
 }

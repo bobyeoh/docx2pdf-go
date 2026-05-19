@@ -242,26 +242,52 @@ func matchingConditions(look docx.TableLook, ri, ci, nRows, nCols, rowBand, colB
 // per-cell value WINS when present, otherwise inherit the table default.
 func applyDefaultCellMargins(t *docx.Table) {
 	dm := t.DefaultCellMargins
-	if dm.Top == 0 && dm.Bottom == 0 && dm.Left == 0 && dm.Right == 0 {
-		return
-	}
 	for ri := range t.Rows {
+		// Per-row exception (w:tblPrEx/w:tblCellMar) wins over the
+		// table default for THIS row's cells per ECMA-376 §17.4.39.
+		// We fold it cell-by-cell so each cell still sees its own
+		// w:tcMar take precedence; absent tcMar but present tblPrEx
+		// → tblPrEx; absent both → tblPr default.
+		rdm := dm
+		if t.Rows[ri].TblPrEx != nil && t.Rows[ri].TblPrEx.HasCellMargins {
+			ex := t.Rows[ri].TblPrEx.CellMargins
+			rdm = CellMargins{
+				Top:    pickMargin(ex.Top, dm.Top),
+				Bottom: pickMargin(ex.Bottom, dm.Bottom),
+				Left:   pickMargin(ex.Left, dm.Left),
+				Right:  pickMargin(ex.Right, dm.Right),
+			}
+		}
+		if rdm.Top == 0 && rdm.Bottom == 0 && rdm.Left == 0 && rdm.Right == 0 {
+			continue
+		}
 		for ci := range t.Rows[ri].Cells {
 			c := &t.Rows[ri].Cells[ci]
 			if c.MarginTopPt == 0 {
-				c.MarginTopPt = dm.Top
+				c.MarginTopPt = rdm.Top
 			}
 			if c.MarginBottomPt == 0 {
-				c.MarginBottomPt = dm.Bottom
+				c.MarginBottomPt = rdm.Bottom
 			}
 			if c.MarginLeftPt == 0 {
-				c.MarginLeftPt = dm.Left
+				c.MarginLeftPt = rdm.Left
 			}
 			if c.MarginRightPt == 0 {
-				c.MarginRightPt = dm.Right
+				c.MarginRightPt = rdm.Right
 			}
 		}
 	}
+}
+
+// CellMargins is locally aliased here so applyDefaultCellMargins can
+// build a per-row merged struct without re-importing docx.
+type CellMargins = docx.CellMargins
+
+func pickMargin(override, base float64) float64 {
+	if override != 0 {
+		return override
+	}
+	return base
 }
 
 func (r *renderer) drawTable(t docx.Table) error {
@@ -273,8 +299,12 @@ func (r *renderer) drawTable(t docx.Table) error {
 	var tblBarTop float64
 	if r.opts.ShowRevisions && tableHasRevision(t) {
 		tblBarTop = r.cursorY
+		letter, pc := firstTablePrChange(t)
 		defer func() {
 			r.drawRevisionChangeBar(tblBarTop, r.cursorY)
+			if pc != nil {
+				r.drawPrChangeBadge(letter, pc, tblBarTop)
+			}
 		}()
 	}
 	cols := 0
@@ -345,9 +375,9 @@ func (r *renderer) drawTable(t docx.Table) error {
 	}
 
 	// Floating table (tblpPr): honor X position via XAlign/XTwips, and Y
-	// via YAlign/YTwips relative to vAnchor. Real text-wrap (other content
-	// flowing around the table) needs per-line clipping which we don't yet
-	// emit — at least the table now lands at the requested Y.
+	// via YAlign/YTwips relative to vAnchor. After the table renders, we
+	// register a floatBand spanning the table's bbox so subsequent
+	// paragraphs flow around the float via lineBandAdjust.
 	if t.FloatPos != nil {
 		fp := t.FloatPos
 		sum := 0.0
@@ -659,8 +689,176 @@ func (r *renderer) resolveColumnWidths(t docx.Table, cols int) []float64 {
 		// narrow ones. This is the most visible piece of "true autofit"
 		// the user can ask for without breaking fixed-grid templates.
 		r.distributeAutofitSlack(t, widths)
+		// Two-pass content-aware autofit: when the table doesn't have a
+		// pinned width and the grid is flexible, compute per-column
+		// content-min and content-max and run Word's standard layout
+		// algorithm. The result is column widths that grow shorter
+		// columns just enough to avoid wrapping and shrink longer ones
+		// proportionally — the classic HTML "fluid table" behavior.
+		if t.TableWidthType == "" || t.TableWidthType == "auto" {
+			r.twoPassTableAutofit(t, widths)
+		}
 	}
 	return widths
+}
+
+// twoPassTableAutofit applies a content-min/content-max layout pass.
+//
+// Algorithm:
+//
+//	min_i  = widest single unbreakable atom in column i across rows
+//	max_i  = full single-line width of the widest paragraph in column i
+//	W      = available table width = sum(widths) (typically r.contentW)
+//
+//	if sum(max) <= W: use max_i for each column (no wrapping needed)
+//	if sum(min) >= W: use min_i for each column (cannot avoid wrapping)
+//	else:
+//	  w_i = min_i + (max_i - min_i) * (W - sum(min)) / (sum(max) - sum(min))
+//
+// Operates in-place on widths. Skipped when minimums alone overflow the
+// available width — distributeAutofitSlack already handles the
+// "everything too wide" case more conservatively.
+func (r *renderer) twoPassTableAutofit(t docx.Table, widths []float64) {
+	if len(t.Rows) == 0 || len(widths) < 2 {
+		return
+	}
+	// Skip two-pass autofit when any cell contains nested tables or
+	// images — the atom-only measure underestimates those, and the
+	// resulting scale would over-shrink the carrying column.
+	for _, row := range t.Rows {
+		for _, cell := range row.Cells {
+			if cellHasNonAtomContent(cell) {
+				return
+			}
+		}
+	}
+	mins := make([]float64, len(widths))
+	maxs := make([]float64, len(widths))
+	for _, row := range t.Rows {
+		col := 0
+		for _, cell := range row.Cells {
+			if col >= len(widths) {
+				break
+			}
+			span := cell.GridSpan
+			if span < 1 {
+				span = 1
+			}
+			if span == 1 && cell.VMerge != "continue" {
+				cmin, cmax := r.cellMinMaxWidth(cell)
+				if cmin > mins[col] {
+					mins[col] = cmin
+				}
+				if cmax > maxs[col] {
+					maxs[col] = cmax
+				}
+			}
+			col += span
+		}
+	}
+	W := 0.0
+	for _, w := range widths {
+		W += w
+	}
+	if W <= 0 {
+		return
+	}
+	sumMin, sumMax := 0.0, 0.0
+	for i := range widths {
+		if maxs[i] < mins[i] {
+			maxs[i] = mins[i]
+		}
+		sumMin += mins[i]
+		sumMax += maxs[i]
+	}
+	if sumMax <= W && sumMax > 0 {
+		// Everything fits without wrapping: allocate max_i and
+		// proportionally redistribute the remaining slack.
+		for i := range widths {
+			widths[i] = maxs[i]
+		}
+		slack := W - sumMax
+		if slack > 0 && sumMax > 0 {
+			for i := range widths {
+				widths[i] += slack * (maxs[i] / sumMax)
+			}
+		}
+		return
+	}
+	if sumMin >= W {
+		// Cannot avoid wrapping; allocate min_i and scale to fit W.
+		if sumMin <= 0 {
+			return
+		}
+		scale := W / sumMin
+		for i := range widths {
+			widths[i] = mins[i] * scale
+		}
+		return
+	}
+	// Linear interpolation between min and max.
+	denom := sumMax - sumMin
+	if denom <= 0 {
+		return
+	}
+	frac := (W - sumMin) / denom
+	for i := range widths {
+		widths[i] = mins[i] + (maxs[i]-mins[i])*frac
+	}
+}
+
+// cellHasNonAtomContent reports whether any block inside cell is a
+// nested table or anything else the paragraph-atom measure cannot see.
+// Used by twoPassTableAutofit to bail out of column-width interpolation
+// for cells whose content extends beyond plain runs.
+func cellHasNonAtomContent(cell docx.TableCell) bool {
+	for _, b := range cell.Blocks {
+		switch v := b.(type) {
+		case docx.Table:
+			return true
+		case docx.Paragraph:
+			for _, r := range v.Runs {
+				if r.ImageID != "" || r.ChartID != "" {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// cellMinMaxWidth returns (min, max) for one cell:
+//
+//	min = widest single unbreakable atom (or single-line width when noWrap)
+//	max = full single-line width of the widest paragraph
+//
+// Both include the standard 8pt cell-margin padding.
+func (r *renderer) cellMinMaxWidth(cell docx.TableCell) (float64, float64) {
+	savedFootnotes := r.pendingFootnotes
+	defer func() { r.pendingFootnotes = savedFootnotes }()
+	cmin := 0.0
+	cmax := 0.0
+	for _, p := range cell.Paragraphs() {
+		atoms := r.runsToAtoms(p.Runs)
+		lineW := 0.0
+		for _, a := range atoms {
+			if a.kind == atomWord {
+				if a.width > cmin {
+					cmin = a.width
+				}
+				lineW += a.width
+			} else if a.kind == atomSpace {
+				lineW += a.width
+			}
+		}
+		if cell.NoWrap && lineW > cmin {
+			cmin = lineW
+		}
+		if lineW > cmax {
+			cmax = lineW
+		}
+	}
+	return cmin + 8, cmax + 8
 }
 
 // distributeAutofitSlack walks the table's first row, measures each
