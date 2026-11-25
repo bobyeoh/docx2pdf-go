@@ -10,7 +10,10 @@ import (
 )
 
 func drawVMLShape(r *renderer, s *docx.VMLShape, x, y, w, h float64) {
-	if w <= 0 || h <= 0 {
+	if w < 0 || h < 0 || (w == 0 && h == 0) {
+		return
+	}
+	if s.Kind != "line" && (w == 0 || h == 0) {
 		return
 	}
 	// Apply rotation around the shape's center. gopdf.Rotate / RotateReset

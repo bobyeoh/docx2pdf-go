@@ -37,8 +37,7 @@ func (r *renderer) drawParagraph(p docx.Paragraph) error {
 		return nil
 	}
 	if p.PageBreak {
-		r.pdf.AddPage()
-		r.cursorY = r.marT
+		r.newPage()
 	}
 	// RTL paragraph state: drives rune-reversal inside RTL word atoms and
 	// line-internal atom reversal at flush time. Set before runsToAtoms so
