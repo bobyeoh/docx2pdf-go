@@ -710,14 +710,15 @@ type NoteConfig struct {
 // `basedOn` chains are resolved at load time so consumers never have to walk
 // the inheritance graph themselves.
 type ParagraphStyle struct {
-	ID            string
-	BasedOn       string
-	Run           RunProps
-	Alignment     Alignment
-	HasAlignment  bool // discriminates AlignLeft default from explicit-left
-	SpacingBefore float64
-	SpacingAfter  float64
-	LineHeight    LineHeight
+	ID                                string
+	BasedOn                           string
+	Run                               RunProps
+	Alignment                         Alignment
+	HasAlignment                      bool // discriminates AlignLeft default from explicit-left
+	SpacingBefore                     float64
+	SpacingAfter                      float64
+	HasSpacingBefore, HasSpacingAfter bool // A style can explicitly clear inherited spacing.
+	LineHeight                        LineHeight
 	// LinkedCharStyle is w:link — when a paragraph style is "linked" to a
 	// character style, applying the paragraph style should auto-apply the
 	// linked character style to every run that doesn't otherwise override.
@@ -1767,9 +1768,11 @@ type PermissionRange struct {
 	Editor      string // w:ed
 }
 
-// CellMargins in points.
+// CellMargins stores margins in points, with presence tracked per side so
+// zero can clear an inherited margin.
 type CellMargins struct {
-	Top, Bottom, Left, Right float64
+	Top, Bottom, Left, Right             float64
+	HasTop, HasBottom, HasLeft, HasRight bool
 }
 
 // TableFloatPos captures w:tblpPr — anchor coordinates and text-wrap
@@ -1926,10 +1929,10 @@ type TableCell struct {
 	CellWidthTwips int
 	// Borders, when set, override the default thin black per-edge borders.
 	Borders CellBorders
-	// Margins (w:tcMar) in points, defaulting to {Top: 0, Bottom: 0, Left: 4, Right: 4}
-	// when zero. We only honor symmetric defaults; per-cell overrides take
-	// precedence.
-	MarginTopPt, MarginBottomPt, MarginLeftPt, MarginRightPt float64
+	// Margins (w:tcMar) in points. An absent side inherits the row or
+	// table default. Set the corresponding HasMargin field for an explicit zero.
+	MarginTopPt, MarginBottomPt, MarginLeftPt, MarginRightPt     float64
+	HasMarginTop, HasMarginBottom, HasMarginLeft, HasMarginRight bool
 
 	// SuppressBottomBorder is set by the renderer's vMerge resolver when
 	// this cell's bottom edge falls inside a vertical-merge group (i.e.

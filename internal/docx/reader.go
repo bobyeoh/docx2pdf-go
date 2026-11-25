@@ -1990,11 +1990,13 @@ func parseStyles(f *zip.File, doc *Document) error {
 				if v := xs.PPr.Spacing.Before; v != "" {
 					if x, err := strconv.Atoi(v); err == nil {
 						ps.SpacingBefore = float64(x) / 20.0
+						ps.HasSpacingBefore = true
 					}
 				}
 				if v := xs.PPr.Spacing.After; v != "" {
 					if x, err := strconv.Atoi(v); err == nil {
 						ps.SpacingAfter = float64(x) / 20.0
+						ps.HasSpacingAfter = true
 					}
 				}
 				if v := xs.PPr.Spacing.Line; v != "" {
@@ -2044,7 +2046,7 @@ func parseStyles(f *zip.File, doc *Document) error {
 
 // mergeStyles overlays child on top of parent. A field on child wins iff it
 // is "set" — for RunProps that's the same OR-merge rPrToProps already does;
-// for paragraph-level fields we use zero/HasAlignment discriminators.
+// paragraph-level properties with meaningful zero values carry presence flags.
 func mergeStyles(parent, child ParagraphStyle) ParagraphStyle {
 	out := parent
 	out.ID = child.ID
@@ -2054,11 +2056,13 @@ func mergeStyles(parent, child ParagraphStyle) ParagraphStyle {
 		out.Alignment = child.Alignment
 		out.HasAlignment = true
 	}
-	if child.SpacingBefore != 0 {
+	if child.HasSpacingBefore || child.SpacingBefore != 0 {
 		out.SpacingBefore = child.SpacingBefore
+		out.HasSpacingBefore = true
 	}
-	if child.SpacingAfter != 0 {
+	if child.HasSpacingAfter || child.SpacingAfter != 0 {
 		out.SpacingAfter = child.SpacingAfter
+		out.HasSpacingAfter = true
 	}
 	if child.LineHeight.Rule != "" {
 		out.LineHeight = child.LineHeight
@@ -4066,10 +4070,10 @@ func decodePPr(dec *xml.Decoder, start xml.StartElement, p *Paragraph, paraRPr *
 						if st.HasAlignment {
 							p.Alignment = st.Alignment
 						}
-						if st.SpacingBefore != 0 {
+						if st.HasSpacingBefore || st.SpacingBefore != 0 {
 							p.SpacingBefore = st.SpacingBefore
 						}
-						if st.SpacingAfter != 0 {
+						if st.HasSpacingAfter || st.SpacingAfter != 0 {
 							p.SpacingAfter = st.SpacingAfter
 						}
 						if st.LineHeight.Rule != "" {
@@ -7568,7 +7572,7 @@ func decodeTblPr(dec *xml.Decoder, start xml.StartElement, tbl *Table) error {
 				fp.BottomFromTextTwips = parseInt("bottomFromText")
 				tbl.FloatPos = fp
 			case "tblCellMar":
-				if err := decodeTblCellMar(dec, t, &tbl.DefaultCellMargins); err != nil {
+				if err := decodeCellMargins(dec, t, &tbl.DefaultCellMargins); err != nil {
 					return err
 				}
 				continue
@@ -7644,8 +7648,8 @@ func decodeTblPr(dec *xml.Decoder, start xml.StartElement, tbl *Table) error {
 	}
 }
 
-// decodeTblCellMar reads w:tblCellMar — table-default cell margins.
-func decodeTblCellMar(dec *xml.Decoder, start xml.StartElement, m *CellMargins) error {
+// decodeCellMargins reads margins shared by table defaults, row exceptions and individual cells.
+func decodeCellMargins(dec *xml.Decoder, start xml.StartElement, m *CellMargins) error {
 	for {
 		tok, err := dec.Token()
 		if err != nil {
@@ -7653,23 +7657,26 @@ func decodeTblCellMar(dec *xml.Decoder, start xml.StartElement, m *CellMargins) 
 		}
 		switch t := tok.(type) {
 		case xml.StartElement:
-			pt := 0.0
-			if v := attr(t, "w"); v != "" {
-				if x, err := strconv.Atoi(v); err == nil {
-					pt = float64(x) / 20.0
+			twips, err := strconv.Atoi(attr(t, "w"))
+			if attr(t, "type") == "nil" {
+				twips, err = 0, nil
+			}
+			if err == nil {
+				pt := float64(twips) / 20
+				switch t.Name.Local {
+				case "top":
+					m.Top, m.HasTop = pt, true
+				case "bottom":
+					m.Bottom, m.HasBottom = pt, true
+				case "left", "start":
+					m.Left, m.HasLeft = pt, true
+				case "right", "end":
+					m.Right, m.HasRight = pt, true
 				}
 			}
-			switch t.Name.Local {
-			case "top":
-				m.Top = pt
-			case "bottom":
-				m.Bottom = pt
-			case "left", "start":
-				m.Left = pt
-			case "right", "end":
-				m.Right = pt
+			if err := dec.Skip(); err != nil {
+				return err
 			}
-			_ = dec.Skip()
 		case xml.EndElement:
 			if t.Name.Local == start.Name.Local {
 				return nil
@@ -7774,7 +7781,7 @@ func decodeTblPrEx(dec *xml.Decoder, start xml.StartElement) (*TblPrEx, error) {
 				ex.HasBorders = true
 				continue
 			case "tblCellMar":
-				if err := decodeTblCellMar(dec, t, &ex.CellMargins); err != nil {
+				if err := decodeCellMargins(dec, t, &ex.CellMargins); err != nil {
 					return ex, err
 				}
 				ex.HasCellMargins = true
@@ -8192,35 +8199,18 @@ func decodePgBorders(dec *xml.Decoder, start xml.StartElement, b *PageBorders) e
 
 // decodeTcMar reads per-cell margin overrides into the cell.
 func decodeTcMar(dec *xml.Decoder, start xml.StartElement, cell *TableCell) error {
-	for {
-		tok, err := dec.Token()
-		if err != nil {
-			return err
-		}
-		switch t := tok.(type) {
-		case xml.StartElement:
-			v := attr(t, "w")
-			pt := 0.0
-			if x, err := strconv.Atoi(v); err == nil {
-				pt = float64(x) / 20.0
-			}
-			switch t.Name.Local {
-			case "top":
-				cell.MarginTopPt = pt
-			case "bottom":
-				cell.MarginBottomPt = pt
-			case "left", "start":
-				cell.MarginLeftPt = pt
-			case "right", "end":
-				cell.MarginRightPt = pt
-			}
-			_ = dec.Skip()
-		case xml.EndElement:
-			if t.Name.Local == start.Name.Local {
-				return nil
-			}
-		}
+	margins := CellMargins{
+		Top: cell.MarginTopPt, Bottom: cell.MarginBottomPt, Left: cell.MarginLeftPt, Right: cell.MarginRightPt,
+		HasTop: cell.HasMarginTop, HasBottom: cell.HasMarginBottom, HasLeft: cell.HasMarginLeft, HasRight: cell.HasMarginRight,
 	}
+	if err := decodeCellMargins(dec, start, &margins); err != nil {
+		return err
+	}
+	cell.MarginTopPt, cell.MarginBottomPt = margins.Top, margins.Bottom
+	cell.MarginLeftPt, cell.MarginRightPt = margins.Left, margins.Right
+	cell.HasMarginTop, cell.HasMarginBottom = margins.HasTop, margins.HasBottom
+	cell.HasMarginLeft, cell.HasMarginRight = margins.HasLeft, margins.HasRight
+	return nil
 }
 
 // decodeCellBorders reads tcBorders { top | bottom | left | right } children.

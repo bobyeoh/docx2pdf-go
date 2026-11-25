@@ -250,48 +250,20 @@ func (r *renderer) measureParagraph(p docx.Paragraph) float64 {
 
 // measureTable estimates a table's rendered height.
 func (r *renderer) measureTable(t docx.Table) float64 {
+	r.resolveHMerge(&t)
+	applyDefaultCellMargins(&t)
+	savedTableSpacing := r.activeTableSpacing
+	r.activeTableSpacing = t.CellSpacingTwips
+	defer func() { r.activeTableSpacing = savedTableSpacing }()
 	cols := 0
 	for _, row := range t.Rows {
-		if len(row.Cells) > cols {
-			cols = len(row.Cells)
-		}
+		cols = max(cols, len(row.Cells))
 	}
 	if cols == 0 {
 		return 0
 	}
 	widths := r.resolveColumnWidths(t, cols)
-	total := 0.0
-	for _, row := range t.Rows {
-		rowH := 0.0
-		col := 0
-		for _, cell := range row.Cells {
-			if col >= len(widths) {
-				break
-			}
-			span := cell.GridSpan
-			if span < 1 {
-				span = 1
-			}
-			w := sumWidths(widths, col, span)
-			if cell.VMerge != "continue" {
-				if ch := r.measureCell(cell, w); ch > rowH {
-					rowH = ch
-				}
-			}
-			col += span
-		}
-		if rowH < r.opts.DefaultFontSize*1.4 {
-			rowH = r.opts.DefaultFontSize * 1.4
-		}
-		if row.HeightTwips > 0 {
-			minH := float64(row.HeightTwips) / 20.0
-			if row.HeightRuleExact || minH > rowH {
-				rowH = minH
-			}
-		}
-		total += rowH
-	}
-	return total
+	return r.predictTableHeight(t, widths)
 }
 
 // drawAt runs the block-level drawing pipeline against a transient region
