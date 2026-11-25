@@ -2111,8 +2111,10 @@ func MergeRunProps(parent, child RunProps) RunProps {
 	if child.FontFamily != "" {
 		out.FontFamily = child.FontFamily
 	}
-	if child.Color != "" {
-		out.Color = child.Color
+	// A run color replaces the entire inherited declaration, including its theme transforms.
+	if child.Color != "" || child.ThemeColor != "" {
+		out.Color, out.ThemeColor = child.Color, child.ThemeColor
+		out.LumMod, out.LumOff = child.LumMod, child.LumOff
 	}
 	if child.Highlight != "" {
 		out.Highlight = child.Highlight
@@ -2134,9 +2136,6 @@ func MergeRunProps(parent, child RunProps) RunProps {
 	}
 	if child.CharacterScale != 0 {
 		out.CharacterScale = child.CharacterScale
-	}
-	if child.ThemeColor != "" {
-		out.ThemeColor = child.ThemeColor
 	}
 	if child.ThemeFontRole != "" {
 		out.ThemeFontRole = child.ThemeFontRole
@@ -3226,12 +3225,12 @@ func rPrToProps(r xmlRPr, base RunProps) RunProps {
 			p.FontSize = hp / 2 // half-points → points
 		}
 	}
-	if r.Color != nil {
-		if r.Color.Val != "" && r.Color.Val != "auto" {
-			p.Color = r.Color.Val
-		}
-		if r.Color.ThemeColor != "" {
-			p.ThemeColor = r.Color.ThemeColor
+	if r.Color != nil && (r.Color.Val != "" || r.Color.ThemeColor != "") {
+		// Keep explicit automatic color so a run can reset its inherited color.
+		p.Color, p.ThemeColor = r.Color.Val, r.Color.ThemeColor
+		p.LumMod, p.LumOff = 0, 0
+		if p.Color == "auto" && p.ThemeColor != "" {
+			p.Color = ""
 		}
 		if r.Color.ThemeShade != "" {
 			if v, err := strconv.ParseUint(r.Color.ThemeShade, 16, 8); err == nil {
