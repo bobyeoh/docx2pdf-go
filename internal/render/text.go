@@ -715,6 +715,19 @@ func (r *renderer) runsToAtoms(runs []docx.Run) []atom {
 	return out
 }
 
+func (r *renderer) addInternalLink(anchor string, x, y, width, height float64) {
+	if r.opts.skipWrite {
+		return
+	}
+	if !r.linkTargets[anchor] {
+		if r.forwardAnchors != nil && !r.forwardAnchors[anchor] {
+			return
+		}
+		r.linkTargets[anchor] = false
+	}
+	r.pdf.AddInternalLink(anchor, x, y, width, height)
+}
+
 func (r *renderer) resolveURL(rid string) string {
 	if rid == "" {
 		return ""
@@ -1070,7 +1083,7 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 					r.pdf.AddExternalLink(url, cx, topY, a.width, h)
 				} else if a.linkAnchor != "" {
 					h := fontAscent(a.props, r.opts.DefaultFontSize) * 1.1
-					r.pdf.AddInternalLink(a.linkAnchor, cx, topY, a.width, h)
+					r.addInternalLink(a.linkAnchor, cx, topY, a.width, h)
 				}
 				if a.props.Em != "" && a.text != "" {
 					drawEmphasisMark(r, a, cx, baseline)
@@ -1155,6 +1168,7 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 				r.pdf.SetX(cx)
 				r.pdf.SetY(baseline - r.opts.DefaultFontSize*0.8)
 				r.pdf.SetAnchor(a.text)
+				r.linkTargets[a.text] = true
 				if r.fields.bookmarkPages != nil {
 					r.fields.bookmarkPages[a.text] = r.pdf.GetNumberOfPages()
 				}
@@ -1196,7 +1210,7 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 				if url := r.resolveURL(a.linkRID); url != "" {
 					r.pdf.AddExternalLink(url, imgX, r.cursorY, a.width, a.height)
 				} else if a.linkAnchor != "" {
-					r.pdf.AddInternalLink(a.linkAnchor, imgX, r.cursorY, a.width, a.height)
+					r.addInternalLink(a.linkAnchor, imgX, r.cursorY, a.width, a.height)
 				}
 				if a.anchored {
 					// Anchored image — don't advance the inline cursor.
@@ -1212,7 +1226,7 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 				if url := r.resolveURL(a.linkRID); url != "" {
 					r.pdf.AddExternalLink(url, cx, r.cursorY, a.width, a.height)
 				} else if a.linkAnchor != "" {
-					r.pdf.AddInternalLink(a.linkAnchor, cx, r.cursorY, a.width, a.height)
+					r.addInternalLink(a.linkAnchor, cx, r.cursorY, a.width, a.height)
 				}
 				cx += a.width
 			case atomMath:

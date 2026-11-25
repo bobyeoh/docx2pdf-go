@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"image"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"time"
@@ -176,6 +177,10 @@ func Render(doc *docx.Document, outPath string, opts Options) error {
 
 // RenderWriter is the streaming variant — writes the produced PDF to w.
 func RenderWriter(doc *docx.Document, w io.Writer, opts Options) error {
+	return renderWriter(doc, w, opts, nil)
+}
+
+func renderWriter(doc *docx.Document, w io.Writer, opts Options, forwardAnchors map[string]bool) error {
 	// Two-pass layout for PAGEREF forward-references. When the doc has any
 	// PAGEREF field and we're not already running the second pass, do a
 	// throwaway render first to populate bookmark→page mapping, then run
@@ -188,7 +193,7 @@ func RenderWriter(doc *docx.Document, w io.Writer, opts Options) error {
 		seedOpts.OnProgress = nil
 		seedOpts.Logger = nil
 		var discard bytes.Buffer
-		if err := RenderWriter(doc, &discard, seedOpts); err != nil {
+		if err := renderWriter(doc, &discard, seedOpts, nil); err != nil {
 			return err
 		}
 		opts.prepopulatedBookmarkPages = seed
@@ -366,6 +371,9 @@ func RenderWriter(doc *docx.Document, w io.Writer, opts Options) error {
 		opts:     opts,
 		fonts:    map[string]bool{},
 		counters: map[int]map[int]int{},
+
+		linkTargets:    map[string]bool{},
+		forwardAnchors: forwardAnchors,
 		fields: fieldVars{
 			now:           time.Now(),
 			decimalSymbol: doc.Settings.DecimalSymbol,
@@ -389,8 +397,12 @@ func RenderWriter(doc *docx.Document, w io.Writer, opts Options) error {
 			bookmarkPages: func() map[string]int {
 				// Seed from a prior dry pass when supplied; otherwise
 				// start empty and let atomBookmark populate it.
-				if opts.prepopulatedBookmarkPages != nil {
+				if opts.skipWrite {
 					return opts.prepopulatedBookmarkPages
+				}
+				if opts.prepopulatedBookmarkPages != nil {
+					// Keep the PAGEREF seed intact if links require a retry.
+					return maps.Clone(opts.prepopulatedBookmarkPages)
 				}
 				return map[string]int{}
 			}(),
@@ -703,6 +715,26 @@ func RenderWriter(doc *docx.Document, w io.Writer, opts Options) error {
 		return nil
 	}
 
+	// gopdf attaches links to the current page as they are drawn and
+	// serializes an empty annotation object for each missing destination.
+	// Once every page has been laid out, retry only if a forward target
+	// never acquired an anchor. Each retry removes an attempted name.
+	retry := false
+	for anchor, rendered := range r.linkTargets {
+		if rendered {
+			continue
+		}
+		if forwardAnchors == nil {
+			forwardAnchors = r.linkTargets
+		}
+		delete(forwardAnchors, anchor)
+		retry = true
+	}
+	if retry {
+		opts.OnProgress, opts.Logger, opts.Verbose = nil, nil, false
+		return renderWriter(doc, w, opts, forwardAnchors)
+	}
+
 	if _, err := pdf.WriteTo(w); err != nil {
 		return fmt.Errorf("write pdf: %w", err)
 	}
@@ -726,6 +758,12 @@ type renderer struct {
 	fonts       map[string]bool     // registered font names
 	counters    map[int]map[int]int // numId → level → next counter value
 	noPageBreak bool                // when true, ensureRoom never adds pages
+	// linkTargets tracks attempted forward links (false) and anchors
+	// registered during this pass (true).
+	linkTargets map[string]bool
+	// forwardAnchors limits retries to previously resolved targets.
+	// Nil allows all forward links to be checked by the initial layout.
+	forwardAnchors map[string]bool
 	// nextBlockMinHeight is the estimated minimum height (in points) of
 	// the block that will be drawn immediately after the current one.
 	// Set by the caller before drawParagraph when a keepNext paragraph
