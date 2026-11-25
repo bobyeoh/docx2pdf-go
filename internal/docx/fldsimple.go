@@ -36,7 +36,7 @@ func decodeFldSimple(dec *xml.Decoder, start xml.StartElement, p *Paragraph, par
 		case xml.StartElement:
 			switch t.Name.Local {
 			case "r":
-				runs, err := decodeRun(dec, t, paraRPr, pctx.doc)
+				runs, err := decodeRun(dec, t, paraRPr, pctx)
 				if err != nil {
 					return err
 				}

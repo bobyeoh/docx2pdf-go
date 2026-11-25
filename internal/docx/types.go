@@ -13,7 +13,7 @@ import (
 // Document is the top-level parsed result of a .docx file.
 type Document struct {
 	Body      []Block
-	Images    map[string]image.Image // keyed by rId (relationship id)
+	Images    map[string]image.Image // keyed by image relationship key
 	Hyperlink map[string]string      // rId → external URL (from rels, TargetMode=External)
 	// RelTargets is rId → internal package target (e.g.
 	// "subDocument/sub1.docx", "media/image1.png"). Populated for
@@ -928,7 +928,7 @@ func (Paragraph) isBlock() {}
 type Run struct {
 	Text       string
 	IsBreak    bool   // soft line break (w:br without page type)
-	ImageID    string // rId if this run is a w:drawing/pic image
+	ImageID    string // relationship key for a DrawingML or VML image
 	ChartID    string // rId if this run is a w:drawing/c:chart reference
 	LinkURL    string // hyperlink rId → external URL (resolved by renderer)
 	LinkAnchor string // hyperlink w:anchor → internal bookmark name target

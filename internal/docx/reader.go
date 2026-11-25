@@ -2,7 +2,6 @@ package docx
 
 import (
 	"archive/zip"
-	"bytes"
 	"encoding/xml"
 	"fmt"
 	"image"
@@ -69,8 +68,8 @@ func (b bytesReaderAtImpl) ReadAt(p []byte, off int64) (int, error) {
 //  1. Unzip the package.
 //  2. Parse word/styles.xml → default RunProps + ParaDefaults + named styles.
 //  3. Parse word/_rels/document.xml.rels → rId → media / hyperlink / part.
-//  4. Decode word/media/* into image.Image objects.
-//  5. Parse word/header*.xml + word/footer*.xml referenced by sectPr.
+//  4. Decode images referenced by the document.
+//  5. Parse header/footer parts and their image relationships.
 //  6. Parse word/numbering.xml.
 //  7. Parse word/document.xml → AST split into Sections at every sectPr.
 func Parse(r io.ReaderAt, size int64) (*Document, error) {
@@ -242,73 +241,10 @@ func ParseWithPassword(r io.ReaderAt, size int64, password string) (*Document, e
 				}
 				doc.Inks[rid] = strokes
 			}
-		case strings.HasPrefix(e.Target, "media/"):
-			full := "word/" + e.Target
-			zf, ok := files[full]
-			if !ok {
-				continue
+		case isImageRel(e.Type) || strings.HasPrefix(e.Target, "media/"):
+			if zf := relatedPart(files, mainDocumentPart, e); zf != nil {
+				loadImagePart(zf, doc, rid)
 			}
-			if strings.HasSuffix(strings.ToLower(e.Target), ".svg") {
-				if img, err := rasterizeSVGAsset(zf); err == nil {
-					doc.Images[rid] = img
-				} else if doc.UnsupportedMedia == nil {
-					doc.UnsupportedMedia = map[string]string{rid: "SVG"}
-				} else {
-					doc.UnsupportedMedia[rid] = "SVG"
-				}
-				continue
-			}
-			if strings.HasSuffix(strings.ToLower(e.Target), ".eps") {
-				// DOS EPS files often carry a TIFF/WMF preview at a fixed
-				// offset in their binary header. We can't interpret
-				// PostScript, but if a TIFF preview is present we decode
-				// it and use that as the image — usually accurate enough
-				// for inline display. EPSs without a preview fall through
-				// to the placeholder path below.
-				if img, ok := extractEPSPreview(zf); ok {
-					doc.Images[rid] = img
-					continue
-				}
-				if doc.UnsupportedMedia == nil {
-					doc.UnsupportedMedia = map[string]string{}
-				}
-				doc.UnsupportedMedia[rid] = "EPS"
-				continue
-			}
-			if label, ok := vectorMediaFormat(e.Target, zf); ok {
-				if doc.UnsupportedMedia == nil {
-					doc.UnsupportedMedia = map[string]string{}
-				}
-				doc.UnsupportedMedia[rid] = label
-				// EMF upgrades happen in two passes:
-				//  1. If the EMF wraps an embedded DIB (very common —
-				//     screenshots, "Picture (Enhanced Metafile)" pastes),
-				//     extract that bitmap and treat the whole EMF as a
-				//     raster image. Renderer picks Images over
-				//     UnsupportedMedia automatically.
-				//  2. Otherwise try a vector replay into a VMLShape.
-				if strings.HasSuffix(strings.ToLower(e.Target), ".emf") {
-					if pngBytes, ok := emfToDIBPng(zf); ok {
-						if img, _, err := image.Decode(bytes.NewReader(pngBytes)); err == nil {
-							doc.Images[rid] = img
-							delete(doc.UnsupportedMedia, rid)
-							continue
-						}
-					}
-					if shape := emfToVMLShape(zf); shape != nil {
-						if doc.EMFShapes == nil {
-							doc.EMFShapes = map[string]*VMLShape{}
-						}
-						doc.EMFShapes[rid] = shape
-					}
-				}
-				continue
-			}
-			img, err := loadImage(zf)
-			if err != nil {
-				continue
-			}
-			doc.Images[rid] = img
 		}
 	}
 
@@ -368,14 +304,13 @@ func ParseWithPassword(r io.ReaderAt, size int64, password string) (*Document, e
 	for rid, e := range rels {
 		switch {
 		case isHeaderRel(e.Type), isFooterRel(e.Type):
-			full := "word/" + e.Target
-			zf, ok := files[full]
-			if !ok {
+			zf := relatedPart(files, mainDocumentPart, e)
+			if zf == nil {
 				continue
 			}
-			blocks, err := parseHeaderFooter(zf, doc)
+			blocks, err := parseHeaderFooter(zf, doc, files)
 			if err != nil {
-				return nil, fmt.Errorf("%s: %w", full, err)
+				return nil, fmt.Errorf("%s: %w", zf.Name, err)
 			}
 			if isHeaderRel(e.Type) {
 				headerParts[rid] = blocks
@@ -503,7 +438,7 @@ func ParseWithPassword(r io.ReaderAt, size int64, password string) (*Document, e
 		}
 	}
 
-	docFile, ok := files["word/document.xml"]
+	docFile, ok := files[mainDocumentPart]
 	if !ok {
 		return nil, fmt.Errorf("not a docx: missing word/document.xml")
 	}
@@ -526,6 +461,7 @@ type parseDocContext struct {
 	doc         *Document
 	headerParts map[string][]Block
 	footerParts map[string][]Block
+	imagePart   string // Owning part for header/footer images.
 
 	// curSection accumulates blocks for the section currently being parsed.
 	// Each sectPr (inline or top-level) finalizes it and starts a new one.
@@ -542,6 +478,15 @@ type parseDocContext struct {
 	// see the correct positional predicate. Top of stack = innermost
 	// repeat.
 	repeatStack []openDopeRepeatFrame
+}
+
+// imageID keeps the document's raw IDs and qualifies header/footer IDs
+// with their source part. The separator cannot occur in an XML attribute.
+func (pctx *parseDocContext) imageID(rid string) string {
+	if rid == "" || pctx.imagePart == "" {
+		return rid
+	}
+	return pctx.imagePart + "\x00" + rid
 }
 
 // openDopeRepeatFrame describes one active repeat scope while we're
@@ -1386,14 +1331,15 @@ func recordPermStart(pctx *parseDocContext, t xml.StartElement) {
 // parseHeaderFooter parses a w:hdr or w:ftr XML part into a slice of blocks
 // by reusing the existing paragraph / table decoders. Header/footer parts
 // never carry sectPr, so we ignore that case.
-func parseHeaderFooter(f *zip.File, doc *Document) ([]Block, error) {
+func parseHeaderFooter(f *zip.File, doc *Document, files map[string]*zip.File) ([]Block, error) {
 	rc, err := openZipFile(f)
 	if err != nil {
 		return nil, err
 	}
 	defer rc.Close()
 	dec := xml.NewDecoder(rc)
-	pctx := &parseDocContext{doc: doc}
+	pctx := &parseDocContext{doc: doc, imagePart: f.Name}
+	loadPartImages(files, pctx)
 	var blocks []Block
 	for {
 		tok, err := dec.Token()
@@ -3620,7 +3566,7 @@ func decodeParagraph(dec *xml.Decoder, start xml.StartElement, pctx *parseDocCon
 					return p, err
 				}
 			case "r":
-				runs, err := decodeRun(dec, t, paraRPr, pctx.doc)
+				runs, err := decodeRun(dec, t, paraRPr, pctx)
 				if err != nil {
 					return p, err
 				}
@@ -3764,7 +3710,7 @@ func decodeParagraph(dec *xml.Decoder, start xml.StartElement, pctx *parseDocCon
 				// MC wrapper as a direct paragraph child (less common
 				// than inside w:r). Treat its Choice/Fallback as
 				// providing run atoms that join this paragraph.
-				runs, err := decodeRunAltContent(dec, t, paraRPr, pctx.doc)
+				runs, err := decodeRunAltContent(dec, t, paraRPr, pctx)
 				if err != nil {
 					return p, err
 				}
@@ -3837,7 +3783,7 @@ func decodeWrapperWithRev(dec *xml.Decoder, start xml.StartElement, p *Paragraph
 		case xml.StartElement:
 			switch t.Name.Local {
 			case "r":
-				runs, err := decodeRun(dec, t, paraRPr, pctx.doc)
+				runs, err := decodeRun(dec, t, paraRPr, pctx)
 				if err != nil {
 					return err
 				}
@@ -3967,7 +3913,7 @@ func decodeHyperlink(dec *xml.Decoder, start xml.StartElement, p *Paragraph, par
 		switch t := tok.(type) {
 		case xml.StartElement:
 			if t.Name.Local == "r" {
-				runs, err := decodeRun(dec, t, paraRPr, pctx.doc)
+				runs, err := decodeRun(dec, t, paraRPr, pctx)
 				if err != nil {
 					return err
 				}
@@ -4386,7 +4332,8 @@ func decodePPr(dec *xml.Decoder, start xml.StartElement, p *Paragraph, paraRPr *
 
 // decodeRun returns one or more Run atoms because a single w:r may carry a
 // text node, a w:br, and a w:drawing in any order.
-func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *Document) ([]Run, error) {
+func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, pctx *parseDocContext) ([]Run, error) {
+	doc := pctx.doc
 	rp := paraRPr
 	var atoms []Run
 	var rPrChange *PrChange
@@ -4588,7 +4535,7 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 				}
 				atoms = append(atoms, Run{InstrText: s, Props: rp})
 			case "drawing":
-				di, err := findDrawingInfo(dec, t, doc)
+				di, err := findDrawingInfo(dec, t, pctx)
 				if err != nil {
 					return nil, err
 				}
@@ -4837,7 +4784,7 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 				// Legacy VML images: <w:pict><v:shape style="..."><v:imagedata r:id="..."/>
 				// </v:shape></w:pict>. Older Word docs, Excel/Outlook pastes, and
 				// some converters still emit these instead of w:drawing.
-				vi, err := findPictInfo(dec, t, doc)
+				vi, err := findPictInfo(dec, t, pctx)
 				if err != nil {
 					return nil, err
 				}
@@ -4869,7 +4816,7 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 				// Markup Compatibility wrapper: prefer mc:Choice over
 				// mc:Fallback. Common pattern is "new shape via wps in
 				// Choice, legacy VML in Fallback" — we want the Choice.
-				runs, err := decodeRunAltContent(dec, t, rp, doc)
+				runs, err := decodeRunAltContent(dec, t, rp, pctx)
 				if err != nil {
 					return nil, err
 				}
@@ -4882,7 +4829,7 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 				//   1. Decoded Excel grid (rendered as a small table).
 				//   2. The preview image / VML shape.
 				//   3. "[Embedded object]" textual placeholder.
-				vi, err := findPictInfo(dec, t, doc)
+				vi, err := findPictInfo(dec, t, pctx)
 				if err != nil {
 					return nil, err
 				}
@@ -5359,10 +5306,10 @@ func parseWrapPolygon(dec *xml.Decoder, start xml.StartElement) ([]WrapPathPoint
 // findDrawingInfo walks a w:drawing subtree and pulls out the drawing info.
 // srcRect: each side is in 1/1000ths of a percent (so 10000 = 10%).
 //
-// doc, when non-nil, is used to fully parse rich text inside w:txbxContent
-// (paragraphs / tables / lists, including formatting). When nil the parser
-// still records the flattened text into info.TxbxText.
-func findDrawingInfo(dec *xml.Decoder, start xml.StartElement, doc *Document) (info drawingInfo, err error) {
+// The part context also applies inside rich textboxes and when choosing
+// between a raster preview and its SVG source.
+func findDrawingInfo(dec *xml.Decoder, start xml.StartElement, pctx *parseDocContext) (info drawingInfo, err error) {
+	doc := pctx.doc
 	depth := 1
 	// Position-decoding context: when we're inside a positionH / positionV
 	// element we capture children into the appropriate DrawingPos.
@@ -5692,14 +5639,12 @@ func findDrawingInfo(dec *xml.Decoder, start xml.StartElement, doc *Document) (i
 				if len(effs) > 0 {
 					info.ImageEffects = append(info.ImageEffects, effs...)
 				}
-				if svgRID != "" {
-					if _, ok := doc.Images[svgRID]; ok {
-						info.RID = svgRID
-					} else {
-						info.RID = rasterRID
+				info.RID = pctx.imageID(rasterRID)
+				if svgRID != "" && doc != nil {
+					svgID := pctx.imageID(svgRID)
+					if _, ok := doc.Images[svgID]; ok {
+						info.RID = svgID
 					}
-				} else {
-					info.RID = rasterRID
 				}
 				depth--
 			case "extent":
@@ -5756,7 +5701,7 @@ func findDrawingInfo(dec *xml.Decoder, start xml.StartElement, doc *Document) (i
 				// full paragraph/table tree (so bold runs, bullets, and
 				// nested tables survive) while also producing a flat
 				// fallback string for callers that only need plain text.
-				txt, blocks, err := extractTxbxRich(dec, t, doc)
+				txt, blocks, err := extractTxbxRich(dec, t, pctx)
 				if err != nil {
 					return info, err
 				}
@@ -6673,9 +6618,9 @@ func readElementText(dec *xml.Decoder, start xml.StartElement) (string, error) {
 // When doc is nil the parser still walks the tree, but resolved styles
 // won't apply — block content is still produced because each paragraph
 // stands on its own data.
-func extractTxbxRich(dec *xml.Decoder, start xml.StartElement, doc *Document) (string, []Block, error) {
-	pctx := &parseDocContext{doc: doc}
-	if doc == nil {
+func extractTxbxRich(dec *xml.Decoder, start xml.StartElement, parent *parseDocContext) (string, []Block, error) {
+	pctx := &parseDocContext{doc: parent.doc, imagePart: parent.imagePart}
+	if pctx.doc == nil {
 		// parseNoteBody calls into decoders that nil-check doc; the few
 		// that don't (style merges) will be no-ops without it.
 		pctx.doc = &Document{}
@@ -6772,9 +6717,8 @@ type pictInfo struct {
 }
 
 // findPictInfo walks a w:pict subtree pulling out imagedata + shape info.
-// Now handles v:group by recursing into each child shape. The doc handle
-// is passed down so v:textbox can parse rich w:txbxContent.
-func findPictInfo(dec *xml.Decoder, start xml.StartElement, doc *Document) (info pictInfo, err error) {
+// The part context keeps image relationships scoped inside v:textbox too.
+func findPictInfo(dec *xml.Decoder, start xml.StartElement, pctx *parseDocContext) (info pictInfo, err error) {
 	// First, drain the immediate children: imagedata (RID) wins over shape;
 	// a single shape element captures the outermost VMLShape, including any
 	// nested group children.
@@ -6788,12 +6732,12 @@ func findPictInfo(dec *xml.Decoder, start xml.StartElement, doc *Document) (info
 		case xml.StartElement:
 			switch t.Name.Local {
 			case "shape", "rect", "roundrect", "oval", "line", "polyline", "group":
-				sh, hr, rid, wpt, hpt, meta := decodeVMLShape(dec, t, doc)
+				sh, hr, rid, wpt, hpt, meta := decodeVMLShape(dec, t, pctx)
 				if hr {
 					info.IsHR = true
 				}
 				if rid != "" && info.RID == "" {
-					info.RID = rid
+					info.RID = pctx.imageID(rid)
 				}
 				if wpt > 0 {
 					info.WPt = wpt
@@ -6847,7 +6791,7 @@ func findPictInfo(dec *xml.Decoder, start xml.StartElement, doc *Document) (info
 					switch a.Name.Local {
 					case "id", "relid":
 						if info.RID == "" {
-							info.RID = a.Value
+							info.RID = pctx.imageID(a.Value)
 						}
 					case "cropleft":
 						info.CropLPct = parseVMLCropPct(a.Value)
@@ -6876,8 +6820,8 @@ func findPictInfo(dec *xml.Decoder, start xml.StartElement, doc *Document) (info
 // for v:group). Returns the constructed shape (nil if it was a pure
 // imagedata), an isHorizontalRule flag, a captured imagedata RID, and
 // the shape's width/height in points. Consumes the matching EndElement.
-// doc, when non-nil, is forwarded to the textbox content extractor so
-// rich w:txbxContent (paragraphs / tables / formatting) survives.
+// The part context is forwarded to the textbox content extractor so
+// rich w:txbxContent can also resolve images in its owning part.
 // vmlImageMeta carries v:imagedata crop attributes (1/1000 of percent)
 // + the chromakey color. Returned from decodeVMLShape alongside the
 // rid so callers can copy them onto the wrapping Run.
@@ -6890,7 +6834,7 @@ type vmlImageMeta struct {
 	HRef string
 }
 
-func decodeVMLShape(dec *xml.Decoder, start xml.StartElement, doc *Document) (*VMLShape, bool, string, float64, float64, vmlImageMeta) {
+func decodeVMLShape(dec *xml.Decoder, start xml.StartElement, pctx *parseDocContext) (*VMLShape, bool, string, float64, float64, vmlImageMeta) {
 	var imgMeta vmlImageMeta
 	kind := start.Name.Local
 	if kind == "shape" {
@@ -6958,7 +6902,7 @@ func decodeVMLShape(dec *xml.Decoder, start xml.StartElement, doc *Document) (*V
 			switch t.Name.Local {
 			case "shape", "rect", "roundrect", "oval", "line", "polyline", "group":
 				// Nested child shape (most common inside v:group).
-				child, childHR, childRID, _, _, _ := decodeVMLShape(dec, t, doc)
+				child, childHR, childRID, _, _, _ := decodeVMLShape(dec, t, pctx)
 				if childHR {
 					isHR = true
 				}
@@ -7048,7 +6992,7 @@ func decodeVMLShape(dec *xml.Decoder, start xml.StartElement, doc *Document) (*V
 				_ = dec.Skip()
 				continue
 			case "textbox":
-				txt, blocks := readVMLTextbox(dec, t, doc)
+				txt, blocks := readVMLTextbox(dec, t, pctx)
 				if txt != "" {
 					if sh.TextBox != "" {
 						sh.TextBox += " "
@@ -7137,7 +7081,7 @@ func parseVMLCropPct(v string) float64 {
 // present). The block path lets the renderer paint bold/list/table
 // content inside legacy VML textboxes too — Word still emits these for
 // Outlook / older converters.
-func readVMLTextbox(dec *xml.Decoder, start xml.StartElement, doc *Document) (string, []Block) {
+func readVMLTextbox(dec *xml.Decoder, start xml.StartElement, pctx *parseDocContext) (string, []Block) {
 	var flat strings.Builder
 	var blocks []Block
 	depth := 1
@@ -7149,7 +7093,7 @@ func readVMLTextbox(dec *xml.Decoder, start xml.StartElement, doc *Document) (st
 		switch t := tok.(type) {
 		case xml.StartElement:
 			if t.Name.Local == "txbxContent" {
-				txt, bs, e := extractTxbxRich(dec, t, doc)
+				txt, bs, e := extractTxbxRich(dec, t, pctx)
 				if e != nil {
 					return strings.TrimSpace(flat.String()), blocks
 				}
