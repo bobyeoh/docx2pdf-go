@@ -329,7 +329,7 @@ docker run --rm -v "$PWD":/work \
 
 | Feature | Status |
 |---|---|
-| Inline images: PNG / JPEG / GIF | ✅ |
+| Inline images in the document, headers, and footers: PNG / JPEG / GIF | ✅ |
 | Image cropping (`a:srcRect`) and explicit extent | ✅ |
 | Legacy VML images (`w:pict` / `v:imagedata`) — older Word, Excel/Outlook pastes | ✅ |
 | Anchored images (`wp:anchor`) — rendered as inline best-effort | ⚠️ |

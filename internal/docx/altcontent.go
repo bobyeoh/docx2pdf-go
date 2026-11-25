@@ -73,7 +73,7 @@ func requiresSupported(reqs string) bool {
 // We expand by re-running the same dispatch logic against each Choice/
 // Fallback's child elements — meaning anything decodeRun's main switch
 // understands (drawing, pict, t, br, sym, fldChar, …) is in scope.
-func decodeRunAltContent(dec *xml.Decoder, start xml.StartElement, rp RunProps, doc *Document) ([]Run, error) {
+func decodeRunAltContent(dec *xml.Decoder, start xml.StartElement, rp RunProps, pctx *parseDocContext) ([]Run, error) {
 	var fallback []Run
 	for {
 		tok, err := dec.Token()
@@ -90,7 +90,7 @@ func decodeRunAltContent(dec *xml.Decoder, start xml.StartElement, rp RunProps, 
 					_ = dec.Skip()
 					continue
 				}
-				inner, err := decodeRunAltBranch(dec, t, rp, doc)
+				inner, err := decodeRunAltBranch(dec, t, rp, pctx)
 				if err != nil {
 					return nil, err
 				}
@@ -103,7 +103,7 @@ func decodeRunAltContent(dec *xml.Decoder, start xml.StartElement, rp RunProps, 
 					return inner, nil
 				}
 			case "Fallback":
-				inner, err := decodeRunAltBranch(dec, t, rp, doc)
+				inner, err := decodeRunAltBranch(dec, t, rp, pctx)
 				if err != nil {
 					return nil, err
 				}
@@ -123,7 +123,8 @@ func decodeRunAltContent(dec *xml.Decoder, start xml.StartElement, rp RunProps, 
 // and returns the Run atoms its child elements produce. Only the
 // run-level elements we know how to render are handled — anything else
 // is dropped.
-func decodeRunAltBranch(dec *xml.Decoder, start xml.StartElement, rp RunProps, doc *Document) ([]Run, error) {
+func decodeRunAltBranch(dec *xml.Decoder, start xml.StartElement, rp RunProps, pctx *parseDocContext) ([]Run, error) {
+	doc := pctx.doc
 	var out []Run
 	for {
 		tok, err := dec.Token()
@@ -134,7 +135,7 @@ func decodeRunAltBranch(dec *xml.Decoder, start xml.StartElement, rp RunProps, d
 		case xml.StartElement:
 			switch t.Name.Local {
 			case "drawing":
-				di, err := findDrawingInfo(dec, t, doc)
+				di, err := findDrawingInfo(dec, t, pctx)
 				if err != nil {
 					return nil, err
 				}
@@ -189,7 +190,7 @@ func decodeRunAltBranch(dec *xml.Decoder, start xml.StartElement, rp RunProps, d
 					}
 				}
 			case "pict":
-				vi, err := findPictInfo(dec, t, doc)
+				vi, err := findPictInfo(dec, t, pctx)
 				if err != nil {
 					return nil, err
 				}
@@ -207,14 +208,14 @@ func decodeRunAltBranch(dec *xml.Decoder, start xml.StartElement, rp RunProps, d
 				// drawingML vs. VML pairing. Re-enter the standard run
 				// decoder so the contents stay structurally faithful
 				// (rPr, drawing, sym, fldChar, all in scope).
-				inner, err := decodeRun(dec, t, rp, doc)
+				inner, err := decodeRun(dec, t, rp, pctx)
 				if err != nil {
 					return nil, err
 				}
 				out = append(out, inner...)
 			case "AlternateContent":
 				// Nested AC — recurse.
-				inner, err := decodeRunAltContent(dec, t, rp, doc)
+				inner, err := decodeRunAltContent(dec, t, rp, pctx)
 				if err != nil {
 					return nil, err
 				}
