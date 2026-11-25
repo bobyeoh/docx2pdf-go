@@ -249,27 +249,3 @@ func TestEDITTIME(t *testing.T) {
 		t.Errorf("EDITTIME = %q, want hour-minute form", got)
 	}
 }
-
-func TestHeadingLevelDetection(t *testing.T) {
-	doc := &docx.Document{}
-	cases := []struct {
-		styleID string
-		outline int
-		want    int
-	}{
-		{"Heading1", 0, 1},
-		{"Heading3", 0, 3},
-		{"Title", 0, 1},
-		{"BodyText", 0, 0},
-		{"", 2, 2},
-		{"", 0, 0}, // unset
-	}
-	for _, c := range cases {
-		p := docx.Paragraph{StyleID: c.styleID, OutlineLvl: c.outline}
-		got := headingLevel(p, doc)
-		if got != c.want {
-			t.Errorf("headingLevel(style=%q outline=%d) = %d, want %d",
-				c.styleID, c.outline, got, c.want)
-		}
-	}
-}

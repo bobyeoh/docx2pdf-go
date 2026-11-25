@@ -730,7 +730,7 @@ func (r *renderer) resolveURL(rid string) string {
 	return ""
 }
 
-func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
+func (r *renderer) layoutLine(atoms []atom, align docx.Alignment, outlineTitle string, outlineLevel int) error {
 	var line []atom
 	var lineW float64
 	var lineMaxH float64
@@ -761,6 +761,10 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 		}
 		lineMaxH = r.applyLineHeight(lineMaxH)
 		r.ensureRoom(lineMaxH)
+		if outlineTitle != "" {
+			r.appendOutline(outlineTitle, outlineLevel)
+			outlineTitle = ""
+		}
 
 		// Effective geometry for this specific line: first physical line gets
 		// the hanging outdent; later lines use the paragraph's normal margin.
