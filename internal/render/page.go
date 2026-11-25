@@ -285,7 +285,7 @@ func (r *renderer) measureTable(t docx.Table) float64 {
 		}
 		if row.HeightTwips > 0 {
 			minH := float64(row.HeightTwips) / 20.0
-			if row.HeightRuleExact || minH > rowH {
+			if r.hasExactRowHeight(row) || minH > rowH {
 				rowH = minH
 			}
 		}

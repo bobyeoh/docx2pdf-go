@@ -1264,7 +1264,7 @@ func (r *renderer) predictRowHeight(row docx.TableRow, widths []float64) float64
 	if row.HeightTwips > 0 {
 		declared := float64(row.HeightTwips) / 20.0
 		switch {
-		case row.HeightRule == "exact" || row.HeightRuleExact:
+		case r.hasExactRowHeight(row):
 			rowH = declared
 		case row.HeightRule == "auto":
 			// content-driven; ignore
@@ -1275,6 +1275,11 @@ func (r *renderer) predictRowHeight(row docx.TableRow, widths []float64) float64
 		}
 	}
 	return rowH
+}
+
+func (r *renderer) hasExactRowHeight(row docx.TableRow) bool {
+	return row.HeightTwips > 0 && !r.opts.ExpandExactTableRows &&
+		(row.HeightRule == "exact" || row.HeightRuleExact)
 }
 
 func (r *renderer) drawRow(row docx.TableRow, widths []float64) error {
@@ -1324,7 +1329,8 @@ func (r *renderer) drawRow(row docx.TableRow, widths []float64) error {
 		rowH = r.opts.DefaultFontSize * 1.4
 	}
 	// w:trHeight semantics:
-	//   "exact"   → use HeightTwips verbatim (overflow gets clipped below)
+	//   "exact"   → use HeightTwips verbatim and clip overflow, unless
+	//               ExpandExactTableRows requests minimum-height behavior
 	//   "auto"    → content-driven; HeightTwips is ignored
 	//   "atLeast" or absent → HeightTwips is a floor (this matches Word's
 	//                de-facto behavior — ECMA-376 nominally says "auto" is
@@ -1333,7 +1339,7 @@ func (r *renderer) drawRow(row docx.TableRow, widths []float64) error {
 	if row.HeightTwips > 0 {
 		declared := float64(row.HeightTwips) / 20.0
 		switch {
-		case row.HeightRule == "exact" || row.HeightRuleExact:
+		case r.hasExactRowHeight(row):
 			rowH = declared
 		case row.HeightRule == "auto":
 			// content-driven; ignore the hint
@@ -1554,7 +1560,7 @@ func (r *renderer) drawRow(row docx.TableRow, widths []float64) error {
 				}
 			}
 			r.cursorY = startY
-			clipped := row.HeightRuleExact && row.HeightTwips > 0
+			clipped := r.hasExactRowHeight(row)
 			if clipped {
 				r.pdf.SaveGraphicsState()
 				clipBox := []gopdf.Point{
@@ -1850,6 +1856,10 @@ func (r *renderer) measureAtomsHeight(atoms []atom, innerW float64) float64 {
 	}
 	for _, a := range atoms {
 		if a.kind == atomBookmark {
+			continue
+		}
+		if a.kind == atomBreak && !hadAny {
+			h += r.applyLineHeight(atomHeight(a, r.opts.DefaultFontSize))
 			continue
 		}
 		if a.kind == atomBreak || a.kind == atomPageBreak {
