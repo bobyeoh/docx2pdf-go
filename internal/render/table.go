@@ -1,6 +1,8 @@
 package render
 
 import (
+	"slices"
+
 	"github.com/bobyeoh/docx2pdf-go/internal/docx"
 	"github.com/signintech/gopdf"
 )
@@ -235,65 +237,51 @@ func matchingConditions(look docx.TableLook, ri, ci, nRows, nCols, rowBand, colB
 	return out
 }
 
-// applyDefaultCellMargins folds w:tblCellMar (table-level default cell
-// padding) into each cell that didn't set its own w:tcMar. Done as a
-// pre-pass so drawRow can ignore the table object and just use the cell
-// fields. Mirrors docx4j's BorderConflictResolverNG behavior:
-// per-cell value WINS when present, otherwise inherit the table default.
+const defaultCellPadding = 4.0
+
+// applyDefaultCellMargins resolves each side independently: a cell margin
+// overrides the row's table-property exception, then the table default.
 func applyDefaultCellMargins(t *docx.Table) {
-	dm := t.DefaultCellMargins
+	table := t.DefaultCellMargins
 	for ri := range t.Rows {
-		// Per-row exception (w:tblPrEx/w:tblCellMar) wins over the
-		// table default for THIS row's cells per ECMA-376 §17.4.39.
-		// We fold it cell-by-cell so each cell still sees its own
-		// w:tcMar take precedence; absent tcMar but present tblPrEx
-		// → tblPrEx; absent both → tblPr default.
-		rdm := dm
-		if t.Rows[ri].TblPrEx != nil && t.Rows[ri].TblPrEx.HasCellMargins {
-			ex := t.Rows[ri].TblPrEx.CellMargins
-			rdm = CellMargins{
-				Top:    pickMargin(ex.Top, dm.Top),
-				Bottom: pickMargin(ex.Bottom, dm.Bottom),
-				Left:   pickMargin(ex.Left, dm.Left),
-				Right:  pickMargin(ex.Right, dm.Right),
-			}
+		row := &t.Rows[ri]
+		var margins docx.CellMargins
+		if row.TblPrEx != nil && row.TblPrEx.HasCellMargins {
+			margins = row.TblPrEx.CellMargins
 		}
-		if rdm.Top == 0 && rdm.Bottom == 0 && rdm.Left == 0 && rdm.Right == 0 {
-			continue
-		}
-		for ci := range t.Rows[ri].Cells {
-			c := &t.Rows[ri].Cells[ci]
-			if c.MarginTopPt == 0 {
-				c.MarginTopPt = rdm.Top
-			}
-			if c.MarginBottomPt == 0 {
-				c.MarginBottomPt = rdm.Bottom
-			}
-			if c.MarginLeftPt == 0 {
-				c.MarginLeftPt = rdm.Left
-			}
-			if c.MarginRightPt == 0 {
-				c.MarginRightPt = rdm.Right
-			}
+		top := marginOr(margins.Top, margins.HasTop, marginOr(table.Top, table.HasTop, defaultCellPadding))
+		bottom := marginOr(margins.Bottom, margins.HasBottom, marginOr(table.Bottom, table.HasBottom, defaultCellPadding))
+		left := marginOr(margins.Left, margins.HasLeft, marginOr(table.Left, table.HasLeft, defaultCellPadding))
+		right := marginOr(margins.Right, margins.HasRight, marginOr(table.Right, table.HasRight, defaultCellPadding))
+		for ci := range row.Cells {
+			cell := &row.Cells[ci]
+			cell.MarginTopPt = marginOr(cell.MarginTopPt, cell.HasMarginTop, top)
+			cell.MarginBottomPt = marginOr(cell.MarginBottomPt, cell.HasMarginBottom, bottom)
+			cell.MarginLeftPt = marginOr(cell.MarginLeftPt, cell.HasMarginLeft, left)
+			cell.MarginRightPt = marginOr(cell.MarginRightPt, cell.HasMarginRight, right)
+			cell.HasMarginTop, cell.HasMarginBottom, cell.HasMarginLeft, cell.HasMarginRight = true, true, true, true
 		}
 	}
 }
 
-// CellMargins is locally aliased here so applyDefaultCellMargins can
-// build a per-row merged struct without re-importing docx.
-type CellMargins = docx.CellMargins
+func cellPadding(cell docx.TableCell) (left, right, top, bottom float64) {
+	return marginOr(cell.MarginLeftPt, cell.HasMarginLeft, defaultCellPadding),
+		marginOr(cell.MarginRightPt, cell.HasMarginRight, defaultCellPadding),
+		marginOr(cell.MarginTopPt, cell.HasMarginTop, defaultCellPadding),
+		marginOr(cell.MarginBottomPt, cell.HasMarginBottom, defaultCellPadding)
+}
 
-func pickMargin(override, base float64) float64 {
-	if override != 0 {
-		return override
+func marginOr(points float64, present bool, fallback float64) float64 {
+	if present || points != 0 {
+		return points
 	}
-	return base
+	return fallback
 }
 
 func (r *renderer) drawTable(t docx.Table) error {
 	r.applyTableStyleToCells(&t)
-	applyDefaultCellMargins(&t)
 	r.resolveHMerge(&t)
+	applyDefaultCellMargins(&t)
 	r.resolveAdjacentBorders(&t)
 	r.resolveVMerge(&t)
 	var tblBarTop float64
@@ -332,8 +320,9 @@ func (r *renderer) drawTable(t docx.Table) error {
 			}
 		}
 	}
+	savedTableSpacing := r.activeTableSpacing
 	r.activeTableSpacing = t.CellSpacingTwips
-	defer func() { r.activeTableSpacing = 0 }()
+	defer func() { r.activeTableSpacing = savedTableSpacing }()
 
 	// w:tblInd shifts the table's starting X by the indent amount. We
 	// implement it by temporarily widening marL and shrinking contentW for
@@ -832,7 +821,7 @@ func cellHasNonAtomContent(cell docx.TableCell) bool {
 //	min = widest single unbreakable atom (or single-line width when noWrap)
 //	max = full single-line width of the widest paragraph
 //
-// Both include the standard 8pt cell-margin padding.
+// Both include the resolved horizontal cell margins.
 func (r *renderer) cellMinMaxWidth(cell docx.TableCell) (float64, float64) {
 	savedFootnotes := r.pendingFootnotes
 	defer func() { r.pendingFootnotes = savedFootnotes }()
@@ -858,7 +847,8 @@ func (r *renderer) cellMinMaxWidth(cell docx.TableCell) (float64, float64) {
 			cmax = lineW
 		}
 	}
-	return cmin + 8, cmax + 8
+	left, right, _, _ := cellPadding(cell)
+	return cmin + left + right, cmax + left + right
 }
 
 // distributeAutofitSlack walks the table's first row, measures each
@@ -961,8 +951,8 @@ func (r *renderer) cellMinWidth(cell docx.TableCell) float64 {
 			}
 		}
 	}
-	// Pad for cell margins (4pt each side default).
-	return maxW + 8
+	left, right, _, _ := cellPadding(cell)
+	return maxW + left + right
 }
 
 // resolveAdjacentBorders applies the OOXML §17.4.66 border-conflict
@@ -1184,6 +1174,8 @@ func (r *renderer) resolveVMerge(t *docx.Table) {
 // continuation cells from the row. This matches what GridSpan would have
 // produced if the doc had used it instead.
 func (r *renderer) resolveHMerge(t *docx.Table) {
+	// Work on copied rows and cells so measurements leave the parsed table intact.
+	t.Rows = slices.Clone(t.Rows)
 	for ri := range t.Rows {
 		row := &t.Rows[ri]
 		// Walk left-to-right; collapse runs of "continue" into the
@@ -1224,125 +1216,70 @@ func (r *renderer) predictTableHeight(t docx.Table, widths []float64) float64 {
 // can inject the repeating header BEFORE the row that overflows
 // (otherwise the header lands after the row, mid-page).
 func (r *renderer) predictRowHeight(row docx.TableRow, widths []float64) float64 {
-	cellHeights := make([]float64, len(row.Cells))
-	col := 0
+	return r.measureRow(row, widths, nil)
+}
+
+func (r *renderer) rowCellSpacing(row docx.TableRow) float64 {
+	twips := row.CellSpacingTwips
+	if twips == 0 {
+		twips = r.activeTableSpacing
+	}
+	return max(0, float64(twips)/20)
+}
+
+// measureRow shares the height calculation between pagination and painting.
+// When requested, it also returns each cell's height for vertical alignment.
+func (r *renderer) measureRow(row docx.TableRow, widths, cellHeights []float64) float64 {
+	if row.Hidden {
+		return 0
+	}
+	spacing := 2 * r.rowCellSpacing(row)
+	rowH := 0.0
+	hasContent := false
+	allHideMark := len(row.Cells) > 0
+	col := max(0, row.GridBefore)
 	for i, cell := range row.Cells {
 		if col >= len(widths) {
 			break
 		}
-		span := cell.GridSpan
-		if span < 1 {
-			span = 1
-		}
-		w := sumWidths(widths, col, span)
-		if cell.VMerge == "continue" {
-			cellHeights[i] = 0
-		} else {
-			cellHeights[i] = r.measureCell(cell, w)
+		span := max(1, cell.GridSpan)
+		if cell.VMerge != "continue" {
+			width := sumWidths(widths, col, span) - spacing
+			height := r.measureCell(cell, width)
+			if cellHeights != nil {
+				cellHeights[i] = height
+			}
+			rowH = max(rowH, height+spacing)
+			hasContent = hasContent || len(cell.Blocks) > 0
+			allHideMark = allHideMark && cell.HideMark
 		}
 		col += span
 	}
-	rowH := 0.0
-	for _, h := range cellHeights {
-		if h > rowH {
-			rowH = h
-		}
-	}
-	// w:hideMark on every visible cell waives the implicit paragraph-mark
-	// floor — empty rows can then collapse to zero height instead of the
-	// default 1.4 × font-size.
-	allHideMark := len(row.Cells) > 0
-	for _, c := range row.Cells {
-		if !c.HideMark && c.VMerge != "continue" {
-			allHideMark = false
-			break
-		}
-	}
-	if !allHideMark && rowH < r.opts.DefaultFontSize*1.4 {
-		rowH = r.opts.DefaultFontSize * 1.4
+
+	// A cell's measured paragraph provides its own line height. Keep the
+	// implicit mark minimum for rows without any measured content.
+	if !hasContent && !allHideMark {
+		rowH = max(rowH, r.opts.DefaultFontSize*1.4)
 	}
 	if row.HeightTwips > 0 {
-		declared := float64(row.HeightTwips) / 20.0
+		declared := float64(row.HeightTwips) / 20
 		switch {
 		case row.HeightRule == "exact" || row.HeightRuleExact:
-			rowH = declared
-		case row.HeightRule == "auto":
-			// content-driven; ignore
-		default:
-			if declared > rowH {
-				rowH = declared
-			}
+			return declared
+		case row.HeightRule != "auto":
+			rowH = max(rowH, declared)
 		}
 	}
 	return rowH
 }
 
 func (r *renderer) drawRow(row docx.TableRow, widths []float64) error {
-	// w:trPr/w:hidden — suppress the row entirely.
 	if row.Hidden {
 		return nil
 	}
 	rowTop := r.cursorY
 	cellHeights := make([]float64, len(row.Cells))
-	col := 0
-	if row.GridBefore > 0 {
-		col = row.GridBefore
-	}
-	for i, cell := range row.Cells {
-		if col >= len(widths) {
-			break
-		}
-		span := cell.GridSpan
-		if span < 1 {
-			span = 1
-		}
-		w := sumWidths(widths, col, span)
-		if cell.VMerge == "continue" {
-			cellHeights[i] = 0
-		} else {
-			cellHeights[i] = r.measureCell(cell, w)
-		}
-		col += span
-	}
-	rowH := 0.0
-	for _, h := range cellHeights {
-		if h > rowH {
-			rowH = h
-		}
-	}
-	// w:hideMark on every visible cell waives the implicit paragraph-mark
-	// floor — empty rows can then collapse to zero height instead of the
-	// default 1.4 × font-size.
-	allHideMark := len(row.Cells) > 0
-	for _, c := range row.Cells {
-		if !c.HideMark && c.VMerge != "continue" {
-			allHideMark = false
-			break
-		}
-	}
-	if !allHideMark && rowH < r.opts.DefaultFontSize*1.4 {
-		rowH = r.opts.DefaultFontSize * 1.4
-	}
-	// w:trHeight semantics:
-	//   "exact"   → use HeightTwips verbatim (overflow gets clipped below)
-	//   "auto"    → content-driven; HeightTwips is ignored
-	//   "atLeast" or absent → HeightTwips is a floor (this matches Word's
-	//                de-facto behavior — ECMA-376 nominally says "auto" is
-	//                the absent default, but every Office build treats a
-	//                bare w:trHeight as atLeast).
-	if row.HeightTwips > 0 {
-		declared := float64(row.HeightTwips) / 20.0
-		switch {
-		case row.HeightRule == "exact" || row.HeightRuleExact:
-			rowH = declared
-		case row.HeightRule == "auto":
-			// content-driven; ignore the hint
-		default:
-			if declared > rowH {
-				rowH = declared
-			}
-		}
-	}
+	rowH := r.measureRow(row, widths, cellHeights)
 
 	// CantSplit: if the row won't fit on the current page, push it to the
 	// next page intact rather than letting ensureRoom break it mid-row.
@@ -1362,11 +1299,7 @@ func (r *renderer) drawRow(row docx.TableRow, widths []float64) error {
 	r.pdf.SetLineWidth(0.5)
 	r.pdf.SetStrokeColor(0, 0, 0)
 
-	cellSpacingTwips := row.CellSpacingTwips
-	if cellSpacingTwips == 0 {
-		cellSpacingTwips = r.activeTableSpacing
-	}
-	cellSpacingPt := float64(cellSpacingTwips) / 20.0
+	cellSpacingPt := r.rowCellSpacing(row)
 
 	x := r.marL
 	// w:trPr/w:jc — per-row horizontal alignment override. Word resolves
@@ -1388,7 +1321,7 @@ func (r *renderer) drawRow(row docx.TableRow, widths []float64) error {
 			}
 		}
 	}
-	col = 0
+	col := 0
 	// w:gridBefore — phantom leading columns. The cells are visually
 	// present (so any tblBorders surface a frame) but carry no content.
 	// w:wBefore — extra leading offset in twips (when gridBefore isn't used).
@@ -1411,7 +1344,6 @@ func (r *renderer) drawRow(row docx.TableRow, widths []float64) error {
 	} else if row.WBeforeTwips > 0 {
 		x += float64(row.WBeforeTwips) / 20.0
 	}
-	const defaultCellPad = 4.0
 	for ci, cell := range row.Cells {
 		if col >= len(widths) {
 			break
@@ -1422,22 +1354,7 @@ func (r *renderer) drawRow(row docx.TableRow, widths []float64) error {
 		}
 		w := sumWidths(widths, col, span)
 
-		padL := cell.MarginLeftPt
-		if padL == 0 {
-			padL = defaultCellPad
-		}
-		padR := cell.MarginRightPt
-		if padR == 0 {
-			padR = defaultCellPad
-		}
-		padT := cell.MarginTopPt
-		if padT == 0 {
-			padT = defaultCellPad
-		}
-		padB := cell.MarginBottomPt
-		if padB == 0 {
-			padB = defaultCellPad
-		}
+		padL, padR, padT, padB := cellPadding(cell)
 
 		left, right := x, x+w
 		top, bottom := rowTop, rowTop+rowH
@@ -1519,18 +1436,7 @@ func (r *renderer) drawRow(row docx.TableRow, widths []float64) error {
 			if r.fields.tableCtx != nil {
 				r.fields.tableCtx.col = col
 			}
-			// Content height is what measureCell returned MINUS the
-			// pad-both-sides it added internally. Using the actual
-			// measurement (not a one-line-per-paragraph stub) keeps
-			// vAlign="center" from pushing wrapped content past the
-			// row's bottom edge — multi-line cells in this row would
-			// otherwise overflow when their column happens to be the
-			// tallest.
-			const cellPad = 4.0
-			contentH := cellHeights[ci] - 2*cellPad
-			if contentH < 0 {
-				contentH = 0
-			}
+			contentH := max(0, cellHeights[ci]-padT-padB)
 			// For a vMerge="restart" cell, the visual cell box spans
 			// every row in the group, so vAlign centers/bottoms against
 			// the merged-group height (set by resolveVMerge via the
@@ -1540,18 +1446,13 @@ func (r *renderer) drawRow(row docx.TableRow, widths []float64) error {
 			if cell.VMerge == "restart" && cell.MergedHeightPt > rowH {
 				boxH = cell.MergedHeightPt
 			}
-			startY := rowTop + padT
+			startY := top + padT
+			slack := max(0, boxH-2*cellSpacingPt-contentH-padT-padB)
 			switch cell.VAlign {
 			case "center":
-				slack := boxH - contentH - (padT + padB)
-				if slack > 0 {
-					startY += slack / 2
-				}
+				startY += slack / 2
 			case "bottom":
-				slack := boxH - contentH - (padT + padB)
-				if slack > 0 {
-					startY += slack
-				}
+				startY += slack
 			}
 			r.cursorY = startY
 			clipped := row.HeightRuleExact && row.HeightTwips > 0
@@ -1766,9 +1667,9 @@ func sumWidths(ws []float64, start, n int) float64 {
 // cells with footnote refs would queue each note twice (once in measure,
 // once in the real draw) and the page bottom would render duplicates.
 func (r *renderer) measureCell(cell docx.TableCell, width float64) float64 {
-	const cellPad = 4.0
-	h := 2 * cellPad
-	innerW := width - 2*cellPad
+	left, right, top, bottom := cellPadding(cell)
+	h := top + bottom
+	innerW := width - left - right
 	savedLine := r.lineHeight
 	savedFootnotes := r.pendingFootnotes
 	defer func() {
@@ -1795,31 +1696,11 @@ func (r *renderer) measureCell(cell docx.TableCell, width float64) float64 {
 	return h
 }
 
-// measureNestedTable estimates the height of a table laid out inside a
-// cell whose content area is `outerW` wide. We reuse the same column-
-// width resolution and per-row measurement that drawTable would use,
-// just without drawing. Borders aren't reasoned about explicitly — Word
-// treats them as zero-width for layout.
 func (r *renderer) measureNestedTable(t docx.Table, outerW float64) float64 {
 	savedContentW := r.contentW
 	r.contentW = outerW
 	defer func() { r.contentW = savedContentW }()
-	cols := 0
-	for _, row := range t.Rows {
-		if len(row.Cells) > cols {
-			cols = len(row.Cells)
-		}
-	}
-	if cols == 0 {
-		return 0
-	}
-	r.resolveHMerge(&t)
-	widths := r.resolveColumnWidths(t, cols)
-	h := 0.0
-	for _, row := range t.Rows {
-		h += r.predictRowHeight(row, widths)
-	}
-	return h
+	return r.measureTable(t)
 }
 
 // measureAtomsHeight is the dry-pass line breaker extracted from
@@ -1829,23 +1710,25 @@ func (r *renderer) measureNestedTable(t docx.Table, outerW float64) float64 {
 func (r *renderer) measureAtomsHeight(atoms []atom, innerW float64) float64 {
 	h := 0.0
 	lineW := 0.0
-	lineH := r.applyLineHeight(r.opts.DefaultFontSize * 1.2)
+	lineH := 0.0
 	hadAny := false
+	flush := func() {
+		// Like layoutLine, fall back to the default font only on an empty line.
+		if lineH == 0 {
+			lineH = r.opts.DefaultFontSize * 1.2
+		}
+		h += r.applyLineHeight(lineH)
+		lineW, lineH, hadAny = 0, 0, false
+	}
 	accumulate := func(a atom) {
-		ah := atomHeight(a, r.opts.DefaultFontSize)
 		if lineW+a.width > innerW && lineW > 0 {
-			h += lineH
-			lineW = 0
-			lineH = r.applyLineHeight(r.opts.DefaultFontSize * 1.2)
+			flush()
 			if a.kind == atomSpace {
 				return
 			}
 		}
 		lineW += a.width
-		scaled := r.applyLineHeight(ah)
-		if scaled > lineH {
-			lineH = scaled
-		}
+		lineH = max(lineH, atomHeight(a, r.opts.DefaultFontSize))
 		hadAny = true
 	}
 	for _, a := range atoms {
@@ -1853,29 +1736,22 @@ func (r *renderer) measureAtomsHeight(atoms []atom, innerW float64) float64 {
 			continue
 		}
 		if a.kind == atomBreak || a.kind == atomPageBreak {
-			h += lineH
-			lineW = 0
-			lineH = r.applyLineHeight(r.opts.DefaultFontSize * 1.2)
-			hadAny = false
+			flush()
 			continue
 		}
 		if a.kind == atomWord && innerW > 0 && a.width > innerW && a.text != "" {
 			if lineW > 0 {
-				h += lineH
-				lineW = 0
-				lineH = r.applyLineHeight(r.opts.DefaultFontSize * 1.2)
+				flush()
 			}
-			if a.width > innerW {
-				for _, sub := range r.splitWordAtomByRune(a) {
-					accumulate(sub)
-				}
-				continue
+			for _, sub := range r.splitWordAtomByRune(a) {
+				accumulate(sub)
 			}
+			continue
 		}
 		accumulate(a)
 	}
-	if hadAny || lineW > 0 || len(atoms) == 0 {
-		h += lineH
+	if hadAny || len(atoms) == 0 {
+		flush()
 	}
 	return h
 }
