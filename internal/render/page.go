@@ -152,14 +152,15 @@ func (r *renderer) stampPageDecorations(sections []docx.Section, sectionPageStar
 			}
 		}
 
-		if len(hdr) > 0 {
+		showFurniture := !r.artworkCoversPage(i)
+		if len(hdr) > 0 && showFurniture {
 			headerY := r.marT * 0.35
 			if err := r.drawAt(hdr, r.marL, headerY, r.contentW); err != nil {
 				r.fields = savedFields
 				return err
 			}
 		}
-		if len(ftr) > 0 {
+		if len(ftr) > 0 && showFurniture {
 			footerY := r.pageH - r.marB + 6
 			if err := r.drawAt(ftr, r.marL, footerY, r.contentW); err != nil {
 				r.fields = savedFields
@@ -1372,6 +1373,7 @@ func (r *renderer) newPage() {
 	r.floatBand = nil
 	r.suppressedLineNumRanges = r.suppressedLineNumRanges[:0]
 	primeContentStream(r.pdf)
+	r.paintPageArtwork()
 }
 
 // primeContentStream emits a zero-width invisible stroke so gopdf doesn't

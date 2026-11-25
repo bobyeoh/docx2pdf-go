@@ -964,6 +964,7 @@ type Run struct {
 	// inline placement can at least approximate the source location.
 	ImageAnchored                    bool
 	AnchorAlignH, AnchorAlignV       string
+	AnchorRelativeH, AnchorRelativeV string
 	AnchorOffsetXPt, AnchorOffsetYPt float64
 	AnchorWrap                       string // "", "none", "square", "tight", "through", "topAndBottom"
 	// AnchorWrapPolygon carries the wp:wrapPolygon path on wp:wrapTight /

@@ -138,56 +138,7 @@ func decodeRunAltBranch(dec *xml.Decoder, start xml.StartElement, rp RunProps, d
 				if err != nil {
 					return nil, err
 				}
-				if di.RID != "" {
-					out = append(out, Run{
-						ImageID:             di.RID,
-						ImageWidthPt:        di.WPt,
-						ImageHeightPt:       di.HPt,
-						CropTopPct:          di.CropT,
-						CropBottomPct:       di.CropB,
-						CropLeftPct:         di.CropL,
-						CropRightPct:        di.CropR,
-						ImageAnchored:       di.IsAnchor,
-						AnchorAlignH:        di.PosH.Align,
-						AnchorAlignV:        di.PosV.Align,
-						AnchorOffsetXPt:     di.PosH.OffsetPt(),
-						AnchorOffsetYPt:     di.PosV.OffsetPt(),
-						AnchorWrap:          di.WrapType,
-						AnchorWrapPolygon:   di.WrapPolygon,
-						AnchorSimplePosUsed: di.SimplePosUsed,
-						AnchorSimplePosXPt:  di.SimplePosXPt,
-						AnchorSimplePosYPt:  di.SimplePosYPt,
-						Props:               rp,
-					})
-				}
-				if di.TxbxText != "" {
-					trp := rp
-					trp.Italic = true
-					out = append(out, Run{Text: di.TxbxText, Props: trp})
-				}
-				// SmartArt fallback: when the Choice carried a diagram
-				// reference but no rastered preview, surface the diagram
-				// text + (best-effort) pre-rendered shape group so the
-				// PDF isn't blank. The same logic the main drawing-decoder
-				// uses, condensed for AC contexts.
-				if di.RID == "" && di.DiagramRID != "" && doc != nil {
-					if drew := doc.DiagramShapes[di.DiagramRID]; drew != nil {
-						scaled := *drew
-						scaled.WidthPt = di.WPt
-						scaled.HeightPt = di.HPt
-						if scaled.WidthPt <= 0 {
-							scaled.WidthPt = 320
-						}
-						if scaled.HeightPt <= 0 {
-							scaled.HeightPt = 200
-						}
-						out = append(out, Run{VMLShape: &scaled, Props: rp})
-					} else if txt := doc.Diagrams[di.DiagramRID]; txt != "" {
-						trp := rp
-						trp.Italic = true
-						out = append(out, Run{Text: "[Diagram: " + txt + "]", Props: trp})
-					}
-				}
+				out = append(out, drawingRuns(di, rp, doc)...)
 			case "pict":
 				vi, err := findPictInfo(dec, t, doc)
 				if err != nil {

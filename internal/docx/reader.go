@@ -4592,247 +4592,7 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 				if err != nil {
 					return nil, err
 				}
-				if di.RID != "" {
-					// wp:wrapTopAndBottom forces line breaks above and
-					// below the image so surrounding text doesn't sit
-					// next to it. Other wrap modes (square / tight /
-					// through / none) currently render as inline; the
-					// flag is preserved on Run.WrapMode for future
-					// work but isn't honored by the line breaker yet.
-					if di.WrapType == "topAndBottom" {
-						atoms = append(atoms, Run{IsBreak: true, Props: rp})
-					}
-					// wp:anchor@behindDoc with no explicit wrap collapses
-					// to the same "behind" rendering path we take for
-					// wp:wrapNone with relativeHeight pushing the image
-					// under the text — i.e., draw the image at its
-					// anchor and let text flow through it.
-					if di.BehindDoc && (di.WrapType == "" || di.WrapType == "none") {
-						di.WrapType = "behind"
-					}
-					atoms = append(atoms, Run{
-						ImageID:             di.RID,
-						ImageWidthPt:        di.WPt,
-						ImageHeightPt:       di.HPt,
-						ImageRotationDeg:    di.RotationDeg,
-						ImageFlipH:          di.FlipH,
-						ImageFlipV:          di.FlipV,
-						CropTopPct:          di.CropT,
-						CropBottomPct:       di.CropB,
-						CropLeftPct:         di.CropL,
-						CropRightPct:        di.CropR,
-						ImageEffects:        di.ImageEffects,
-						ImageAnchored:       di.IsAnchor,
-						AnchorAlignH:        di.PosH.Align,
-						AnchorAlignV:        di.PosV.Align,
-						AnchorOffsetXPt:     di.PosH.OffsetPt(),
-						AnchorOffsetYPt:     di.PosV.OffsetPt(),
-						AnchorWrap:          di.WrapType,
-						AnchorWrapPolygon:   di.WrapPolygon,
-						AnchorSimplePosUsed: di.SimplePosUsed,
-						AnchorSimplePosXPt:  di.SimplePosXPt,
-						AnchorSimplePosYPt:  di.SimplePosYPt,
-						ImagePctWidth:       di.PctWidth,
-						ImagePctHeight:      di.PctHeight,
-						ImagePctRelFromH:    di.RelFromH,
-						ImagePctRelFromV:    di.RelFromV,
-						AltText:             di.AltText,
-						LinkURL:             di.HyperlinkRID,
-						LinkAnchor:          di.HyperlinkAnchor,
-						LinkTooltip:         di.HyperlinkTooltip,
-						Props:               rp,
-					})
-				} else if di.IsGroup && di.GroupChildShapeCount > 1 && di.ShapePrst == "" && di.CustPath == "" {
-					// Group drawing whose children were heterogeneous enough
-					// that findDrawingInfo couldn't collapse them into a
-					// single shape. Surface a labeled placeholder so the
-					// reader sees something at the source's footprint.
-					sh := &VMLShape{
-						Kind:           "rect",
-						WidthPt:        di.WPt,
-						HeightPt:       di.HPt,
-						StrokeColor:    "808080",
-						StrokeWeightPt: 0.5,
-						TextBox:        fmt.Sprintf("[Group: %d shapes]", di.GroupChildShapeCount),
-					}
-					if sh.WidthPt <= 0 {
-						sh.WidthPt = 192
-					}
-					if sh.HeightPt <= 0 {
-						sh.HeightPt = 96
-					}
-					atoms = append(atoms, Run{
-						VMLShape:        sh,
-						AltText:         di.AltText,
-						ImageAnchored:   di.IsAnchor,
-						AnchorAlignH:    di.PosH.Align,
-						AnchorAlignV:    di.PosV.Align,
-						AnchorOffsetXPt: di.PosH.OffsetPt(),
-						AnchorOffsetYPt: di.PosV.OffsetPt(),
-						AnchorWrap:      di.WrapType,
-						Props:           rp,
-					})
-					di.TxbxText = ""
-				} else if di.ShapePrst != "" || di.CustPath != "" {
-					// DrawingML vector shape (no image). Synthesize a
-					// VMLShape so the renderer's shape path draws it.
-					sh := &VMLShape{
-						Kind:              shapeKindForPrst(di.ShapePrst),
-						WidthPt:           di.WPt,
-						HeightPt:          di.HPt,
-						FillColor:         di.ShapeFill,
-						StrokeColor:       di.ShapeStroke,
-						StrokeWeightPt:    di.ShapeStrokeWeightPt,
-						CustomPath:        di.CustPath,
-						GradientKind:      di.ShapeGradientKind,
-						GradientAngle:     di.ShapeGradientAngle,
-						GradientStops:     di.ShapeGradientStops,
-						Shadow:            di.ShapeShadow,
-						Pattern:           di.ShapePattern,
-						TextBox:           di.TxbxText,
-						TextBoxBlocks:     di.TxbxBlocks,
-						HeadEnd:           di.ShapeHeadEnd,
-						TailEnd:           di.ShapeTailEnd,
-						DashStyle:         di.ShapeDashStyle,
-						CapStyle:          di.ShapeCapStyle,
-						CompoundLn:        di.ShapeCompoundLn,
-						TextAnchor:        di.TextAnchor,
-						TextLeftInsetPt:   di.TextLeftInsetPt,
-						TextTopInsetPt:    di.TextTopInsetPt,
-						TextRightInsetPt:  di.TextRightInsetPt,
-						TextBottomInsetPt: di.TextBottomInsetPt,
-						TextVertical:      di.TextVertical,
-						TextAutoFit:       di.TextAutoFit,
-					}
-					if sh.WidthPt <= 0 {
-						sh.WidthPt = 96
-					}
-					if sh.HeightPt <= 0 {
-						sh.HeightPt = 48
-					}
-					atoms = append(atoms, Run{
-						VMLShape:            sh,
-						AltText:             di.AltText,
-						ImageAnchored:       di.IsAnchor,
-						AnchorAlignH:        di.PosH.Align,
-						AnchorAlignV:        di.PosV.Align,
-						AnchorOffsetXPt:     di.PosH.OffsetPt(),
-						AnchorOffsetYPt:     di.PosV.OffsetPt(),
-						AnchorWrap:          di.WrapType,
-						AnchorWrapPolygon:   di.WrapPolygon,
-						AnchorSimplePosUsed: di.SimplePosUsed,
-						AnchorSimplePosXPt:  di.SimplePosXPt,
-						AnchorSimplePosYPt:  di.SimplePosYPt,
-						LinkURL:             di.HyperlinkRID,
-						LinkAnchor:          di.HyperlinkAnchor,
-						LinkTooltip:         di.HyperlinkTooltip,
-						Props:               rp,
-					})
-					// Done — text-box content is carried by the shape
-					// itself, no separate inline italic dump needed.
-					di.TxbxText = ""
-				}
-				// Text-box body (wps:txbx) on a drawing that's NOT a
-				// vector shape (image-only or empty drawing). Inline-
-				// emit as italic so the reader can distinguish box
-				// content from surrounding flow text.
-				if di.TxbxText != "" {
-					trp := rp
-					trp.Italic = true
-					atoms = append(atoms, Run{Text: di.TxbxText, Props: trp})
-				}
-				// Chart reference: paint a rectangular placeholder
-				// where the chart would sit, then surface the
-				// pre-extracted labels next to it. Pixel-accurate
-				// chart drawing (bars, slices, axes) would require
-				// parsing the c:ser/c:val data — best-effort here is
-				// the labeled rect so the reader sees the chart's
-				// dimensions plus its title/data prose.
-				if di.ChartRID != "" {
-					txt := doc.Charts[di.ChartRID]
-					sh := &VMLShape{
-						Kind:           "rect",
-						WidthPt:        di.WPt,
-						HeightPt:       di.HPt,
-						StrokeColor:    "808080",
-						StrokeWeightPt: 0.5,
-						TextBox:        "Chart",
-					}
-					if sh.WidthPt <= 0 {
-						sh.WidthPt = 240
-					}
-					if sh.HeightPt <= 0 {
-						sh.HeightPt = 160
-					}
-					// Prefer the structured chart data when available so
-					// the renderer can paint real bars/pies. The text
-					// dump stays as the placeholder label.
-					if cd, ok := doc.ChartsData[di.ChartRID]; ok {
-						sh.Chart = &cd
-						sh.TextBox = "" // chart renderer paints its own labels
-					} else if txt != "" {
-						sh.TextBox = "Chart: " + truncateText(txt, 80)
-					}
-					atoms = append(atoms, Run{VMLShape: sh, Props: rp})
-					if sh.Chart == nil && txt != "" {
-						// Fallback: dump the chart's text content inline
-						// so prose around the chart still makes sense.
-						trp := rp
-						trp.Italic = true
-						atoms = append(atoms, Run{Text: "[Chart: " + txt + "]", Props: trp})
-					}
-				}
-				// SmartArt diagram reference: paint a labeled box for
-				// the visual footprint and surface the node-text graph
-				// as italic prose so the conceptual content survives.
-				// Full diagram layout requires running the layout/colors/
-				// quickStyle algorithm — out of scope.
-				if di.DiagramRID != "" {
-					txt := doc.Diagrams[di.DiagramRID]
-					// When the SmartArt drawing part was pre-rendered by
-					// Word, use that whole group as the shape — every
-					// node renders as a real geometric box with its
-					// caption. Otherwise synthesize a minimal process
-					// layout from the node-text list so a diagram still
-					// shows up as boxes-with-arrows rather than a single
-					// gray placeholder rect.
-					var sh *VMLShape
-					if drew := doc.DiagramShapes[di.DiagramRID]; drew != nil {
-						scaled := *drew
-						scaled.WidthPt = di.WPt
-						scaled.HeightPt = di.HPt
-						if scaled.WidthPt <= 0 {
-							scaled.WidthPt = 320
-						}
-						if scaled.HeightPt <= 0 {
-							scaled.HeightPt = 200
-						}
-						sh = &scaled
-					} else if synth := synthesizeSmartArtLayoutKind(txt, doc.DiagramLayouts[di.DiagramRID], di.WPt, di.HPt); synth != nil {
-						sh = synth
-					} else {
-						sh = &VMLShape{
-							Kind:           "rect",
-							WidthPt:        di.WPt,
-							HeightPt:       di.HPt,
-							StrokeColor:    "B0B0B0",
-							StrokeWeightPt: 0.5,
-							TextBox:        "SmartArt",
-						}
-						if sh.WidthPt <= 0 {
-							sh.WidthPt = 240
-						}
-						if sh.HeightPt <= 0 {
-							sh.HeightPt = 160
-						}
-					}
-					atoms = append(atoms, Run{VMLShape: sh, Props: rp})
-					if doc.DiagramShapes[di.DiagramRID] == nil && sh.Kind != "group" && txt != "" {
-						trp := rp
-						trp.Italic = true
-						atoms = append(atoms, Run{Text: "[Diagram: " + txt + "]", Props: trp})
-					}
-				}
+				atoms = append(atoms, drawingRuns(di, rp, doc)...)
 			case "pict":
 				// Legacy VML images: <w:pict><v:shape style="..."><v:imagedata r:id="..."/>
 				// </v:shape></w:pict>. Older Word docs, Excel/Outlook pastes, and
@@ -5168,6 +4928,7 @@ type drawingInfo struct {
 	// <a:spPr><a:solidFill>/<a:ln>.
 	ShapeFill           string
 	ShapeStroke         string
+	ShapeStrokeHidden   bool
 	ShapeStrokeWeightPt float64
 	// ShapeHeadEnd / ShapeTailEnd carry the <a:headEnd type="..."/> and
 	// <a:tailEnd type="..."/> values when the line declares arrows.
@@ -5354,6 +5115,254 @@ func parseWrapPolygon(dec *xml.Decoder, start xml.StartElement) ([]WrapPathPoint
 		pts = pts[:len(pts)-1]
 	}
 	return pts, nil
+}
+
+// drawingRuns is shared by ordinary drawings and markup-compatibility branches.
+func drawingRuns(di drawingInfo, rp RunProps, doc *Document) []Run {
+	var runs []Run
+	if di.BehindDoc && (di.WrapType == "" || di.WrapType == "none") {
+		di.WrapType = "behind"
+	}
+	if di.RID != "" {
+		// wp:wrapTopAndBottom forces line breaks above and
+		// below the image so surrounding text doesn't sit
+		// next to it. Other wrap modes (square / tight /
+		// through / none) currently render as inline; the
+		// flag is preserved on Run.WrapMode for future
+		// work but isn't honored by the line breaker yet.
+		if di.WrapType == "topAndBottom" {
+			runs = append(runs, Run{IsBreak: true, Props: rp})
+		}
+		runs = append(runs, Run{
+			ImageID:             di.RID,
+			ImageWidthPt:        di.WPt,
+			ImageHeightPt:       di.HPt,
+			ImageRotationDeg:    di.RotationDeg,
+			ImageFlipH:          di.FlipH,
+			ImageFlipV:          di.FlipV,
+			CropTopPct:          di.CropT,
+			CropBottomPct:       di.CropB,
+			CropLeftPct:         di.CropL,
+			CropRightPct:        di.CropR,
+			ImageEffects:        di.ImageEffects,
+			ImageAnchored:       di.IsAnchor,
+			AnchorRelativeH:     di.PosH.RelativeFrom,
+			AnchorRelativeV:     di.PosV.RelativeFrom,
+			AnchorAlignH:        di.PosH.Align,
+			AnchorAlignV:        di.PosV.Align,
+			AnchorOffsetXPt:     di.PosH.OffsetPt(),
+			AnchorOffsetYPt:     di.PosV.OffsetPt(),
+			AnchorWrap:          di.WrapType,
+			AnchorWrapPolygon:   di.WrapPolygon,
+			AnchorSimplePosUsed: di.SimplePosUsed,
+			AnchorSimplePosXPt:  di.SimplePosXPt,
+			AnchorSimplePosYPt:  di.SimplePosYPt,
+			ImagePctWidth:       di.PctWidth,
+			ImagePctHeight:      di.PctHeight,
+			ImagePctRelFromH:    di.RelFromH,
+			ImagePctRelFromV:    di.RelFromV,
+			AltText:             di.AltText,
+			LinkURL:             di.HyperlinkRID,
+			LinkAnchor:          di.HyperlinkAnchor,
+			LinkTooltip:         di.HyperlinkTooltip,
+			Props:               rp,
+		})
+	} else if di.IsGroup && di.GroupChildShapeCount > 1 && di.ShapePrst == "" && di.CustPath == "" {
+		// Group drawing whose children were heterogeneous enough
+		// that findDrawingInfo couldn't collapse them into a
+		// single shape. Surface a labeled placeholder so the
+		// reader sees something at the source's footprint.
+		sh := &VMLShape{
+			Kind:           "rect",
+			WidthPt:        di.WPt,
+			HeightPt:       di.HPt,
+			StrokeColor:    "808080",
+			StrokeWeightPt: 0.5,
+			TextBox:        fmt.Sprintf("[Group: %d shapes]", di.GroupChildShapeCount),
+		}
+		if sh.WidthPt <= 0 {
+			sh.WidthPt = 192
+		}
+		if sh.HeightPt <= 0 {
+			sh.HeightPt = 96
+		}
+		runs = append(runs, Run{
+			VMLShape:        sh,
+			AltText:         di.AltText,
+			ImageAnchored:   di.IsAnchor,
+			AnchorRelativeH: di.PosH.RelativeFrom,
+			AnchorRelativeV: di.PosV.RelativeFrom,
+			AnchorAlignH:    di.PosH.Align,
+			AnchorAlignV:    di.PosV.Align,
+			AnchorOffsetXPt: di.PosH.OffsetPt(),
+			AnchorOffsetYPt: di.PosV.OffsetPt(),
+			AnchorWrap:      di.WrapType,
+			Props:           rp,
+		})
+		di.TxbxText = ""
+	} else if di.ShapePrst != "" || di.CustPath != "" {
+		// DrawingML vector shape (no image). Synthesize a
+		// VMLShape so the renderer's shape path draws it.
+		sh := &VMLShape{
+			Kind:              shapeKindForPrst(di.ShapePrst),
+			WidthPt:           di.WPt,
+			HeightPt:          di.HPt,
+			FillColor:         di.ShapeFill,
+			StrokeColor:       di.ShapeStroke,
+			StrokeWeightPt:    di.ShapeStrokeWeightPt,
+			CustomPath:        di.CustPath,
+			GradientKind:      di.ShapeGradientKind,
+			GradientAngle:     di.ShapeGradientAngle,
+			GradientStops:     di.ShapeGradientStops,
+			Shadow:            di.ShapeShadow,
+			Pattern:           di.ShapePattern,
+			TextBox:           di.TxbxText,
+			TextBoxBlocks:     di.TxbxBlocks,
+			HeadEnd:           di.ShapeHeadEnd,
+			TailEnd:           di.ShapeTailEnd,
+			DashStyle:         di.ShapeDashStyle,
+			CapStyle:          di.ShapeCapStyle,
+			CompoundLn:        di.ShapeCompoundLn,
+			TextAnchor:        di.TextAnchor,
+			TextLeftInsetPt:   di.TextLeftInsetPt,
+			TextTopInsetPt:    di.TextTopInsetPt,
+			TextRightInsetPt:  di.TextRightInsetPt,
+			TextBottomInsetPt: di.TextBottomInsetPt,
+			TextVertical:      di.TextVertical,
+			TextAutoFit:       di.TextAutoFit,
+		}
+		if sh.WidthPt <= 0 && (sh.Kind != "line" || sh.HeightPt <= 0) {
+			sh.WidthPt = 96
+		}
+		if sh.HeightPt <= 0 && sh.Kind != "line" {
+			sh.HeightPt = 48
+		}
+		runs = append(runs, Run{
+			VMLShape:            sh,
+			AltText:             di.AltText,
+			ImageAnchored:       di.IsAnchor,
+			AnchorRelativeH:     di.PosH.RelativeFrom,
+			AnchorRelativeV:     di.PosV.RelativeFrom,
+			AnchorAlignH:        di.PosH.Align,
+			AnchorAlignV:        di.PosV.Align,
+			AnchorOffsetXPt:     di.PosH.OffsetPt(),
+			AnchorOffsetYPt:     di.PosV.OffsetPt(),
+			AnchorWrap:          di.WrapType,
+			AnchorWrapPolygon:   di.WrapPolygon,
+			AnchorSimplePosUsed: di.SimplePosUsed,
+			AnchorSimplePosXPt:  di.SimplePosXPt,
+			AnchorSimplePosYPt:  di.SimplePosYPt,
+			LinkURL:             di.HyperlinkRID,
+			LinkAnchor:          di.HyperlinkAnchor,
+			LinkTooltip:         di.HyperlinkTooltip,
+			Props:               rp,
+		})
+		// Done — text-box content is carried by the shape
+		// itself, no separate inline italic dump needed.
+		di.TxbxText = ""
+	}
+	// Text-box body (wps:txbx) on a drawing that's NOT a
+	// vector shape (image-only or empty drawing). Inline-
+	// emit as italic so the reader can distinguish box
+	// content from surrounding flow text.
+	if di.TxbxText != "" {
+		trp := rp
+		trp.Italic = true
+		runs = append(runs, Run{Text: di.TxbxText, Props: trp})
+	}
+	// Chart reference: paint a rectangular placeholder
+	// where the chart would sit, then surface the
+	// pre-extracted labels next to it. Pixel-accurate
+	// chart drawing (bars, slices, axes) would require
+	// parsing the c:ser/c:val data — best-effort here is
+	// the labeled rect so the reader sees the chart's
+	// dimensions plus its title/data prose.
+	if di.ChartRID != "" {
+		txt := doc.Charts[di.ChartRID]
+		sh := &VMLShape{
+			Kind:           "rect",
+			WidthPt:        di.WPt,
+			HeightPt:       di.HPt,
+			StrokeColor:    "808080",
+			StrokeWeightPt: 0.5,
+			TextBox:        "Chart",
+		}
+		if sh.WidthPt <= 0 {
+			sh.WidthPt = 240
+		}
+		if sh.HeightPt <= 0 {
+			sh.HeightPt = 160
+		}
+		// Prefer the structured chart data when available so
+		// the renderer can paint real bars/pies. The text
+		// dump stays as the placeholder label.
+		if cd, ok := doc.ChartsData[di.ChartRID]; ok {
+			sh.Chart = &cd
+			sh.TextBox = "" // chart renderer paints its own labels
+		} else if txt != "" {
+			sh.TextBox = "Chart: " + truncateText(txt, 80)
+		}
+		runs = append(runs, Run{VMLShape: sh, Props: rp})
+		if sh.Chart == nil && txt != "" {
+			// Fallback: dump the chart's text content inline
+			// so prose around the chart still makes sense.
+			trp := rp
+			trp.Italic = true
+			runs = append(runs, Run{Text: "[Chart: " + txt + "]", Props: trp})
+		}
+	}
+	// SmartArt diagram reference: paint a labeled box for
+	// the visual footprint and surface the node-text graph
+	// as italic prose so the conceptual content survives.
+	// Full diagram layout requires running the layout/colors/
+	// quickStyle algorithm — out of scope.
+	if di.DiagramRID != "" {
+		txt := doc.Diagrams[di.DiagramRID]
+		// When the SmartArt drawing part was pre-rendered by
+		// Word, use that whole group as the shape — every
+		// node renders as a real geometric box with its
+		// caption. Otherwise synthesize a minimal process
+		// layout from the node-text list so a diagram still
+		// shows up as boxes-with-arrows rather than a single
+		// gray placeholder rect.
+		var sh *VMLShape
+		if drew := doc.DiagramShapes[di.DiagramRID]; drew != nil {
+			scaled := *drew
+			scaled.WidthPt = di.WPt
+			scaled.HeightPt = di.HPt
+			if scaled.WidthPt <= 0 {
+				scaled.WidthPt = 320
+			}
+			if scaled.HeightPt <= 0 {
+				scaled.HeightPt = 200
+			}
+			sh = &scaled
+		} else if synth := synthesizeSmartArtLayoutKind(txt, doc.DiagramLayouts[di.DiagramRID], di.WPt, di.HPt); synth != nil {
+			sh = synth
+		} else {
+			sh = &VMLShape{
+				Kind:           "rect",
+				WidthPt:        di.WPt,
+				HeightPt:       di.HPt,
+				StrokeColor:    "B0B0B0",
+				StrokeWeightPt: 0.5,
+				TextBox:        "SmartArt",
+			}
+			if sh.WidthPt <= 0 {
+				sh.WidthPt = 240
+			}
+			if sh.HeightPt <= 0 {
+				sh.HeightPt = 160
+			}
+		}
+		runs = append(runs, Run{VMLShape: sh, Props: rp})
+		if doc.DiagramShapes[di.DiagramRID] == nil && sh.Kind != "group" && txt != "" {
+			trp := rp
+			trp.Italic = true
+			runs = append(runs, Run{Text: "[Diagram: " + txt + "]", Props: trp})
+		}
+	}
+	return runs
 }
 
 // findDrawingInfo walks a w:drawing subtree and pulls out the drawing info.
@@ -5635,7 +5644,7 @@ func findDrawingInfo(dec *xml.Decoder, start xml.StartElement, doc *Document) (i
 				}
 				depth--
 			case "lnRef":
-				if c := scanSolidFillColorTheme(dec, t, themeFor(doc)); c != "" && info.ShapeStroke == "" {
+				if c := scanSolidFillColorTheme(dec, t, themeFor(doc)); c != "" && info.ShapeStroke == "" && !info.ShapeStrokeHidden {
 					info.ShapeStroke = c
 				}
 				depth--
@@ -5656,7 +5665,9 @@ func findDrawingInfo(dec *xml.Decoder, start xml.StartElement, doc *Document) (i
 					}
 				}
 				props := parseLinePropsExt(dec, t, themeFor(doc))
-				if props.Color != "" {
+				if props.NoFill {
+					info.ShapeStroke, info.ShapeStrokeHidden = "", true
+				} else if props.Color != "" {
 					info.ShapeStroke = props.Color
 				}
 				if props.HeadEnd != "" {
@@ -6230,6 +6241,7 @@ func parseLineProps(dec *xml.Decoder, start xml.StartElement, theme Theme) (colo
 // arrow types, dash style, line cap and compound. Used by shape renderers
 // to translate OOXML stroke semantics to PDF graphics state.
 type LineProps struct {
+	NoFill  bool
 	Color   string
 	HeadEnd string // none/triangle/stealth/diamond/oval/arrow
 	TailEnd string
@@ -6330,6 +6342,9 @@ func parseLinePropsExt(dec *xml.Decoder, start xml.StartElement, theme Theme) Li
 		switch t := tok.(type) {
 		case xml.StartElement:
 			switch t.Name.Local {
+			case "noFill":
+				out.NoFill = true
+				_ = dec.Skip()
 			case "solidFill":
 				if c := scanSolidFillColorTheme(dec, t, theme); c != "" && out.Color == "" {
 					out.Color = c

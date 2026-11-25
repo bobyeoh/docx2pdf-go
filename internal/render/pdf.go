@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"image"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"time"
@@ -58,6 +59,9 @@ type Options struct {
 	// skip the final WriteTo. The dry pass uses this to populate
 	// bookmarkPages without producing a usable PDF.
 	skipWrite bool
+
+	pageArtwork        map[int][]pageArtwork
+	collectPageArtwork bool
 
 	// FontRegular is the path to the TTF used for normal text. When
 	// empty, resolution order is: $DOCX2PDF_FONT env var, then a list
@@ -192,6 +196,18 @@ func RenderWriter(doc *docx.Document, w io.Writer, opts Options) error {
 			return err
 		}
 		opts.prepopulatedBookmarkPages = seed
+	}
+	// Locate page-relative artwork after text and field pagination. Paint
+	// it at page creation so an anchor late in the body cannot cover text.
+	if !opts.skipWrite && opts.pageArtwork == nil && hasPageArtwork(doc) {
+		opts.pageArtwork = make(map[int][]pageArtwork)
+		scan := opts
+		scan.collectPageArtwork, scan.skipWrite = true, true
+		scan.prepopulatedBookmarkPages = maps.Clone(opts.prepopulatedBookmarkPages)
+		scan.OnProgress, scan.Logger, scan.Verbose = nil, nil, false
+		if err := RenderWriter(doc, io.Discard, scan); err != nil {
+			return err
+		}
 	}
 	if opts.FontRegular == "" {
 		// Resolution order when no explicit font was passed:
@@ -501,6 +517,7 @@ func RenderWriter(doc *docx.Document, w io.Writer, opts Options) error {
 			pdf.AddPage()
 			r.cursorY = r.marT
 			primeContentStream(&pdf)
+			r.paintPageArtwork()
 		case colBreak:
 			// Best-effort: when a column slot is active, advance; otherwise
 			// fall back to a normal page break.
@@ -511,6 +528,7 @@ func RenderWriter(doc *docx.Document, w io.Writer, opts Options) error {
 				pdf.AddPageWithOption(gopdf.PageOption{PageSize: &gopdf.Rect{W: r.pageW, H: r.pageH}})
 				r.cursorY = r.marT
 				primeContentStream(&pdf)
+				r.paintPageArtwork()
 			}
 		case !startsNewPage:
 			// Continuous: stay on the same page, adopt new geometry.
@@ -518,12 +536,14 @@ func RenderWriter(doc *docx.Document, w io.Writer, opts Options) error {
 			if extraPage {
 				pdf.AddPageWithOption(gopdf.PageOption{PageSize: &gopdf.Rect{W: r.pageW, H: r.pageH}})
 				primeContentStream(&pdf)
+				r.paintPageArtwork()
 			}
 			pdf.AddPageWithOption(gopdf.PageOption{
 				PageSize: &gopdf.Rect{W: r.pageW, H: r.pageH},
 			})
 			r.cursorY = r.marT
 			primeContentStream(&pdf)
+			r.paintPageArtwork()
 		}
 		sectionPageStart[i] = pdf.GetNumberOfPages()
 

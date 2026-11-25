@@ -22,14 +22,16 @@ type atom struct {
 	// anchored signals an image from wp:anchor (floating). When true the
 	// renderer respects anchorAlignH for horizontal placement instead of
 	// drawing at the inline cursor.
-	anchored     bool
-	anchorAlignH string // "left", "center", "right", "inside", "outside"
+	anchored                         bool
+	anchorRelativeH, anchorRelativeV string
+	anchorAlignH                     string // "left", "center", "right", "inside", "outside"
 	// anchorWrap mirrors w:wrap on wp:anchor: "" (none/behind/through —
 	// no flow effect), "topAndBottom", "square", "tight". For
 	// topAndBottom we force a line break before and after the image so
 	// body text doesn't overlap. square/tight downgrade to topAndBottom
 	// since true shape-exclusion layout is out of scope.
-	anchorWrap string
+	anchorWrap   string
+	anchorAlignV string
 	// anchorOffsetXPt / anchorOffsetYPt mirror w:positionH/positionV w:posOffset
 	// in points. When AnchorAlignH is empty, the renderer places the
 	// floating image at (marL+OffsetX, currentY+OffsetY). When wrap is
@@ -340,13 +342,13 @@ func (r *renderer) runsToAtoms(runs []docx.Run) []atom {
 		if run.VMLShape != nil {
 			s := run.VMLShape
 			w, h := s.WidthPt, s.HeightPt
-			if w <= 0 {
+			if w <= 0 && (s.Kind != "line" || h <= 0) {
 				w = 48
 			}
-			if h <= 0 {
+			if h <= 0 && s.Kind != "line" {
 				h = 24
 			}
-			if w > r.contentW {
+			if w > r.contentW && !(run.ImageAnchored && run.AnchorRelativeH == "page") {
 				scale := r.contentW / w
 				w *= scale
 				h *= scale
@@ -359,7 +361,10 @@ func (r *renderer) runsToAtoms(runs []docx.Run) []atom {
 				props:               run.Props,
 				anchored:            run.ImageAnchored,
 				anchorAlignH:        run.AnchorAlignH,
+				anchorRelativeH:     run.AnchorRelativeH,
+				anchorRelativeV:     run.AnchorRelativeV,
 				anchorWrap:          run.AnchorWrap,
+				anchorAlignV:        run.AnchorAlignV,
 				anchorOffsetXPt:     run.AnchorOffsetXPt,
 				anchorOffsetYPt:     run.AnchorOffsetYPt,
 				anchorWrapPolygon:   run.AnchorWrapPolygon,
@@ -495,7 +500,7 @@ func (r *renderer) runsToAtoms(runs []docx.Run) []atom {
 				}
 			case run.ImageWidthPt > 0 && run.ImageHeightPt > 0:
 				w, h = run.ImageWidthPt, run.ImageHeightPt
-				if w > r.contentW {
+				if w > r.contentW && !(run.ImageAnchored && run.AnchorRelativeH == "page") {
 					scale := r.contentW / w
 					w *= scale
 					h *= scale
@@ -513,7 +518,10 @@ func (r *renderer) runsToAtoms(runs []docx.Run) []atom {
 				linkAnchor:          run.LinkAnchor,
 				anchored:            run.ImageAnchored,
 				anchorAlignH:        run.AnchorAlignH,
+				anchorRelativeH:     run.AnchorRelativeH,
+				anchorRelativeV:     run.AnchorRelativeV,
 				anchorWrap:          run.AnchorWrap,
+				anchorAlignV:        run.AnchorAlignV,
 				anchorOffsetXPt:     run.AnchorOffsetXPt,
 				anchorOffsetYPt:     run.AnchorOffsetYPt,
 				anchorWrapPolygon:   run.AnchorWrapPolygon,
@@ -1703,45 +1711,58 @@ func buildWrapPolygon(pts []docx.WrapPathPoint, leftX, topY, w, h float64) ([]po
 	return out, minY, maxY
 }
 
-// drawFloatingShapeBehind paints a wp:anchor image whose wrap is
-// none/behind/through — text doesn't yield to it. The image is placed
-// at marL+anchorOffsetX (or aligned per anchorAlignH) and cursorY+
-// anchorOffsetY. The inline cursor and lineMaxH are NOT advanced.
+// drawFloatingShapeBehind handles a non-wrapping anchor without consuming
+// any space in the text flow. An anchor relative to the page uses the
+// full page box instead of the current paragraph position.
 func (r *renderer) drawFloatingShapeBehind(a *atom) {
 	if a.width <= 0 || a.height <= 0 {
 		return
 	}
-	var imgX, imgY float64
+	x, y := r.marL+a.anchorOffsetXPt, r.cursorY+a.anchorOffsetYPt
 	if a.anchorSimplePosUsed {
-		// Legacy Word 2003 absolute positioning — coordinates are page-
-		// relative, ignoring positionH/positionV alignment.
-		imgX = a.anchorSimplePosXPt
-		imgY = a.anchorSimplePosYPt
+		x, y = a.anchorSimplePosXPt, a.anchorSimplePosYPt
 	} else {
-		imgX = r.marL + a.anchorOffsetXPt
+		left, width := r.marL, r.contentW
+		if a.anchorRelativeH == "page" {
+			left, width = 0, r.pageW
+			x = left + a.anchorOffsetXPt
+		}
 		switch a.anchorAlignH {
 		case "right", "outside":
-			imgX = r.marL + r.contentW - a.width
+			x = left + width - a.width
 		case "center":
-			imgX = r.marL + (r.contentW-a.width)/2
+			x = left + (width-a.width)/2
 		case "left", "inside":
-			imgX = r.marL
+			x = left
 		}
-		imgY = r.cursorY + a.anchorOffsetYPt
+		if a.anchorRelativeV == "page" {
+			y = a.anchorOffsetYPt
+			switch a.anchorAlignV {
+			case "bottom", "outside":
+				y = r.pageH - a.height
+			case "center":
+				y = (r.pageH - a.height) / 2
+			case "top", "inside":
+				y = 0
+			}
+		}
 	}
+	artwork := pageArtwork{drawing: *a, x: x, y: y}
 	if a.kind == atomImage {
-		var img image.Image
-		if strings.Contains(a.imageID, ":crop") {
-			img = r.croppedCache[a.imageID]
-		} else {
-			img = r.doc.Images[a.imageID]
+		artwork.image = r.croppedCache[a.imageID]
+		if artwork.image == nil {
+			artwork.image = r.doc.Images[a.imageID]
 		}
-		if img != nil {
-			_ = r.drawImage(img, imgX, imgY, a.width, a.height)
-		}
-	} else if a.shape != nil {
-		drawVMLShape(r, a.shape, imgX, imgY, a.width, a.height)
 	}
+	if !r.noPageBreak && r.opts.pageArtwork != nil && !a.anchorSimplePosUsed &&
+		a.anchorWrap == "behind" && a.anchorRelativeH == "page" && a.anchorRelativeV == "page" {
+		if r.opts.collectPageArtwork {
+			page := r.pdf.GetNumberOfPages()
+			r.opts.pageArtwork[page] = append(r.opts.pageArtwork[page], artwork)
+		}
+		return
+	}
+	r.paintFloatingArtwork(artwork)
 }
 
 // lineBandAdjust returns the (x, width, true) constraints for a line
