@@ -6,7 +6,7 @@ import (
 	"github.com/bobyeoh/docx2pdf-go/internal/docx"
 )
 
-func TestIsHeadingStyle(t *testing.T) {
+func TestHeadingStyleFallback(t *testing.T) {
 	cases := []struct {
 		id   string
 		want bool
@@ -26,9 +26,33 @@ func TestIsHeadingStyle(t *testing.T) {
 		{"BodyText", false},
 	}
 	for _, c := range cases {
-		got := isHeadingStyle(c.id)
+		got := outlineLevelFromStyle(c.id, 0) > 0
 		if got != c.want {
-			t.Errorf("isHeadingStyle(%q) = %v, want %v", c.id, got, c.want)
+			t.Errorf("outline fallback for %q = %v, want %v", c.id, got, c.want)
+		}
+	}
+}
+
+func TestEffectiveHeadingLevel(t *testing.T) {
+	cases := []struct {
+		styleID string
+		outline int
+		want    int
+	}{
+		{"Heading1", 0, 1},
+		{"Heading3", 0, 3},
+		{"Title", 0, 1},
+		{"BodyText", 0, 0},
+		{"", 2, 2},
+		{"Heading3", 2, 2},  // resolved level overrides the ID
+		{"Heading1", 10, 0}, // explicitly body text
+		{"", 0, 0},          // unset
+	}
+	for _, c := range cases {
+		got := outlineLevelFromStyle(c.styleID, c.outline)
+		if got != c.want {
+			t.Errorf("outlineLevelFromStyle(style=%q outline=%d) = %d, want %d",
+				c.styleID, c.outline, got, c.want)
 		}
 	}
 }

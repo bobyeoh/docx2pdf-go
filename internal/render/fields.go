@@ -2169,7 +2169,7 @@ func collectHeadings(doc *docx.Document) []tocEntry {
 		for _, b := range blocks {
 			switch v := b.(type) {
 			case docx.Paragraph:
-				lvl := headingLevel(v, doc)
+				lvl := outlineLevelFromStyle(v.StyleID, v.OutlineLvl)
 				if lvl > 0 {
 					txt := paragraphPlainText(v)
 					if txt != "" {
@@ -2207,9 +2207,8 @@ func collectHeadings(doc *docx.Document) []tocEntry {
 //     unless they overlap the style map. When BOTH `\t` and `\u` are
 //     given, the union is taken (Word's behavior).
 //   - `\u` keeps entries whose paragraphs have an explicit outlineLvl.
-//     Our headings list already includes those since headingLevel honors
-//     OutlineLvl; `\u` therefore is a no-op extension for our model
-//     beyond suppressing the implicit Title rule.
+//     The heading list includes resolved outline levels. This switch
+//     also suppresses the implicit Title rule.
 //   - `\f SEQID` restricts TC entries to a single SEQ stream.
 //   - `\b name` filters to entries whose Bookmark falls inside the named
 //     bookmark range — not modelled here (we lack bookmark span info);
@@ -2320,27 +2319,6 @@ func collectXEEntries(doc *docx.Document) []string {
 		walk(doc.Body)
 	}
 	return out
-}
-
-// headingLevel returns 1..9 if p is a heading paragraph.
-func headingLevel(p docx.Paragraph, doc *docx.Document) int {
-	_ = doc
-	if p.OutlineLvl >= 1 && p.OutlineLvl <= 9 {
-		return p.OutlineLvl
-	}
-	if p.StyleID != "" {
-		id := strings.ToLower(p.StyleID)
-		if id == "title" {
-			return 1
-		}
-		if strings.HasPrefix(id, "heading") {
-			tail := strings.TrimPrefix(id, "heading")
-			if n, err := strconv.Atoi(tail); err == nil && n >= 1 && n <= 9 {
-				return n
-			}
-		}
-	}
-	return 0
 }
 
 // firstHeadingBookmark picks the first `_Toc...`-style anchor on a

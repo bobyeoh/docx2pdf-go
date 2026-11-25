@@ -79,22 +79,6 @@ func (r *renderer) drawParagraph(p docx.Paragraph) error {
 	if sb > 0 {
 		r.cursorY += sb
 	}
-	// PDF outline: paragraphs styled as Heading1..9 or Title contribute a
-	// bookmark in the reader's sidebar so the resulting PDF has a clickable
-	// navigable structure. We emit a true nested outline tree — Heading2
-	// becomes a child of the most recent Heading1, etc. We add the outline
-	// AFTER applying spacing-before so the bookmark's destination Y lands
-	// at the heading's actual top edge, not the gap above it. KeepNext
-	// ensureRoom may still shift the heading to a new page; that case is
-	// handled by ensureRoom moving cursorY and triggering AddPage, so the
-	// AddOutlineWithPosition we call here will use the correct page index.
-	if title := headingTitle(p); title != "" {
-		level := outlineLevelFromStyle(p.StyleID, p.OutlineLvl)
-		if level < 1 {
-			level = 1
-		}
-		r.appendOutline(title, level)
-	}
 	// keepNext baseline: ensure room for at least 2.4× a default font
 	// line so a heading isn't orphaned at the bottom of the page. Full
 	// keepLines / widow-orphan measurement happens once we know the
@@ -241,7 +225,8 @@ func (r *renderer) drawParagraph(p docx.Paragraph) error {
 		}
 	}
 
-	if err := r.layoutLine(atoms, align); err != nil {
+	outlineLevel := outlineLevelFromStyle(p.StyleID, p.OutlineLvl)
+	if err := r.layoutLine(atoms, align, headingTitle(p), outlineLevel); err != nil {
 		r.restoreParagraphState(savedColIdx, savedMarL, savedContentW, savedLine)
 		r.pendingMarker = nil
 		r.firstLineHangPt = 0
@@ -1160,15 +1145,9 @@ func roman(n int, upper bool) string {
 	return out
 }
 
-// headingTitle returns a PDF-outline title when p is styled as a heading.
-// Recognized styles: Heading1..Heading9 and Title (Word's defaults). We
-// match case-insensitively and tolerate the variant "Heading 1" style ID
-// some templates use. Returns "" for non-heading paragraphs.
-//
-// The title is the concatenated visible text of the paragraph's runs,
-// trimmed of surrounding whitespace.
+// headingTitle returns the visible text of an outline heading.
 func headingTitle(p docx.Paragraph) string {
-	if !isHeadingStyle(p.StyleID) {
+	if outlineLevelFromStyle(p.StyleID, p.OutlineLvl) == 0 {
 		return ""
 	}
 	var b strings.Builder
@@ -1181,34 +1160,25 @@ func headingTitle(p docx.Paragraph) string {
 	return strings.TrimSpace(b.String())
 }
 
-// outlineLevelFromStyle maps a paragraph's style ID and explicit
-// w:outlineLvl onto a 1-based PDF outline depth. Title and Heading1
-// both resolve to depth 1; Heading2 → 2; etc. An explicit outlineLvl
-// (0..9, where 0 = top) wins when set, since some templates apply
-// outline levels via direct formatting on non-heading styles.
+// outlineLevelFromStyle returns a 1-based heading depth or zero for body text.
+// Resolve the OOXML level first and fall back to familiar style IDs for
+// documents whose styles do not declare a level.
 func outlineLevelFromStyle(styleID string, outlineLvl int) int {
-	if outlineLvl >= 0 && outlineLvl <= 9 {
-		// w:outlineLvl is 0-based (0 = top); convert to a 1-based depth.
-		// We use outlineLvl only when the style isn't a Heading variant
-		// — Heading styles trump because they're the conventional source.
-		if !isHeadingStyle(styleID) {
-			return outlineLvl + 1
+	if outlineLvl != 0 {
+		if outlineLvl >= 1 && outlineLvl <= 9 {
+			return outlineLvl
 		}
+		return 0
 	}
-	low := strings.ToLower(strings.ReplaceAll(styleID, " ", ""))
-	if low == "title" {
+	id := strings.ToLower(strings.ReplaceAll(styleID, " ", ""))
+	if id == "title" || id == "heading" {
 		return 1
 	}
-	if strings.HasPrefix(low, "heading") {
-		rest := low[len("heading"):]
-		if rest == "" {
-			return 1
-		}
-		if n, err := strconv.Atoi(rest); err == nil && n >= 1 && n <= 9 {
-			return n
-		}
+	if level, ok := strings.CutPrefix(id, "heading"); ok && len(level) == 1 &&
+		level[0] >= '1' && level[0] <= '9' {
+		return int(level[0] - '0')
 	}
-	return 1
+	return 0
 }
 
 // appendOutline records a heading entry in the renderer's outline tree at
@@ -1228,9 +1198,8 @@ func (r *renderer) appendOutline(title string, level int) {
 	if level > 9 {
 		level = 9
 	}
-	// gopdf's bookmark dest is the current page; SetXY hasn't been called
-	// yet for the heading itself, so use AddOutlineWithPosition so the
-	// destination Y matches where the heading will be drawn.
+	// The first line has been placed, so use its final page and top edge.
+	r.pdf.SetY(r.cursorY)
 	obj := r.pdf.AddOutlineWithPosition(title)
 	node := &gopdf.OutlineNode{Obj: obj}
 	// Compact-skip: a heading deeper than the existing stack + 1 attaches
@@ -1251,30 +1220,6 @@ func (r *renderer) appendOutline(title string, level int) {
 		parent.Children = append(parent.Children, node)
 	}
 	r.outlineStack = append(r.outlineStack, node)
-}
-
-func isHeadingStyle(id string) bool {
-	if id == "" {
-		return false
-	}
-	low := strings.ToLower(strings.ReplaceAll(id, " ", ""))
-	if low == "title" {
-		return true
-	}
-	if !strings.HasPrefix(low, "heading") {
-		return false
-	}
-	// "heading", "heading1" … "heading9" all qualify; "headingnoborder"
-	// (custom names) shouldn't, so require either bare "heading" or one
-	// trailing decimal digit.
-	rest := low[len("heading"):]
-	if rest == "" {
-		return true
-	}
-	if len(rest) == 1 && rest[0] >= '1' && rest[0] <= '9' {
-		return true
-	}
-	return false
 }
 
 // isHorizontalRuleParagraph reports whether p should render as a

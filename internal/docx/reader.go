@@ -1754,6 +1754,9 @@ func (e *xmlBorderEdge) toBorderEdge() BorderEdge {
 }
 
 type xmlStylePPr struct {
+	OutlineLvl *struct {
+		Val string `xml:"val,attr"`
+	} `xml:"outlineLvl"`
 	Jc *struct {
 		Val string `xml:"val,attr"`
 	} `xml:"jc"`
@@ -1970,6 +1973,9 @@ func parseStyles(f *zip.File, doc *Document) error {
 			ps.Run = rPrToProps(*xs.RPr, RunProps{})
 		}
 		if xs.PPr != nil {
+			if xs.PPr.OutlineLvl != nil {
+				ps.OutlineLvl = wordOutlineLevel(xs.PPr.OutlineLvl.Val)
+			}
 			if xs.PPr.NumPr != nil {
 				if xs.PPr.NumPr.NumID != nil {
 					if x, err := strconv.Atoi(xs.PPr.NumPr.NumID.Val); err == nil && x > 0 {
@@ -2065,6 +2071,9 @@ func mergeStyles(parent, child ParagraphStyle) ParagraphStyle {
 	}
 	if child.LinkedCharStyle != "" {
 		out.LinkedCharStyle = child.LinkedCharStyle
+	}
+	if child.OutlineLvl != 0 {
+		out.OutlineLvl = child.OutlineLvl
 	}
 	if child.NumPr.NumID != 0 {
 		out.NumPr = child.NumPr
@@ -4036,6 +4045,15 @@ func decodeNumPr(dec *xml.Decoder, start xml.StartElement, p *Paragraph) error {
 	}
 }
 
+// wordOutlineLevel preserves the distinction between absent and explicit level 0.
+func wordOutlineLevel(value string) int {
+	level, err := strconv.Atoi(value)
+	if err != nil || level < 0 || level > 9 {
+		return 0
+	}
+	return level + 1
+}
+
 func decodePPr(dec *xml.Decoder, start xml.StartElement, p *Paragraph, paraRPr *RunProps, pctx *parseDocContext) error {
 	doc := pctx.doc
 	for {
@@ -4062,6 +4080,9 @@ func decodePPr(dec *xml.Decoder, start xml.StartElement, p *Paragraph, paraRPr *
 							if cs, ok := doc.CharStyles[st.LinkedCharStyle]; ok {
 								*paraRPr = MergeRunProps(*paraRPr, cs)
 							}
+						}
+						if st.OutlineLvl != 0 {
+							p.OutlineLvl = st.OutlineLvl
 						}
 						if st.HasAlignment {
 							p.Alignment = st.Alignment
@@ -4184,13 +4205,8 @@ func decodePPr(dec *xml.Decoder, start xml.StartElement, p *Paragraph, paraRPr *
 				p.WidowControl = &v
 				_ = dec.Skip()
 			case "outlineLvl":
-				if v := attr(t, "val"); v != "" {
-					if x, err := strconv.Atoi(v); err == nil {
-						// Word stores 0..8 here (Heading1..Heading9); 9 means
-						// "body text". Use +1 internally to distinguish 0 from
-						// "unset" (the zero value of int).
-						p.OutlineLvl = x + 1
-					}
+				if level := wordOutlineLevel(attr(t, "val")); level != 0 {
+					p.OutlineLvl = level
 				}
 				_ = dec.Skip()
 			case "textDirection":

@@ -718,6 +718,7 @@ type ParagraphStyle struct {
 	SpacingBefore float64
 	SpacingAfter  float64
 	LineHeight    LineHeight
+	OutlineLvl    int // Same 1-based encoding as Paragraph.OutlineLvl.
 	// LinkedCharStyle is w:link — when a paragraph style is "linked" to a
 	// character style, applying the paragraph style should auto-apply the
 	// linked character style to every run that doesn't otherwise override.
@@ -829,8 +830,8 @@ type Paragraph struct {
 	// SnapToGrid — when false, the paragraph opts out of the section's
 	// docGrid line snapping.
 	SnapToGrid *bool
-	// OutlineLvl is w:outlineLvl (0-9). When >= 0 this paragraph contributes
-	// to the PDF outline even if its style is not Heading*.
+	// OutlineLvl is the resolved w:outlineLvl plus one. Zero is unset,
+	// 1–9 are heading levels, and 10 is explicitly body text.
 	OutlineLvl int
 	// TextDirection is one of "lrTb" (default), "tbRl", "btLr", "lrTbV",
 	// "tbRlV", "tbLrV". When non-default the renderer rotates the
