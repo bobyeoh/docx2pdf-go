@@ -39,6 +39,7 @@ func main() {
 	fontSymbol := flag.String("font-symbol", "", "path to TTF that covers ballot-box / arrow / dingbat blocks — NotoSansSymbols2 is the canonical choice (optional)")
 	size := flag.Float64("size", 11, "default font size in points")
 	pageNumbers := flag.Bool("page-numbers", false, "draw 'X / N' page numbers at the bottom of every page")
+	expandExactRows := flag.Bool("expand-exact-table-rows", false, "treat exact table row heights as minimums to fit wrapped content")
 	recursive := flag.Bool("recursive", false, "in batch mode, descend into subdirectories")
 	keepGoing := flag.Bool("keep-going", false, "in batch mode, continue past per-file errors (exit non-zero if any failed)")
 	workers := flag.Int("workers", 1, "in batch mode, parallel worker count (default 1)")
@@ -56,18 +57,19 @@ func main() {
 	// system font and surface a clear error if none is available.
 
 	opts := convert.Options{
-		FontRegular:     *font,
-		FontBold:        *fontBold,
-		FontItalic:      *fontItalic,
-		FontHeading:     *fontHeading,
-		FontFallback:    *fontFallback,
-		FontSymbol:      *fontSymbol,
-		DefaultFontSize: *size,
-		PageNumbers:     *pageNumbers,
-		Verbose:         *verbose,
-		Lenient:         *lenient,
-		Author:          *author,
-		ShowRevisions:   *showRevisions,
+		FontRegular:          *font,
+		FontBold:             *fontBold,
+		FontItalic:           *fontItalic,
+		FontHeading:          *fontHeading,
+		FontFallback:         *fontFallback,
+		FontSymbol:           *fontSymbol,
+		DefaultFontSize:      *size,
+		PageNumbers:          *pageNumbers,
+		ExpandExactTableRows: *expandExactRows,
+		Verbose:              *verbose,
+		Lenient:              *lenient,
+		Author:               *author,
+		ShowRevisions:        *showRevisions,
 	}
 
 	// Streaming mode: -in - and/or -out -.

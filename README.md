@@ -198,6 +198,7 @@ docx2pdf -in ./input -out ./output -recursive -workers 8
 | `-font-fallback PATH` | CJK / symbol fallback (TrueType only) |
 | `-size N` | Default font size in points (default 11) |
 | `-page-numbers` | Draw "X / N" at the bottom of every page |
+| `-expand-exact-table-rows` | Treat exact row heights as minimums, allowing wrapped text to grow the row. This can change pagination. In Go, set `Options.ExpandExactTableRows`. |
 | `-author NAME` | Override `AUTHOR` field + PDF metadata `Author` |
 | `-show-revisions` | Render tracked changes inline (insertions underlined, deletions struck through, per-author colors) instead of silently accepting them |
 | `-recursive` | In batch mode, descend into subdirectories |

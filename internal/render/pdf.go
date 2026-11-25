@@ -95,7 +95,10 @@ type Options struct {
 	// PageNumbers, when true, draws "X / N" centered in the bottom margin
 	// of every page after the body is rendered.
 	PageNumbers bool
-	Verbose     bool
+	// ExpandExactTableRows treats exact row heights as minimums, allowing
+	// rows to grow when their text wraps differently with substitute fonts.
+	ExpandExactTableRows bool
+	Verbose              bool
 	// ShowRevisions controls how tracked-changes runs are rendered.
 	// When false (default), del/moveFrom runs are silently dropped from
 	// the output (Word's "Accept All" semantics). When true, del/moveFrom

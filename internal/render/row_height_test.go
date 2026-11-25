@@ -81,3 +81,30 @@ func TestRowHeight_AtLeastHonorsMinimum(t *testing.T) {
 		t.Errorf("atLeast min rowHeight = %v, want 100", got)
 	}
 }
+
+func TestMeasureTable_ExpandExactRows(t *testing.T) {
+	r := makeTestRenderer(t)
+	table := docx.Table{
+		ColumnWidthsTwips: []int{2000},
+		Layout:            "fixed",
+		Rows: []docx.TableRow{{
+			HeightTwips:     160,
+			HeightRule:      "exact",
+			HeightRuleExact: true,
+			Cells: []docx.TableCell{{Blocks: []docx.Block{
+				docx.Paragraph{Runs: []docx.Run{{Text: "Two lines\nof body text"}}},
+			}}},
+		}},
+	}
+	if got := r.measureTable(table); got != 8 {
+		t.Errorf("fixed table height = %g, want 8pt", got)
+	}
+	r.opts.ExpandExactTableRows = true
+	want := r.predictRowHeight(table.Rows[0], []float64{100})
+	if want <= 8 {
+		t.Fatalf("row prediction did not expand: %gpt", want)
+	}
+	if got := r.measureTable(table); got != want {
+		t.Errorf("expanded table height = %g, want %gpt", got, want)
+	}
+}

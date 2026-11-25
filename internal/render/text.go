@@ -742,7 +742,11 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 
 	flush := func(isLast bool) error {
 		if len(line) == 0 {
-			r.cursorY += r.applyLineHeight(r.opts.DefaultFontSize * 1.2)
+			if lineMaxH == 0 {
+				lineMaxH = r.opts.DefaultFontSize * 1.2
+			}
+			r.cursorY += r.applyLineHeight(lineMaxH)
+			lineMaxH = 0
 			// An empty first line still "uses up" the hanging — clear so the
 			// next non-empty line wraps at the normal margin.
 			hang = 0
@@ -1273,6 +1277,11 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 
 	for _, a := range atoms {
 		if a.kind == atomBreak {
+			// On a blank line, the break's run supplies the font size.
+			// A tight row can lose a line if this uses the document default.
+			if len(line) == 0 {
+				lineMaxH = atomHeight(a, r.opts.DefaultFontSize)
+			}
 			if err := flush(true); err != nil {
 				return err
 			}
@@ -2079,7 +2088,7 @@ func atomHeight(a atom, defaultSize float64) float64 {
 			sz = defaultSize
 		}
 		return sz * 1.2
-	case atomWord, atomSpace, atomTab:
+	case atomWord, atomSpace, atomTab, atomBreak:
 		sz := a.props.FontSize
 		if sz == 0 {
 			sz = defaultSize
