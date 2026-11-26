@@ -1540,7 +1540,7 @@ type RunProps struct {
 	SmallCaps  bool    // w:smallCaps — lowercase rendered as small upper-case
 	FontSize   float64 // half-points in docx; we store points
 	FontFamily string
-	Color      string // hex without leading '#', e.g. "FF0000"
+	Color      string // hex without leading '#', or "auto" to reset inherited color
 	// Highlight is one of Word's predefined names (yellow, green, cyan, ...).
 	// When non-empty the renderer paints a colored rect under the run.
 	Highlight string

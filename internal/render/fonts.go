@@ -268,7 +268,7 @@ func (r *renderer) applyFontFamily(p docx.RunProps, family string) error {
 			color = applyLumModOff(hex, p.LumMod, p.LumOff)
 		}
 	}
-	if color != "" {
+	if color != "" && color != "auto" {
 		rR, gR, bR := parseHexColor(color)
 		r.pdf.SetTextColor(rR, gR, bR)
 	} else {
